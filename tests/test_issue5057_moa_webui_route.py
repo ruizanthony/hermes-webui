@@ -127,3 +127,23 @@ def test_moa_config_is_per_turn_not_persisted():
     js_source = js_path.read_text(encoding="utf-8")
     assert "moa_config:_pendingMoaConfig?true:undefined" in js_source
     assert "_pendingMoaConfig=null" in js_source
+
+def test_moa_webui_turn_uses_virtual_provider_without_persisting_session_model():
+    """A WebUI /moa one-shot must execute through provider=moa, not merely
+    inject private MoA guidance into the currently selected model.
+
+    The frontend keeps the visible session model/provider unchanged after /moa,
+    so the route must distinguish persisted session metadata from worker runtime
+    metadata. Otherwise /moa appears to succeed but the final answer is produced
+    by the normal session provider and the reference blocks are never emitted.
+    """
+    routes_path = Path(__file__).resolve().parent.parent / "api" / "routes.py"
+    routes_source = routes_path.read_text(encoding="utf-8")
+    assert 'worker_kwargs["runtime_model"] = str(moa_config.get("preset")' in routes_source
+    assert 'worker_kwargs["runtime_model_provider"] = "moa"' in routes_source
+    assert 'response["effective_model_provider"] = model_provider' in routes_source
+    streaming_path = Path(__file__).resolve().parent.parent / "api" / "streaming.py"
+    streaming_source = streaming_path.read_text(encoding="utf-8")
+    assert "runtime_override_active = runtime_model is not None or runtime_model_provider is not None" in streaming_source
+    assert "s.model = session_model" in streaming_source
+    assert "s.model_provider = session_provider_context or None" in streaming_source

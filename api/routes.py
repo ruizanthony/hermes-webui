@@ -18524,11 +18524,27 @@ def _start_chat_stream_for_session(
     if goal_related:
         STREAM_GOAL_RELATED[stream_id] = True
     diag.stage("worker_thread_start") if diag else None
-    backend_is_gateway = webui_gateway_chat_enabled(get_config())
+    # WebUI's /moa command is a local, one-shot runtime override. The frontend
+    # sends a per-turn ``moa_config`` flag, but Hermes Agent's native MoA path is
+    # selected by running the worker with provider="moa" and the configured MoA
+    # preset as the runtime model. Passing ``moa_config`` into a normal provider's
+    # run_conversation() only appends private MoA context to that provider; it
+    # does not switch the acting runtime to the MoA aggregator and does not expose
+    # the reference blocks to WebUI as standard ``moa.reference`` /
+    # ``moa.aggregating`` events.
+    #
+    # Keep the session's persisted model/provider unchanged for /moa one-shot
+    # semantics. Only the worker receives provider=moa + preset model; the
+    # response intentionally continues to report the original model state so the
+    # browser does not switch the whole session to MoA after one /moa turn.
+    moa_requested = bool(moa_config) or str(model_provider or "").strip().lower() == "moa"
+    backend_is_gateway = webui_gateway_chat_enabled(get_config()) and not moa_requested
     worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
     worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
     if moa_config and not backend_is_gateway:
         worker_kwargs["moa_config"] = moa_config
+        worker_kwargs["runtime_model"] = str(moa_config.get("preset") or moa_config.get("default_preset") or "default")
+        worker_kwargs["runtime_model_provider"] = "moa"
     thr = threading.Thread(
         target=worker_target,
         args=(s.session_id, msg, model, workspace, stream_id, attachments),

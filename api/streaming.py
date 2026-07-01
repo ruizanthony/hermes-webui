@@ -6209,6 +6209,8 @@ def _run_agent_streaming(
     model_provider=None,
     goal_related=False,
     moa_config=None,
+    runtime_model=None,
+    runtime_model_provider=None,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
 
@@ -6642,13 +6644,25 @@ def _run_agent_streaming(
         s = get_session(session_id)
         update_active_run(stream_id, phase="running", session_id=session_id)
         s.workspace = str(Path(workspace).expanduser().resolve())
-        s.model = model
-        provider_context = (
+        runtime_override_active = runtime_model is not None or runtime_model_provider is not None
+        session_model = model
+        session_provider_context = (
             str(model_provider).strip().lower()
             if model_provider is not None
             else getattr(s, "model_provider", None)
         )
-        s.model_provider = provider_context or None
+        # runtime_* lets a one-shot route such as /moa execute with a virtual
+        # provider without permanently switching the visible session model.
+        # Normal sends and explicit model picks leave runtime_* unset, preserving
+        # the historical single model/provider path.
+        model = runtime_model if runtime_model is not None else model
+        provider_context = (
+            str(runtime_model_provider).strip().lower()
+            if runtime_model_provider is not None
+            else session_provider_context
+        )
+        s.model = session_model
+        s.model_provider = session_provider_context or None
 
         _agent_lock = _get_session_agent_lock(session_id)
         # TD1: set thread-local env context so concurrent sessions don't clobber globals
@@ -6690,9 +6704,16 @@ def _run_agent_streaming(
             profile_home=_profile_home,
             has_profile=bool(getattr(s, "profile", None)),
         )
-        s.model_provider = provider_context
-        if _repaired and model != (s.model or ""):
-            s.model = model
+        if runtime_override_active:
+            # One-shot runtime overrides (notably /moa) must not become the
+            # session's durable model/provider. The agent below still uses the
+            # resolved runtime model/provider held in local variables.
+            s.model = session_model
+            s.model_provider = session_provider_context or None
+        else:
+            s.model_provider = provider_context
+            if _repaired and model != (s.model or ""):
+                s.model = model
 
         # Capture the resolved profile name now, while profile context is
         # reliable. Used in the compression migration block to stamp s.profile
