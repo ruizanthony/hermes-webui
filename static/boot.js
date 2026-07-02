@@ -3244,16 +3244,40 @@ window._applyTitlebarProfileVisibility=_applyTitlebarProfileVisibility;
   try{if(typeof renderSessionList==='function') void renderSessionList();}catch(_){}
 });
 
-// Fix #822 (bfcache path): when the browser restores the page from the
-// back-forward cache, the async boot IIFE above does NOT re-run, but the
-// DOM — including any stale value in #sessionSearch — IS restored.  A
-// prior search string would silently hide all sessions via the filter in
-// renderSessionListFromCache().  Clear the field and re-run the full layout
-// sync whenever the page is restored from cache (`event.persisted === true`).
-// Fix #1045: also re-run topbar/workspace/panel state so the rail and layout
-// chrome aren't left in the stale bfcache snapshot.
-window.addEventListener('pageshow', async (event) => {
-  if (!event.persisted) return;  // fresh loads are handled by the IIFE above
+let _profileResumeSyncInFlight = null;
+
+async function _resyncProfileSessionListAfterResume(reason){
+  if(_profileResumeSyncInFlight) return _profileResumeSyncInFlight;
+  _profileResumeSyncInFlight = (async()=>{
+    let profileChanged = false;
+    try {
+      const profile = await api('/api/profile/active', {timeoutToast:false});
+      const name = profile && typeof profile.name === 'string' ? profile.name.trim() : '';
+      if (name && S.activeProfile !== name) {
+        S.activeProfile = name;
+        S.activeProfileIsDefault = !!profile.is_default;
+        profileChanged = true;
+        if (typeof _showAllProfiles !== 'undefined') _showAllProfiles = false;
+        if (typeof _activeProject !== 'undefined') _activeProject = null;
+      }
+      if (profile && profile.default_workspace) {
+        S._profileDefaultWorkspace = profile.default_workspace;
+      }
+    } catch (_) {}
+    if (typeof syncTopbar === 'function') try { syncTopbar(); } catch (_) {}
+    if (typeof syncWorkspacePanelState === 'function') try { syncWorkspacePanelState(); } catch (_) {}
+    if (typeof renderSessionList === 'function') {
+      try { await renderSessionList({deferWhileInteracting:false}); } catch (_) {}
+    } else if (typeof renderSessionListFromCache === 'function') {
+      try { renderSessionListFromCache(); } catch (_) {}
+    }
+    return {profileChanged, reason};
+  })();
+  try { return await _profileResumeSyncInFlight; }
+  finally { _profileResumeSyncInFlight = null; }
+}
+
+async function _restoreWebUiAfterBrowserResume(event){
   const _srch = document.getElementById('sessionSearch');
   if (_srch) _srch.value = '';
   if (typeof syncSessionSearchClear === 'function') syncSessionSearchClear();
@@ -3263,10 +3287,16 @@ window.addEventListener('pageshow', async (event) => {
   if (typeof closeReasoningDropdown === 'function') try { closeReasoningDropdown(); } catch (_) {}
   if (typeof closeWsDropdown === 'function') try { closeWsDropdown(); } catch (_) {}
   if (typeof closeProfileDropdown === 'function') try { closeProfileDropdown(); } catch (_) {}
+
+  const resumeSync = await _resyncProfileSessionListAfterResume(event && event.type || 'resume');
+  const profileChanged = !!(resumeSync && resumeSync.profileChanged);
   // BFCache restores the frozen DOM without rerunning boot. Refresh the active
   // session through the normal load path so in-flight sessions with
   // active_stream_id / pending_user_message can reattach like a reload restore.
-  if (S.session && S.session.session_id && typeof loadSession === 'function') {
+  // If the profile cookie changed while this page was frozen, the old active
+  // session belongs to another profile; skip that detail load and let the fresh
+  // profile-scoped sidebar render above be authoritative.
+  if (!profileChanged && S.session && S.session.session_id && typeof loadSession === 'function') {
     try {
       await loadSession(S.session.session_id);
       if (S.session && S.session.session_id && typeof checkInflightOnBoot === 'function') {
@@ -3274,14 +3304,8 @@ window.addEventListener('pageshow', async (event) => {
       }
     } catch (_) {}
   }
-  // Re-synchronise layout chrome that the boot IIFE sets up but bfcache
-  // doesn't re-run. Each call is guarded so missing helpers degrade silently.
-  if (typeof syncTopbar === 'function') try { syncTopbar(); } catch (_) {}
-  if (typeof syncWorkspacePanelState === 'function') try { syncWorkspacePanelState(); } catch (_) {}
-  if (typeof renderSessionListFromCache === 'function') {
-    try { renderSessionListFromCache(); } catch (_) {}
-  }
   // Restart the gateway SSE watcher — the persisted connection is dead after bfcache
+  // and can also be stale after an installed-PWA visibility resume.
   if (typeof startGatewaySSE === 'function') try { startGatewaySSE(); } catch (_) {}
   // Re-sync sidebar collapse state from localStorage. bfcache restored the
   // frozen DOM but another tab may have toggled the sidebar in the meantime.
@@ -3293,6 +3317,27 @@ window.addEventListener('pageshow', async (event) => {
       if (typeof _syncSidebarAria === 'function') _syncSidebarAria();
     } catch (_) {}
   }
+}
+
+// Fix #822 (bfcache path): when the browser restores the page from the
+// back-forward cache, the async boot IIFE above does NOT re-run, but the
+// DOM — including any stale value in #sessionSearch — IS restored.  A
+// prior search string would silently hide all sessions via the filter in
+// renderSessionListFromCache().  Clear the field and re-run the full layout
+// sync whenever the page is restored from cache (`event.persisted === true`).
+// Fix #1045: also re-run topbar/workspace/panel state so the rail and layout
+// chrome aren't left in the stale bfcache snapshot. Installed PWAs also resume
+// through visibilitychange without a full navigation, so revalidate the active
+// profile cookie and fetch a fresh profile-scoped session list there too.
+window.addEventListener('pageshow', (event) => {
+  if (!event.persisted) return;  // fresh loads are handled by the IIFE above
+  void _restoreWebUiAfterBrowserResume(event);
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (!window.HermesPWA || !HermesPWA.isStandalone || !HermesPWA.isStandalone()) return;
+  void _restoreWebUiAfterBrowserResume({type:'visibilitychange'});
 });
 
 async function shutdownServer() {

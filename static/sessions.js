@@ -3170,6 +3170,31 @@ let _serverWebuiSessionCount = null;  // explicit server count for WebUI session
 let _serverCliSessionCount = null;    // explicit server count for CLI sessions
 let _sessionSourceFilter = 'webui';  // 'webui' keeps WebUI chats separate from read-only CLI sessions
 _restoreSessionSourceFilter();
+
+function _currentSessionListScope(){
+  return {
+    profile: S.activeProfile || 'default',
+    allProfiles: !!_showAllProfiles,
+    sidebarSource: _requestedSessionSidebarSource(),
+    excludeHidden: _sessionListExcludeHiddenEnabled(),
+  };
+}
+
+function _sessionListScopeMatchesCurrent(scope){
+  if(!scope) return true;
+  const current=_currentSessionListScope();
+  return scope.profile===current.profile
+    && scope.allProfiles===current.allProfiles
+    && scope.sidebarSource===current.sidebarSource
+    && scope.excludeHidden===current.excludeHidden;
+}
+
+function _refreshSessionListAfterScopeMismatch(){
+  if(_sessionListSkeletonActive) return;
+  if(typeof showSessionListSkeleton==='function') showSessionListSkeleton(S.activeProfile||'default');
+  void renderSessionList({deferWhileInteracting:false});
+}
+
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
@@ -6335,6 +6360,10 @@ function renderSessionListFromCache(){
   // _applySessionListPayload — once _allSessions is fresh — so only a render backed by
   // up-to-date data replaces the skeleton. The failure-restore path clears it too.
   if(_sessionListSkeletonActive) return;
+  if(!_sessionListScopeMatchesCurrent(_allSessionsScope)){
+    _refreshSessionListAfterScopeMismatch();
+    return;
+  }
   // Don't re-render while user is actively renaming a session (would destroy the input)
   if(_renamingSid) return;
   // Keep the per-conversation actions menu stable while the user is trying to
