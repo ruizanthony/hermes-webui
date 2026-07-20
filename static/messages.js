@@ -7798,12 +7798,10 @@ function stopSessionStream() {
 // Events without `event_id` are ignored — the server contract guarantees one
 // on every completion emit, so a missing key signals a malformed or replayed
 // payload we should not surface or ack.
-// PR (c) UX surface: post-dedupe the handler marks the session viewed (when
-// the session pane is current and the doc is visible+focused), then runs the
-// T4 drop-when-focused gate; only out-of-focus or off-pane completions spawn
-// a toast. The diagnostic ack POST still fires for both focused and
-// unfocused viewers so the server receives the delivery/cleanup signal;
-// the focus gate suppresses UI noise only.
+// Quiet completion policy: post-dedupe the handler updates viewed/unread state
+// only when the session is actively viewed, then always sends the diagnostic
+// ack. It never renders task ids or technical summaries; the server-side wakeup
+// lets the agent produce the sole user-facing, consolidated response.
 function _handleBgTaskCompleteEvent(e, expectedSid, opts) {
   try {
     const d = JSON.parse(e.data || '{}');
@@ -7817,13 +7815,6 @@ function _handleBgTaskCompleteEvent(e, expectedSid, opts) {
     if (_viewed) {
       try { _markSessionViewed(sid, (S&&S.session&&S.session.session_id===sid)?(S.session.message_count??(S.messages&&S.messages.length)??0):0); } catch(_){}
       try { if(typeof _clearSessionCompletionUnread==='function') _clearSessionCompletionUnread(sid); } catch(_){}
-    } else {
-      // T4 drop-when-focused: suppress toast only; ack below still fires.
-      try {
-        const tid = (d.task_id || '').slice(0, 8) || '?';
-        const tail = d.summary ? `: ${String(d.summary).slice(0, 80)}` : '';
-        showToast(`Task ${tid} done${tail}`, 2600);
-      } catch (_) {}
     }
 
     // Fire-and-forget ack (diagnostic only — Option Z made this a no-op for
@@ -7843,11 +7834,9 @@ function _handleBgTaskCompleteEvent(e, expectedSid, opts) {
     // to wake the agent. Server-side wakeup is the PRIMARY mechanism — the
     // drain thread starts the turn directly (no tab required), so the
     // closed-tab case works (parity with CLI/Telegram). The per-session SSE
-    // channel this handler is wired into is DEMOTED to a pure live-view
-    // layer: if a tab is open the server-initiated turn streams live via the
-    // existing chat-stream EventSource; if the tab is closed the turn still
-    // runs server-side and the result is persisted to the session store.
-    // The user-facing toast + drop-when-focused gate land in PR (c).
+    // channel this handler is wired into is only a live-view layer: if a tab is
+    // open the server-initiated turn streams live; otherwise the final assistant
+    // response is persisted for later.
   } catch(_) {}
 }
 

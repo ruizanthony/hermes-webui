@@ -84,10 +84,10 @@ def test_format_wakeup_prompt_handles_watch_disabled():
         "command": "tail -f log",
         "message": "Watch patterns disabled for process proc_abc.",
     }
-    assert (
-        format_wakeup_prompt(evt)
-        == "[IMPORTANT: Watch patterns disabled for process proc_abc.]"
-    )
+    result = format_wakeup_prompt(evt)
+    assert result is not None
+    assert "[IMPORTANT: Watch patterns disabled for process proc_abc.]" in result
+    assert "internal orchestration input" in result.lower()
 
 
 def test_format_wakeup_prompt_skips_blank_watch_disabled():
@@ -103,10 +103,10 @@ def test_format_wakeup_prompt_handles_watch_overflow_tripped():
         "command": "",
         "message": "Watch-pattern overflow: suppressing further watch_match events.",
     }
-    assert (
-        format_wakeup_prompt(evt)
-        == "[IMPORTANT: Watch-pattern overflow: suppressing further watch_match events.]"
-    )
+    result = format_wakeup_prompt(evt)
+    assert result is not None
+    assert "[IMPORTANT: Watch-pattern overflow: suppressing further watch_match events.]" in result
+    assert "internal orchestration input" in result.lower()
 
 
 def test_format_wakeup_prompt_handles_watch_overflow_released():
@@ -118,13 +118,13 @@ def test_format_wakeup_prompt_handles_watch_overflow_released():
         "suppressed": 3,
         "message": "Watch-pattern notifications resumed. 3 match event(s) were suppressed.",
     }
-    assert (
-        format_wakeup_prompt(evt)
-        == "[IMPORTANT: Watch-pattern notifications resumed. 3 match event(s) were suppressed.]"
-    )
+    result = format_wakeup_prompt(evt)
+    assert result is not None
+    assert "[IMPORTANT: Watch-pattern notifications resumed. 3 match event(s) were suppressed.]" in result
+    assert "internal orchestration input" in result.lower()
 
 
-def test_format_wakeup_prompt_keeps_normal_completion():
+def test_format_wakeup_prompt_keeps_normal_completion_inside_executive_envelope():
     evt = {
         "type": "completion",
         "session_id": "proc_abc",
@@ -137,3 +137,32 @@ def test_format_wakeup_prompt_keeps_normal_completion():
     assert "Background process proc_abc completed" in result
     assert "Command: sleep 1" in result
     assert "Output:\ndone" in result
+    assert "internal orchestration input" in result.lower()
+    assert "inspect remaining background work" in result.lower()
+    assert "one concise executive-level update" in result.lower()
+    assert "decision, blocker, or meaningful final result" in result.lower()
+    assert "do not quote process ids, commands, or raw output" in result.lower()
+
+
+def test_async_delegation_wakeup_uses_the_same_executive_envelope(monkeypatch):
+    import sys
+    import types
+
+    fake_mod = types.ModuleType("tools.process_registry")
+    setattr(
+        fake_mod,
+        "format_process_notification",
+        lambda _evt: "[ASYNC DELEGATION COMPLETE — t_1]\nTechnical review finished.",
+    )
+    fake_pkg = sys.modules.get("tools") or types.ModuleType("tools")
+    monkeypatch.setitem(sys.modules, "tools", fake_pkg)
+    monkeypatch.setitem(sys.modules, "tools.process_registry", fake_mod)
+
+    result = format_wakeup_prompt(
+        {"type": "async_delegation", "delegation_id": "d_1", "status": "completed"}
+    )
+
+    assert result is not None
+    assert "Technical review finished" in result
+    assert "internal orchestration input" in result.lower()
+    assert "one concise executive-level update" in result.lower()
