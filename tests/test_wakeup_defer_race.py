@@ -196,7 +196,9 @@ def test_completion_during_turn_teardown_still_wakes(monkeypatch):
         call = holder["calls"][0]
         assert call["session_id"] == sid
         assert call["source"] == "process_wakeup"
-        assert call["message"].startswith("[IMPORTANT: Background process")
+        assert call["message"].startswith("[INTERNAL BACKGROUND EVENT")
+        assert "internal orchestration input" in call["message"].lower()
+        assert "[IMPORTANT: Background process proc-fast-1 completed" in call["message"]
         # Claimed → nothing left to re-deliver.
         assert sid not in cfg.DEFERRED_PROCESS_WAKEUPS
     finally:

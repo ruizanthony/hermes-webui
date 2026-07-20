@@ -604,18 +604,13 @@ def test_real_completion_event_shape_routes_to_session_channel():
         assert data["session_id"] == webui_sid
         assert data["task_id"] == proc_id
         assert data.get("event_id"), "emitter must stamp event_id (Q4 contract)"
-        # Per the Q1 minimal-payload trim settled in #2242, the SSE payload
-        # no longer carries ``wakeup_prompt`` (or ``command`` / ``exit_code``).
-        # The optional ``summary`` field is now the only human-readable
-        # surface; when the synthetic wakeup body is available the emitter
-        # derives a short first-line summary from it.
+        # The completion event is transport-only: the synthetic wakeup stays
+        # server/model-side and the agent's assistant response is the sole
+        # user-facing summary. No process text belongs in the SSE payload.
         assert "wakeup_prompt" not in data
         assert "command" not in data
         assert "exit_code" not in data
-        summary = data.get("summary")
-        if summary is not None:
-            assert isinstance(summary, str)
-            assert "IMPORTANT" in summary or "Background process" in summary
+        assert "summary" not in data
     finally:
         ch.unsubscribe(q)
         with bp.SESSION_CHANNELS_LOCK:
@@ -695,7 +690,9 @@ def test_server_side_wakeup_when_idle_no_tab(monkeypatch):
         call = holder["calls"][0]
         assert call["session_id"] == sid
         assert call["source"] == "process_wakeup"
-        assert call["message"].startswith("[IMPORTANT: Background process")
+        assert call["message"].startswith("[INTERNAL BACKGROUND EVENT")
+        assert "internal orchestration input" in call["message"].lower()
+        assert "[IMPORTANT: Background process" in call["message"]
     finally:
         bp.unregister_process_session(sid)
         cfg.PENDING_BG_TASK_COMPLETIONS.discard(sid)

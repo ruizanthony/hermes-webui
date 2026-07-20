@@ -617,7 +617,7 @@ function _cancelMessageVirtualizedRender(){
 }
 function _messageIsRenderable(m){
   if(!m||!m.role||m.role==='tool') return false;
-  if(m._source === 'process_wakeup') return !!(msgContent(m)||m.attachments?.length);
+  if(m._source === 'process_wakeup') return false;
   if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) return false;
   if(_isRecoveryControlMessage(m)) return false;
   const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
@@ -626,6 +626,11 @@ function _messageIsRenderable(m){
   const hasReasoningAnchor=hasTc||hasTu||_messageHasReasoningPayload(m);
   const hasAssistantVisibleAnchor=hasTc||hasTu||hasPartialTc||_messageHasReasoningPayload(m)||_assistantMessageHasVisibleContent(m);
   return !!(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasReasoningAnchor||hasAssistantVisibleAnchor)));
+}
+function _hasHiddenProcessWakeupBoundaryBefore(rawIdx){
+  if(!Number.isInteger(rawIdx)||rawIdx<=0||!Array.isArray(S.messages)) return false;
+  const previous=S.messages[rawIdx-1];
+  return !!(previous&&previous._source==='process_wakeup');
 }
 function _getVisibleMessagesWithIdx(){
   if(!_visWithIdxCache || _visWithIdxCacheLen !== S.messages.length || _visWithIdxCacheSrc !== S.messages){
@@ -16099,6 +16104,7 @@ function renderMessages(options){
     }
     const isProcessWakeup=m&&m._source==='process_wakeup';
     const isUser=m.role==='user';
+    if(_hasHiddenProcessWakeupBoundaryBefore(rawIdx)) currentAssistantTurn=null;
     if(!isUser&&_isMarkerOnlyAssistantCompressionMessage(m)){
       content='**Error:** No response received after context compression. Please retry.';
     }
