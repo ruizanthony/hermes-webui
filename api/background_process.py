@@ -463,8 +463,26 @@ def _truncate(text: str, limit: int) -> str:
     return s[:limit] + "\n…(truncated)"
 
 
+def _executive_wakeup_prompt(technical_event: str | None) -> str | None:
+    """Keep wakeup details model-visible while making them internal orchestration input."""
+    if not isinstance(technical_event, str) or not technical_event.strip():
+        return None
+    return (
+        "[INTERNAL BACKGROUND EVENT — this is internal orchestration input, not a user message.\n"
+        "Use it to resume the current task. Before producing user-visible text, inspect remaining "
+        "background work for the same task and consolidate related completions. If useful work remains, "
+        "continue with tools instead of posting an interim report.\n"
+        "Only address the user when there is a decision, blocker, or meaningful final result. Then write "
+        "one concise executive-level update in the user's language: outcome, operational impact, risk, "
+        "and next decision or action. Do not quote process IDs, commands, or raw output unless the user "
+        "explicitly asks for technical detail.\n"
+        "Technical event follows:\n"
+        f"{technical_event}]"
+    )
+
+
 def format_wakeup_prompt(evt: object) -> str | None:
-    """Build the synthetic [IMPORTANT: …] message the agent will see.
+    """Build the synthetic internal event message the agent will see.
 
     Mirrors ``cli._format_process_notification`` so wakeup payloads look the
     same in CLI and WebUI sessions.
@@ -481,10 +499,10 @@ def format_wakeup_prompt(evt: object) -> str | None:
     # mis-rendered as a fake process completion.
     if evt_type in {"watch_overflow_tripped", "watch_overflow_released"}:
         msg = str(evt.get("message") or "").strip()
-        return f"[IMPORTANT: {msg}]" if msg else None
+        return _executive_wakeup_prompt(f"[IMPORTANT: {msg}]") if msg else None
     if evt_type == "watch_disabled":
         msg = str(evt.get("message") or "").strip()
-        return f"[IMPORTANT: {msg}]" if msg else None
+        return _executive_wakeup_prompt(f"[IMPORTANT: {msg}]") if msg else None
     if evt_type == "watch_match":
         pat = evt.get("pattern", "?")
         out = _truncate(evt.get("output", ""), 4000)
@@ -496,7 +514,7 @@ def format_wakeup_prompt(evt: object) -> str | None:
         )
         if sup:
             body += f"\n({sup} earlier matches were suppressed by rate limit)"
-        return body + "]"
+        return _executive_wakeup_prompt(body + "]")
     if evt_type == "async_delegation":
         # A background ``delegate_task`` completion. The agent-side formatter
         # renders these; delegate to it so the subagent result re-enters the
@@ -507,7 +525,7 @@ def format_wakeup_prompt(evt: object) -> str | None:
             )
             result = _agent_fmt(evt)
             if result:
-                return result
+                return _executive_wakeup_prompt(result)
         except Exception:
             logger.debug(
                 "agent-side format_process_notification fallback failed for "
@@ -525,7 +543,7 @@ def format_wakeup_prompt(evt: object) -> str | None:
     # Default: completion event
     exit_code = evt.get("exit_code", "?")
     out = _truncate(evt.get("output", ""), 4000)
-    return (
+    return _executive_wakeup_prompt(
         f"[IMPORTANT: Background process {sid} completed (exit_code={exit_code}).\n"
         f"Command: {cmd}\n"
         f"Output:\n{out}]"
@@ -535,17 +553,15 @@ def format_wakeup_prompt(evt: object) -> str | None:
 def _build_payload(evt: dict, session_id: str) -> dict:
     """Build the SSE data payload.
 
-    Shape per maintainer decision on PR #2242 (R2 §Q1):
-        ``{session_id, task_id, completed_at, summary?, event_id}``
-    Minimal by design — consumers re-fetch task detail by ``task_id`` if
-    they need ``command`` / ``exit_code`` / ``stdout_preview`` etc.
+    Shape:
+        ``{session_id, task_id, completed_at, event_id}``
+    Minimal by design — consumers only need stable routing and deduplication.
+    Human-readable process details stay server/model-side so the agent's eventual
+    assistant response remains the sole user-facing summary.
 
     - ``task_id``: the background process id (registry uuid). Stable across
       the process's lifetime; was previously surfaced as ``process_id``.
     - ``completed_at``: float wall-clock seconds; was ``emitted_at``.
-    - ``summary``: optional one-liner derived from the completion event when
-      available (e.g. ``[IMPORTANT: …]`` synthetic body's first line); omitted
-      otherwise to honour "keep the payload minimal".
     - ``event_id``: server-generated uuid hex — per-emit, so a re-emit for the
       same ``task_id`` (shouldn't happen today, but the spec is forward-looking)
       still produces a distinct id. The cross-A/B dedupe stays keyed on
@@ -563,26 +579,6 @@ def _build_payload(evt: dict, session_id: str) -> dict:
         "completed_at": time.time(),
         "event_id": uuid.uuid4().hex,
     }
-    # Best-effort optional summary: the first non-empty line of the synthetic
-    # wakeup body, trimmed. Omitted entirely when nothing useful is available.
-    try:
-        wakeup_body = format_wakeup_prompt(evt)
-        if wakeup_body:
-            # Strip leading "[IMPORTANT: " marker noise — take the first
-            # informative line, cap length.
-            first_line = next(
-                (
-                    ln.strip().lstrip("[").rstrip("]").strip()
-                    for ln in wakeup_body.splitlines()
-                    if ln.strip()
-                ),
-                "",
-            )
-            if first_line:
-                payload["summary"] = _truncate(first_line, 200)
-    except Exception:
-        # Summary is optional; never let its derivation block the emit.
-        logger.debug("summary derivation failed", exc_info=True)
     return payload
 
 
