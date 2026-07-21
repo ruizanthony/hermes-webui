@@ -10,6 +10,7 @@ Discovery order for all paths:
 """
 
 import collections
+import contextlib
 import copy
 import hashlib
 import json
@@ -9025,17 +9026,45 @@ LAST_RUN_FINISHED_AT: float | None = None
 SERVER_START_TIME = time.time()
 
 
-def register_active_run(stream_id: str, **metadata) -> None:
-    """Mark a WebUI agent worker as alive until its outer finally exits."""
+def register_active_run(stream_id: str, *, expected_stream=None, **metadata) -> bool:
+    """Atomically register or refresh one complete stream/run owner.
+
+    When ``expected_stream`` is supplied, registration also proves that the
+    caller still owns the exact route-created channel and its session mapping.
+    A complete existing identity may only be refreshed by the same owner.
+    """
     if not stream_id:
-        return
+        return False
     now = time.time()
     entry = dict(metadata or {})
     entry.setdefault("stream_id", stream_id)
     entry.setdefault("started_at", now)
     entry.setdefault("phase", "running")
-    with ACTIVE_RUNS_LOCK:
-        ACTIVE_RUNS[stream_id] = entry
+    candidate_owner = tuple(
+        str(entry.get(key) or "").strip()
+        for key in ("session_id", "turn_id", "prompt_hash")
+    )
+
+    stream_lock = STREAMS_LOCK if expected_stream is not None else contextlib.nullcontext()
+    with stream_lock:
+        if expected_stream is not None:
+            if STREAMS.get(stream_id) is not expected_stream:
+                return False
+            session_id = candidate_owner[0]
+            owner_session_id = stream_owner_session_id(stream_id)
+            if session_id and owner_session_id is not None and owner_session_id != session_id:
+                return False
+        with ACTIVE_RUNS_LOCK:
+            current = ACTIVE_RUNS.get(stream_id)
+            current_owner = tuple(
+                str((current or {}).get(key) or "").strip()
+                for key in ("session_id", "turn_id", "prompt_hash")
+            )
+            if current is not None and all(current_owner):
+                if not all(candidate_owner) or candidate_owner != current_owner:
+                    return False
+            ACTIVE_RUNS[stream_id] = entry
+    return True
 
 
 def update_active_run(stream_id: str, **metadata) -> None:

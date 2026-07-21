@@ -21323,6 +21323,7 @@ def _start_chat_stream_for_session(
         STREAMS[stream_id] = stream
     register_active_run(
         stream_id,
+        expected_stream=stream,
         session_id=s.session_id,
         started_at=s.pending_started_at,
         phase="queued",
@@ -21339,6 +21340,7 @@ def _start_chat_stream_for_session(
         "goal_related": goal_related,
         "turn_id": turn_id,
         "prompt_hash": prompt_hash,
+        "stream": stream,
     }
     if moa_config and not backend_is_gateway:
         worker_kwargs["moa_config"] = moa_config

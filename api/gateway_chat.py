@@ -867,6 +867,7 @@ def _run_gateway_chat_streaming(
     goal_related=False,
     turn_id=None,
     prompt_hash=None,
+    stream=None,
 ):
     """Bridge a WebUI chat turn through Hermes Gateway's API server.
 
@@ -876,7 +877,7 @@ def _run_gateway_chat_streaming(
     the configured Gateway API server into those local events and persists the
     final user/assistant turn back into the WebUI session.
     """
-    q = STREAMS.get(stream_id)
+    q = stream if stream is not None else STREAMS.get(stream_id)
     if q is None:
         _finish_gateway_run_starting(stream_id, result="fallback")
         _clear_gateway_run_starting(stream_id)
@@ -884,8 +885,9 @@ def _run_gateway_chat_streaming(
         # layer registered so STREAM_SESSION_OWNERS does not leak (no teardown finally runs).
         unregister_stream_owner(stream_id)
         return
-    register_active_run(
+    if not register_active_run(
         stream_id,
+        expected_stream=q,
         session_id=session_id,
         started_at=time.time(),
         phase="gateway-starting",
@@ -895,7 +897,8 @@ def _run_gateway_chat_streaming(
         backend="gateway",
         turn_id=turn_id,
         prompt_hash=prompt_hash,
-    )
+    ):
+        return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
     except Exception:

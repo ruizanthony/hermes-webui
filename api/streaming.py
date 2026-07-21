@@ -7186,6 +7186,7 @@ def _run_agent_streaming(
     turn_id=None,
     prompt_hash=None,
     moa_config=None,
+    stream=None,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
 
@@ -7194,15 +7195,16 @@ def _run_agent_streaming(
     """
     _turn_route_model = model
     _turn_route_provider = model_provider
-    q = STREAMS.get(stream_id)
+    q = stream if stream is not None else STREAMS.get(stream_id)
     if q is None:
         # The stream was cancelled before the worker started; the route layer
         # already registered the stream owner, so release it here to avoid
         # leaking a STREAM_SESSION_OWNERS entry that the teardown finally never sees.
         unregister_stream_owner(stream_id)
         return
-    register_active_run(
+    if not register_active_run(
         stream_id,
+        expected_stream=q,
         session_id=session_id,
         started_at=time.time(),
         phase="starting",
@@ -7212,7 +7214,8 @@ def _run_agent_streaming(
         ephemeral=bool(ephemeral),
         turn_id=turn_id,
         prompt_hash=prompt_hash,
-    )
+    ):
+        return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
     except Exception:
