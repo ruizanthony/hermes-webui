@@ -29,6 +29,7 @@ from api.config import (
     gateway_supports_approval,
     register_active_run,
     unregister_active_run,
+    unregister_active_run_if_matches,
     unregister_stream_owner,
     update_active_run,
 )
@@ -145,6 +146,43 @@ def wait_for_gateway_run_id(stream_id: str, timeout: float) -> tuple[bool, str |
                 state["waiters"] = waiters
                 if _retire_gateway_run_starting_if_done(stream_id):
                     _STREAM_RUN_STARTING_CONDITION.notify_all()
+
+
+def _teardown_gateway_stream_globals_if_owned(
+    stream_id, stream, *, turn_id=None, prompt_hash=None,
+    runs_api_pending_marked=False,
+):
+    """Release gateway globals only while this worker owns the exact channel."""
+    with STREAMS_LOCK:
+        if STREAMS.get(stream_id) is not stream:
+            return False
+        AGENT_INSTANCES.pop(stream_id, None)
+        CANCEL_FLAGS.pop(stream_id, None)
+        STREAM_GOAL_RELATED.pop(stream_id, None)
+        STREAM_PARTIAL_TEXT.pop(stream_id, None)
+        STREAM_REASONING_TEXT.pop(stream_id, None)
+        STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
+        STREAM_LAST_EVENT_ID.pop(stream_id, None)
+        STREAMS.pop(stream_id, None)
+        # Keep run-id publication available until approval waiters have consumed
+        # it. Holding STREAMS_LOCK across this lifecycle cleanup prevents a new
+        # channel reusing stream_id from being registered between the ownership
+        # check above and the lifecycle mutation below.
+        with _STREAM_RUN_STARTING_CONDITION:
+            if stream_id in _STREAM_RUN_LIFECYCLE:
+                if runs_api_pending_marked and gateway_run_id_pending(stream_id):
+                    _finish_gateway_run_starting(stream_id)
+                _clear_gateway_run_starting(stream_id)
+            else:
+                _STREAM_RUN_IDS.pop(stream_id, None)
+    if turn_id and prompt_hash:
+        unregister_active_run_if_matches(
+            stream_id, turn_id=turn_id, prompt_hash=prompt_hash
+        )
+    else:
+        unregister_active_run(stream_id)
+    return True
+
 
 _WEBUI_CHAT_BACKEND_ENV = "HERMES_WEBUI_CHAT_BACKEND"
 _WEBUI_GATEWAY_BASE_URL_ENV = "HERMES_WEBUI_GATEWAY_BASE_URL"
@@ -1392,17 +1430,7 @@ def _run_gateway_chat_streaming(
             except Exception:
                 logger.debug("Failed to clear gateway stream state", exc_info=True)
             _cleanup_gateway_pending_mirror(session_id)
-        with STREAMS_LOCK:
-            AGENT_INSTANCES.pop(stream_id, None)
-            CANCEL_FLAGS.pop(stream_id, None)
-            STREAM_GOAL_RELATED.pop(stream_id, None)
-            STREAM_PARTIAL_TEXT.pop(stream_id, None)
-            STREAM_REASONING_TEXT.pop(stream_id, None)
-            STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
-            STREAM_LAST_EVENT_ID.pop(stream_id, None)
-            STREAMS.pop(stream_id, None)
-        if runs_api_pending_marked and gateway_run_id_pending(stream_id):
-            _finish_gateway_run_starting(stream_id)
-        _clear_gateway_run_starting(stream_id)
-        unregister_stream_owner(stream_id)
-        unregister_active_run(stream_id)
+        _teardown_gateway_stream_globals_if_owned(
+            stream_id, q, turn_id=turn_id, prompt_hash=prompt_hash,
+            runs_api_pending_marked=runs_api_pending_marked,
+        )

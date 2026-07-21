@@ -112,6 +112,41 @@ def test_clear_endpoint_sets_truncation_watermark(monkeypatch, tmp_path):
     assert loaded.messages == []
 
 
+def test_clear_endpoint_invalidates_legacy_and_gateway_late_writeback(monkeypatch, tmp_path):
+    from api.active_checkpoint import build_active_checkpoint
+    from api.gateway_chat import _stream_writeback_is_current as gateway_is_current
+    from api.models import Session
+    from api.streaming import _stream_writeback_is_current as legacy_is_current
+
+    _seed_session_dir(monkeypatch, tmp_path)
+    prompt = "prompt being cleared"
+    checkpoint = build_active_checkpoint(
+        stream_id="clear-stream", turn_id="clear-turn", submitted_prompt_text=prompt
+    )
+    session = Session(
+        session_id="clear_checkpoint_owner",
+        messages=_four_turn_messages(),
+        active_stream_id="clear-stream",
+        active_checkpoint=checkpoint,
+        pending_turn_id="clear-turn",
+        pending_user_message=prompt,
+    )
+    session.save()
+
+    captured = _call_clear(monkeypatch, session.session_id)
+    assert captured["payload"].get("ok") is True
+    loaded = Session.load(session.session_id)
+    assert loaded.active_checkpoint is None
+    assert loaded.pending_turn_id is None
+    identity = {
+        "turn_id": "clear-turn",
+        "prompt_hash": checkpoint["prompt_hash"],
+        "submitted_prompt_text": prompt,
+    }
+    assert not legacy_is_current(loaded, "clear-stream", **identity)
+    assert not gateway_is_current(loaded, "clear-stream", **identity)
+
+
 def test_clear_empties_context_messages(monkeypatch, tmp_path):
     """Second-half fix (#5532): context_messages must also be cleared so a
     continued turn does not carry pre-clear context into the model. On master
