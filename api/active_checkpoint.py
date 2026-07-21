@@ -46,7 +46,8 @@ def active_checkpoint_matches(
         str(active.get("turn_id") or "").strip(),
         str(active.get("prompt_hash") or "").strip(),
     )
-    return all(candidate) and candidate == owner
+    active_stream_id = str(getattr(session, "active_stream_id", None) or "").strip()
+    return all(candidate) and active_stream_id == candidate[0] and candidate == owner
 
 
 def clear_active_checkpoint(session: Any) -> None:

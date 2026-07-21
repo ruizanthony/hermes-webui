@@ -9058,6 +9058,34 @@ def unregister_active_run(stream_id: str) -> None:
         LAST_RUN_FINISHED_AT = time.time()
     unregister_stream_owner(stream_id)
 
+
+def unregister_active_run_if_matches(
+    stream_id: str, *, turn_id: str | None, prompt_hash: str | None
+) -> bool:
+    """Remove only the complete run identity owned by the terminating worker."""
+    if not stream_id:
+        return False
+    candidate = (
+        str(turn_id or "").strip(),
+        str(prompt_hash or "").strip(),
+    )
+    if not all(candidate):
+        return False
+    global LAST_RUN_FINISHED_AT
+    with ACTIVE_RUNS_LOCK:
+        entry = ACTIVE_RUNS.get(stream_id)
+        owner = (
+            str((entry or {}).get("turn_id") or "").strip(),
+            str((entry or {}).get("prompt_hash") or "").strip(),
+        )
+        if candidate != owner:
+            return False
+        ACTIVE_RUNS.pop(stream_id, None)
+        LAST_RUN_FINISHED_AT = time.time()
+    unregister_stream_owner(stream_id)
+    return True
+
+
 # Agent cache: reuse AIAgent across messages in the same WebUI session so that
 # _user_turn_count survives between turns.  This mirrors the gateway's
 # _agent_cache pattern and is required for injectionFrequency: "first-turn".

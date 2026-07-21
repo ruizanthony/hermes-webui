@@ -132,6 +132,55 @@ def test_manual_compress_persists_truncation_boundary(monkeypatch, cleanup_test_
     assert loaded.messages == original_messages
 
 
+def test_manual_compress_invalidates_legacy_and_gateway_late_writeback(
+    monkeypatch, cleanup_test_sessions, tmp_path
+):
+    from api.active_checkpoint import build_active_checkpoint
+    from api.gateway_chat import _stream_writeback_is_current as gateway_is_current
+    from api.streaming import _stream_writeback_is_current as legacy_is_current
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(parents=True)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    models.SESSIONS.clear()
+    prompt = "prompt before manual compression"
+    checkpoint = build_active_checkpoint(
+        stream_id="compress-stream", turn_id="compress-turn", submitted_prompt_text=prompt
+    )
+    session = Session(
+        session_id=f"compress_checkpoint_{time.time_ns()}",
+        workspace=str(tmp_path),
+        model="openai/gpt-5.4-mini",
+        messages=[
+            _msg("user", "one", 1.0),
+            _msg("assistant", "two", 2.0),
+            _msg("user", "three", 3.0),
+            _msg("assistant", "four", 4.0),
+        ],
+        active_checkpoint=checkpoint,
+        pending_turn_id="compress-turn",
+    )
+    session.save(touch_updated_at=False)
+    cleanup_test_sessions.append(session.session_id)
+    _install_fake_compression_runtime(monkeypatch, _FakeAgent)
+
+    handler = _FakeHandler()
+    _handle_session_compress(handler, {"session_id": session.session_id})
+
+    assert handler.status == 200
+    loaded = Session.load(session.session_id)
+    assert loaded.active_checkpoint is None
+    assert loaded.pending_turn_id is None
+    identity = {
+        "turn_id": "compress-turn",
+        "prompt_hash": checkpoint["prompt_hash"],
+        "submitted_prompt_text": prompt,
+    }
+    assert not legacy_is_current(loaded, "compress-stream", **identity)
+    assert not gateway_is_current(loaded, "compress-stream", **identity)
+
+
 def test_manual_compress_blocks_state_db_replay(monkeypatch, cleanup_test_sessions, tmp_path):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir(parents=True)

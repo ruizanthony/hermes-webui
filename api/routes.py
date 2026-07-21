@@ -2887,6 +2887,15 @@ def _clear_stale_stream_state(session) -> bool:
     stream_id = getattr(session, "active_stream_id", None)
     if not stream_id:
         return False
+    from api.active_checkpoint import active_checkpoint_matches, clear_active_checkpoint
+    checkpoint = copy.deepcopy(getattr(session, "active_checkpoint", None))
+    checkpoint_identity = None
+    if isinstance(checkpoint, dict):
+        checkpoint_identity = (
+            str(checkpoint.get("stream_id") or "").strip(),
+            str(checkpoint.get("turn_id") or "").strip(),
+            str(checkpoint.get("prompt_hash") or "").strip(),
+        )
     with STREAMS_LOCK:
         stream_alive = stream_id in STREAMS
     if stream_alive:
@@ -2962,15 +2971,13 @@ def _clear_stale_stream_state(session) -> bool:
             # would attempt one ghost SSE reconnect before recovering).
             try:
                 original_stub.active_stream_id = None
-                original_stub.active_checkpoint = None
+                clear_active_checkpoint(original_stub)
                 if hasattr(original_stub, "pending_user_message"):
                     original_stub.pending_user_message = None
                 if hasattr(original_stub, "pending_attachments"):
                     original_stub.pending_attachments = []
                 if hasattr(original_stub, "pending_started_at"):
                     original_stub.pending_started_at = None
-                if hasattr(original_stub, "pending_turn_id"):
-                    original_stub.pending_turn_id = None
                 if hasattr(original_stub, "pending_user_source"):
                     original_stub.pending_user_source = None
             except Exception:
@@ -2983,6 +2990,37 @@ def _clear_stale_stream_state(session) -> bool:
     # case we must NOT clobber its session.active_stream_id.
     with _get_session_agent_lock(session.session_id):
         if getattr(session, "active_stream_id", None) != stream_id:
+            return False
+        if checkpoint_identity is not None and not active_checkpoint_matches(
+            session,
+            stream_id=checkpoint_identity[0],
+            turn_id=checkpoint_identity[1],
+            prompt_hash=checkpoint_identity[2],
+        ):
+            return False
+        # Recheck worker/channel liveness at the point of mutation. A newer turn
+        # may reuse the same stream id while stale cleanup waits for this lock.
+        with STREAMS_LOCK:
+            if stream_id in STREAMS:
+                return False
+        try:
+            from api import config as _live_config
+            with _live_config.ACTIVE_RUNS_LOCK:
+                active_run = (_live_config.ACTIVE_RUNS or {}).get(stream_id)
+                if active_run is not None:
+                    return False
+        except Exception:
+            return False
+        try:
+            pending_started_at = getattr(session, "pending_started_at", None)
+            pending_age = time.time() - float(pending_started_at) if pending_started_at else None
+        except Exception:
+            pending_age = None
+        if (
+            getattr(session, "pending_user_message", None)
+            and pending_age is not None
+            and pending_age < grace_seconds
+        ):
             return False
         if getattr(session, "pending_user_message", None):
             try:
@@ -3006,15 +3044,13 @@ def _clear_stale_stream_state(session) -> bool:
                 if original_stub is not session:
                     try:
                         original_stub.active_stream_id = None
-                        original_stub.active_checkpoint = None
+                        clear_active_checkpoint(original_stub)
                         if hasattr(original_stub, "pending_user_message"):
                             original_stub.pending_user_message = None
                         if hasattr(original_stub, "pending_attachments"):
                             original_stub.pending_attachments = []
                         if hasattr(original_stub, "pending_started_at"):
                             original_stub.pending_started_at = None
-                        if hasattr(original_stub, "pending_turn_id"):
-                            original_stub.pending_turn_id = None
                         if hasattr(original_stub, "pending_user_source"):
                             original_stub.pending_user_source = None
                     except Exception:
@@ -3024,15 +3060,13 @@ def _clear_stale_stream_state(session) -> bool:
                 return False
         _materialize_pending_user_turn_before_error(session)
         session.active_stream_id = None
-        session.active_checkpoint = None
+        clear_active_checkpoint(session)
         if hasattr(session, "pending_user_message"):
             session.pending_user_message = None
         if hasattr(session, "pending_attachments"):
             session.pending_attachments = []
         if hasattr(session, "pending_started_at"):
             session.pending_started_at = None
-        if hasattr(session, "pending_turn_id"):
-            session.pending_turn_id = None
         if hasattr(session, "pending_user_source"):
             session.pending_user_source = None
         try:
@@ -3050,15 +3084,13 @@ def _clear_stale_stream_state(session) -> bool:
     if original_stub is not session:
         try:
             original_stub.active_stream_id = None
-            original_stub.active_checkpoint = None
+            clear_active_checkpoint(original_stub)
             if hasattr(original_stub, "pending_user_message"):
                 original_stub.pending_user_message = None
             if hasattr(original_stub, "pending_attachments"):
                 original_stub.pending_attachments = []
             if hasattr(original_stub, "pending_started_at"):
                 original_stub.pending_started_at = None
-            if hasattr(original_stub, "pending_turn_id"):
-                original_stub.pending_turn_id = None
             if hasattr(original_stub, "pending_user_source"):
                 original_stub.pending_user_source = None
         except Exception:
@@ -15053,6 +15085,8 @@ def handle_post(handler, parsed) -> bool:
                     s.compression_anchor_visible_idx = None
                     s.compression_anchor_message_key = None
             s.active_stream_id = None
+            from api.active_checkpoint import clear_active_checkpoint
+            clear_active_checkpoint(s)
             s.pending_user_message = None
             s.pending_attachments = []
             s.pending_started_at = None
@@ -15074,6 +15108,8 @@ def handle_post(handler, parsed) -> bool:
                     and persisted.get("truncation_watermark") == 0.0
                     and persisted.get("truncation_boundary") == 0.0
                     and persisted.get("active_stream_id") is None
+                    and persisted.get("active_checkpoint") is None
+                    and persisted.get("pending_turn_id") is None
                     and persisted.get("pending_user_message") is None
                     and persisted.get("pending_attachments") == []
                     and persisted.get("pending_started_at") is None
@@ -24774,6 +24810,8 @@ def _handle_session_compress(handler, body):
         original_messages = list(messages)
         original_stream_state = (
             getattr(s, "active_stream_id", None),
+            copy.deepcopy(getattr(s, "active_checkpoint", None)),
+            getattr(s, "pending_turn_id", None),
             getattr(s, "pending_user_message", None),
             copy.deepcopy(getattr(s, "pending_attachments", None)),
             getattr(s, "pending_started_at", None),
@@ -24811,6 +24849,8 @@ def _handle_session_compress(handler, body):
             # If the history changed, the compression result is stale — abort.
             current_stream_state = (
                 getattr(s, "active_stream_id", None),
+                copy.deepcopy(getattr(s, "active_checkpoint", None)),
+                getattr(s, "pending_turn_id", None),
                 getattr(s, "pending_user_message", None),
                 copy.deepcopy(getattr(s, "pending_attachments", None)),
                 getattr(s, "pending_started_at", None),
@@ -24827,6 +24867,8 @@ def _handle_session_compress(handler, body):
             _stamp_missing_message_timestamps(compressed_copy)
             s.context_messages = compressed_copy
             s.active_stream_id = None
+            from api.active_checkpoint import clear_active_checkpoint
+            clear_active_checkpoint(s)
             s.pending_user_message = None
             s.pending_attachments = []
             s.pending_started_at = None

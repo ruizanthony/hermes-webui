@@ -335,7 +335,8 @@ class TestIssue765FollowupHardening:
         join_idx = src.find("if _ckpt_thread is not None:\n                _ckpt_thread.join(timeout=15)")
         lock_idx = src.find(
             "with _agent_lock:\n"
-            "                if not ephemeral and not _stream_writeback_is_current(s, stream_id):"
+            "                if not ephemeral and not _stream_writeback_is_current(\n"
+            "                    s, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,"
         )
         save_idx = src.find("_deduplicate_context_messages(_next_context_messages)")
 
@@ -358,7 +359,8 @@ class TestIssue765FollowupHardening:
         )
         outer_lock_idx = src.find(
             "with _agent_lock:\n"
-            "                if not ephemeral and not _stream_writeback_is_current(s, stream_id):"
+            "                if not ephemeral and not _stream_writeback_is_current(\n"
+            "                    s, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,"
         )
         silent_failure_idx = src.find(
             "if _terminal_failure or (not _assistant_added and not _token_sent):"

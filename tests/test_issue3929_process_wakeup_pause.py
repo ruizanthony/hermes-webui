@@ -2586,7 +2586,12 @@ def test_success_path_clears_process_wakeup_pause_after_late_cancel_checks():
 
 def test_gateway_success_path_checks_cancel_before_clearing_process_wakeup_pause():
     src = Path(__file__).parent.parent.joinpath("api", "gateway_chat.py").read_text(encoding="utf-8")
-    current_idx = src.index("if not _stream_writeback_is_current(s, stream_id):")
+    success_lock_idx = src.index("with _get_session_agent_lock(session_id):\n            s = get_session(session_id)")
+    current_idx = src.index("if not _stream_writeback_is_current(", success_lock_idx)
+    current_guard = src[current_idx:src.index("):", current_idx) + 2]
+    assert "turn_id=turn_id" in current_guard
+    assert "prompt_hash=prompt_hash" in current_guard
+    assert "submitted_prompt_text=msg_text" in current_guard
     early_cancel_idx = src.index("if cancel_event.is_set():", current_idx)
     pending_clear_idx = src.index("s.pending_user_source = None")
     pre_clear_comment_idx = src.index("# Recheck immediately before clearing", pending_clear_idx)

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import api.config as config
 import api.routes as routes
+from api.active_checkpoint import build_active_checkpoint
 
 REPO = Path(__file__).resolve().parents[1]
 ROUTES_SRC = (REPO / "api" / "routes.py").read_text(encoding="utf-8")
@@ -426,6 +427,54 @@ def test_stale_stream_cleanup_does_not_clobber_concurrent_chat_start(monkeypatch
     assert session.pending_user_message == "new prompt"
     assert session.pending_attachments == ["new.txt"]
     assert session.pending_started_at == 456
+
+
+def test_stale_cleanup_rechecks_complete_owner_and_liveness_under_session_lock(monkeypatch):
+    """A same-stream replacement across the precheck/lock gap must survive."""
+    config.STREAMS.clear()
+    config.ACTIVE_RUNS.clear()
+    session = _FakeSession()
+    session.active_checkpoint = build_active_checkpoint(
+        stream_id="stale-stream", turn_id="old-turn", submitted_prompt_text="old prompt"
+    )
+    session.pending_turn_id = "old-turn"
+    session.pending_started_at = time.time() - 120
+    newer_channel = object()
+
+    class ReplaceBeforeLock:
+        def __enter__(self):
+            session.active_stream_id = "stale-stream"
+            session.active_checkpoint = build_active_checkpoint(
+                stream_id="stale-stream",
+                turn_id="new-turn",
+                submitted_prompt_text="new prompt",
+            )
+            session.pending_turn_id = "new-turn"
+            session.pending_user_message = "new prompt"
+            session.pending_started_at = time.time()
+            with config.STREAMS_LOCK:
+                config.STREAMS["stale-stream"] = newer_channel
+            config.register_active_run(
+                "stale-stream",
+                session_id=session.session_id,
+                turn_id="new-turn",
+                prompt_hash=session.active_checkpoint["prompt_hash"],
+            )
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda _sid: ReplaceBeforeLock())
+    try:
+        assert routes._clear_stale_stream_state(session) is False
+        assert session.active_checkpoint["turn_id"] == "new-turn"
+        assert session.pending_turn_id == "new-turn"
+        assert session.pending_user_message == "new prompt"
+        assert config.STREAMS["stale-stream"] is newer_channel
+        assert config.ACTIVE_RUNS["stale-stream"]["turn_id"] == "new-turn"
+    finally:
+        config.STREAMS.pop("stale-stream", None)
+        config.unregister_active_run("stale-stream")
 
 
 def test_frontend_drops_inflight_cache_when_server_session_is_idle():

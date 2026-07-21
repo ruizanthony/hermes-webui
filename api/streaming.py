@@ -35,6 +35,7 @@ from api.config import (
     LOCK, SESSIONS, SESSIONS_MAX, SESSION_DIR,
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     register_active_run, update_active_run, unregister_active_run,
+    unregister_active_run_if_matches,
     unregister_stream_owner,
     SESSION_AGENT_LOCKS, SESSION_AGENT_LOCKS_LOCK,
     resolve_model_provider,
@@ -4003,11 +4004,14 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
             # completed answer. The continuation session's live state is
             # restored from saved_* locals in the finally block.
             saved_active_stream_id = getattr(s, 'active_stream_id', None)
+            saved_active_checkpoint = copy.deepcopy(getattr(s, 'active_checkpoint', None))
+            saved_pending_turn_id = getattr(s, 'pending_turn_id', None)
             saved_pending_user_message = getattr(s, 'pending_user_message', None)
             saved_pending_attachments = list(getattr(s, 'pending_attachments', []) or [])
             saved_pending_started_at = getattr(s, 'pending_started_at', None)
             saved_pending_user_source = getattr(s, 'pending_user_source', None)
             s.active_stream_id = None
+            clear_active_checkpoint(s)
             s.pending_user_message = None
             s.pending_attachments = []
             s.pending_started_at = None
@@ -4027,6 +4031,8 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
                 s.pre_compression_snapshot = saved_snapshot
                 s.pinned = saved_pinned
                 s.active_stream_id = saved_active_stream_id
+                s.active_checkpoint = saved_active_checkpoint
+                s.pending_turn_id = saved_pending_turn_id
                 s.pending_user_message = saved_pending_user_message
                 s.pending_attachments = saved_pending_attachments
                 s.pending_started_at = saved_pending_started_at
@@ -4048,6 +4054,7 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
             # primary branch above so future readers can trust snapshot files
             # to never contain live runtime state.
             snapshot.active_stream_id = None
+            clear_active_checkpoint(snapshot)
             snapshot.pending_user_message = None
             snapshot.pending_attachments = []
             snapshot.pending_started_at = None
@@ -5593,6 +5600,30 @@ def _stream_writeback_is_current(
         prompt_hash=prompt_hash,
         submitted_prompt_text=submitted_prompt_text,
     )
+
+
+def _teardown_stream_globals_if_owned(
+    stream_id, stream, *, turn_id=None, prompt_hash=None
+):
+    """Release stream-keyed globals only if this worker still owns the channel."""
+    with STREAMS_LOCK:
+        if STREAMS.get(stream_id) is not stream:
+            return False
+        STREAMS.pop(stream_id, None)
+        CANCEL_FLAGS.pop(stream_id, None)
+        AGENT_INSTANCES.pop(stream_id, None)
+        STREAM_PARTIAL_TEXT.pop(stream_id, None)
+        STREAM_REASONING_TEXT.pop(stream_id, None)
+        STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
+        STREAM_GOAL_RELATED.pop(stream_id, None)
+        STREAM_LAST_EVENT_ID.pop(stream_id, None)
+    if turn_id and prompt_hash:
+        unregister_active_run_if_matches(
+            stream_id, turn_id=turn_id, prompt_hash=prompt_hash
+        )
+    else:
+        unregister_active_run(stream_id)
+    return True
 
 
 def _stream_writeback_can_supersede_recovery_marker(session, msg_text):
@@ -9679,6 +9710,7 @@ def _run_agent_streaming(
                         _turn_duration = _terminal_turn_duration(s)
                         _materialize_pending_user_turn_before_error(s)
                         s.active_stream_id = None
+                        clear_active_checkpoint(s)
                         s.pending_user_message = None
                         s.pending_attachments = []
                         s.pending_started_at = None
@@ -10686,18 +10718,28 @@ def _run_agent_streaming(
                     _ckpt_thread.join(timeout=15)
                 _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
                 with _lock_ctx:
+                    _pause_recorded = False
                     if (
                         not ephemeral
                         and _turn_pending_source == 'process_wakeup'
                         and _exc_is_credential_pool_empty
                     ):
-                        record_process_wakeup_provider_unavailable_pause(
+                        _pause_recorded = bool(record_process_wakeup_provider_unavailable_pause(
                             s,
                             classification=_classification['type'],
                             model=_turn_route_model,
                             provider=_turn_route_provider,
-                        )
-                    _finalize_owned_cancel()
+                        ))
+                    _cancel_persisted = _finalize_owned_cancel()
+                    if _pause_recorded and not _cancel_persisted:
+                        try:
+                            s.save(touch_updated_at=False)
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist stale cancelled process_wakeup pause for %s",
+                                getattr(s, 'session_id', session_id),
+                                exc_info=True,
+                            )
                     if not ephemeral:
                         try:
                             append_turn_journal_event_for_stream(
@@ -11036,28 +11078,12 @@ def _run_agent_streaming(
         # CLI/cron env fallback resumes — same lifecycle slot as the env
         # restore above.
         _reset_turn_session_identity(_turn_session_identity_tokens)
-        with STREAMS_LOCK:
-            STREAMS.pop(stream_id, None)
-            CANCEL_FLAGS.pop(stream_id, None)
-            AGENT_INSTANCES.pop(stream_id, None)  # Clean up agent instance reference
-            STREAM_PARTIAL_TEXT.pop(stream_id, None)  # Clean up partial text buffer (#893)
-            STREAM_REASONING_TEXT.pop(stream_id, None)  # Clean up reasoning trace (#1361 §A)
-            STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)  # Clean up tool calls (#1361 §B)
-            STREAM_GOAL_RELATED.pop(stream_id, None)  # Clean up goal-related flag (#1932)
-            STREAM_LAST_EVENT_ID.pop(stream_id, None)  # Clean up event_id pointer (stage-364)
-            unregister_active_run(stream_id)
-            # Clean up the stream-owner registry so stale stream_id→session_id
-            # mappings do not accumulate over thousands of completed streams (#6351).
-            unregister_stream_owner(stream_id)
-            # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker
-            # is set by goal_continue (line ~3328) inside the SAME function
-            # call and consumed atomically by `_start_chat_stream_for_session`
-            # in routes.py (around line 6522) when the next stream starts.
-            # Discarding here in the streaming worker's `finally` would
-            # almost always race ahead of the frontend's SSE-receive →
-            # POST /api/chat/start round-trip and erase the marker before
-            # the next stream can read it, breaking the goal-continuation
-            # chain. Stage-326 critical fix per Opus advisor review.
+        _teardown_stream_globals_if_owned(
+            stream_id, q, turn_id=turn_id, prompt_hash=prompt_hash
+        )
+        # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker is
+        # consumed atomically by the next stream start; teardown racing ahead
+        # of that request would erase the continuation chain.
 
         # ── Defer-path fix: turn-teardown idle-hook ────────────────────────
         # The session has just transitioned active→idle: unregister_active_run
