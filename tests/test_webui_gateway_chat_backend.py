@@ -4,7 +4,9 @@ from email.message import Message
 import json
 from pathlib import Path
 import re
+import sys
 import time
+from types import SimpleNamespace
 import urllib.error
 
 import api.gateway_chat as gateway_chat
@@ -274,7 +276,17 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
     monkeypatch.setattr(models, "SESSIONS", OrderedDict())
 
-    captured = {}
+    captured = {"gateway_calls": 0, "checkpoint_resume_calls": 0}
+
+    def checkpoint_resume_planner(*args, **kwargs):
+        captured["checkpoint_resume_calls"] += 1
+        return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "api.checkpoint_resume",
+        SimpleNamespace(build_gateway_checkpoint_resume_plan=checkpoint_resume_planner),
+    )
 
     class FakeResponse:
         def __enter__(self):
@@ -297,6 +309,8 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
             yield b'data: [DONE]\n\n'
 
     def fake_urlopen(req, timeout=0):
+        if req.full_url.endswith("/v1/chat/completions"):
+            captured["gateway_calls"] += 1
         captured["url"] = req.full_url
         captured["headers"] = dict(req.header_items())
         captured["body"] = req.data.decode("utf-8")
@@ -346,6 +360,8 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
     assert saved.messages[0]["timestamp"] < saved.messages[1]["timestamp"]
     assert saved.active_stream_id is None
     assert stream_id not in STREAMS
+    assert captured["checkpoint_resume_calls"] == 0
+    assert captured["gateway_calls"] == 1
     assert captured["url"] == "http://gateway.local/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer secret-token"
     assert captured["headers"]["X-hermes-session-id"] == s.session_id
