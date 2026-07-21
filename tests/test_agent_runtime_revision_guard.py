@@ -446,7 +446,7 @@ def test_stream_admission_uses_one_gateway_ownership_snapshot(monkeypatch, gatew
     """The barrier and worker must share one immutable backend decision."""
     from api import routes
     from api import turn_journal
-    from api.config import unregister_stream_owner
+    from api.config import unregister_active_run_if_matches
 
     gateway_reads = []
     revision_checks = []
@@ -514,10 +514,14 @@ def test_stream_admission_uses_one_gateway_ownership_snapshot(monkeypatch, gatew
         assert worker_kwargs[0]["stream"] is routes.STREAMS[response["stream_id"]]
     finally:
         stream_id = str(response.get("stream_id") or "")
-        with routes.STREAMS_LOCK:
-            routes.STREAMS.pop(stream_id, None)
-        unregister_stream_owner(stream_id)
-        routes.STREAM_GOAL_RELATED.pop(stream_id, None)
+        unregister_active_run_if_matches(
+            stream_id,
+            session_id=session.session_id,
+            turn_id=worker_kwargs[0]["turn_id"],
+            prompt_hash=worker_kwargs[0]["prompt_hash"],
+            expected_stream=worker_kwargs[0]["stream"],
+            cleanup_stream_state=True,
+        )
 
 
 @pytest.mark.parametrize(

@@ -527,13 +527,13 @@ def test_session_new_keeps_prev_session_commit_for_same_profile(monkeypatch):
     assert cap["ok"]["session"]["session_id"] == "new_session"
 
 
-def test_stream_owner_unregistered_on_worker_early_return(monkeypatch):
-    """A stream cancelled before the worker starts (q is None) must not leak its owner entry.
+def test_worker_missing_stream_does_not_unregister_unproven_owner(monkeypatch):
+    """A compatibility worker without a channel token must fail closed.
 
-    The route layer registers the stream owner synchronously before launching the
-    worker. If the stream is cancelled before the worker reaches `q = STREAMS.get(...)`,
-    the worker early-returns before register_active_run / the teardown finally — so the
-    owner entry must be released on that early-return path or STREAM_SESSION_OWNERS leaks.
+    Route-created workers now receive an atomically registered exact channel and
+    never use this path. A historical/direct caller that sees no STREAMS entry
+    cannot prove whether the owner is its own or a replacement generation, so it
+    must leave the entry intact for an identity-bearing cleanup.
     """
     from api import config
     import api.streaming as streaming
@@ -541,8 +541,8 @@ def test_stream_owner_unregistered_on_worker_early_return(monkeypatch):
     with config.STREAM_SESSION_OWNERS_LOCK:
         previous = dict(config.STREAM_SESSION_OWNERS)
         config.STREAM_SESSION_OWNERS.clear()
-    # Owner registered by the route layer, but the stream was already cancelled
-    # (never placed in STREAMS), so the worker will hit `q is None`.
+    # A direct compatibility owner exists without a channel, so the worker hits
+    # q is None without any immutable generation token.
     config.register_stream_owner("leak-stream", "some_session")
     try:
         with config.STREAMS_LOCK:
@@ -551,7 +551,7 @@ def test_stream_owner_unregistered_on_worker_early_return(monkeypatch):
             "some_session", "hi", "m", "/tmp", "leak-stream",
         )
         with config.STREAM_SESSION_OWNERS_LOCK:
-            assert "leak-stream" not in config.STREAM_SESSION_OWNERS
+            assert config.STREAM_SESSION_OWNERS["leak-stream"] == "some_session"
     finally:
         with config.STREAM_SESSION_OWNERS_LOCK:
             config.STREAM_SESSION_OWNERS.clear()

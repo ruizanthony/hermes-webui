@@ -13,7 +13,6 @@ import urllib.request
 from typing import Any
 
 from api.config import (
-    AGENT_INSTANCES,
     CANCEL_FLAGS,
     PENDING_GOAL_CONTINUATION,
     STREAM_GOAL_RELATED,
@@ -30,7 +29,6 @@ from api.config import (
     register_active_run,
     unregister_active_run,
     unregister_active_run_if_matches,
-    unregister_stream_owner,
     update_active_run,
 )
 from api.helpers import _redact_text, redact_session_data
@@ -42,38 +40,53 @@ logger = logging.getLogger(__name__)
 
 # Maps stream_id -> gateway run_id for approval response relay.
 _STREAM_RUN_IDS: dict[str, str] = {}
+_STREAM_RUN_CHANNELS: dict[str, object] = {}
 _STREAM_RUN_LIFECYCLE: dict[str, dict[str, Any]] = {}
 _STREAM_RUN_STARTING_CONDITION = threading.Condition()
 GATEWAY_RUN_ID_WAIT_TIMEOUT = 5.0
 
 
 def _mark_gateway_run_starting(stream_id: str) -> None:
-    with _STREAM_RUN_STARTING_CONDITION:
-        _STREAM_RUN_IDS.pop(stream_id, None)
-        _STREAM_RUN_LIFECYCLE[stream_id] = {
-            "phase": "pending",
-            "run_id": "",
-            "waiters": 0,
-            "owner_done": False,
-        }
+    with STREAMS_LOCK:
+        stream = STREAMS.get(stream_id)
+        with _STREAM_RUN_STARTING_CONDITION:
+            _STREAM_RUN_IDS.pop(stream_id, None)
+            _STREAM_RUN_CHANNELS.pop(stream_id, None)
+            _STREAM_RUN_LIFECYCLE[stream_id] = {
+                "phase": "pending",
+                "run_id": "",
+                "waiters": 0,
+                "owner_done": False,
+                "stream": stream,
+            }
+
+
+def _publish_gateway_run_id_locked(stream_id: str, run_id: str) -> None:
+    state = _STREAM_RUN_LIFECYCLE.get(stream_id) or {}
+    _STREAM_RUN_IDS[stream_id] = run_id
+    _STREAM_RUN_LIFECYCLE[stream_id] = {
+        "phase": "ready",
+        "run_id": run_id,
+        "waiters": int(state.get("waiters") or 0),
+        "owner_done": bool(state.get("owner_done")),
+        "stream": state.get("stream"),
+    }
+    _STREAM_RUN_STARTING_CONDITION.notify_all()
 
 
 def _publish_gateway_run_id(stream_id: str, run_id: str) -> None:
     with _STREAM_RUN_STARTING_CONDITION:
-        _STREAM_RUN_IDS[stream_id] = run_id
-        state = _STREAM_RUN_LIFECYCLE.get(stream_id) or {}
-        _STREAM_RUN_LIFECYCLE[stream_id] = {
-            "phase": "ready",
-            "run_id": run_id,
-            "waiters": int(state.get("waiters") or 0),
-            "owner_done": bool(state.get("owner_done")),
-        }
-        _STREAM_RUN_STARTING_CONDITION.notify_all()
+        _publish_gateway_run_id_locked(stream_id, run_id)
 
 
-def _finish_gateway_run_starting(stream_id: str, *, result: str = "failed") -> None:
+def _finish_gateway_run_starting(
+    stream_id: str, *, result: str = "failed", stream=None
+) -> None:
     with _STREAM_RUN_STARTING_CONDITION:
         state = _STREAM_RUN_LIFECYCLE.get(stream_id) or {}
+        state_stream = state.get("stream")
+        if stream is not None and state_stream is not None and state_stream is not stream:
+            return
         if str(state.get("phase") or "").strip().lower() == "ready":
             return
         _STREAM_RUN_IDS.pop(stream_id, None)
@@ -82,6 +95,7 @@ def _finish_gateway_run_starting(stream_id: str, *, result: str = "failed") -> N
             "run_id": "",
             "waiters": int(state.get("waiters") or 0),
             "owner_done": bool(state.get("owner_done")),
+            "stream": state_stream,
         }
         _STREAM_RUN_STARTING_CONDITION.notify_all()
 
@@ -96,12 +110,16 @@ def _retire_gateway_run_starting_if_done(stream_id: str) -> bool:
         return False
     _STREAM_RUN_LIFECYCLE.pop(stream_id, None)
     _STREAM_RUN_IDS.pop(stream_id, None)
+    _STREAM_RUN_CHANNELS.pop(stream_id, None)
     return True
 
 
-def _clear_gateway_run_starting(stream_id: str) -> None:
+def _clear_gateway_run_starting(stream_id: str, *, stream=None) -> None:
     with _STREAM_RUN_STARTING_CONDITION:
         state = _STREAM_RUN_LIFECYCLE.get(stream_id)
+        state_stream = (state or {}).get("stream")
+        if stream is not None and state_stream is not None and state_stream is not stream:
+            return
         if state:
             state["owner_done"] = True
         _retire_gateway_run_starting_if_done(stream_id)
@@ -148,39 +166,73 @@ def wait_for_gateway_run_id(stream_id: str, timeout: float) -> tuple[bool, str |
                     _STREAM_RUN_STARTING_CONDITION.notify_all()
 
 
-def _teardown_gateway_stream_globals_if_owned(
-    stream_id, stream, *, turn_id=None, prompt_hash=None,
-    runs_api_pending_marked=False,
-):
-    """Release gateway globals only while this worker owns the exact channel."""
+def _record_stream_run_id(
+    stream_id: str, run_id: str, *, stream=None, publish: bool = False
+) -> bool:
+    """Record a gateway run id only for the exact live channel generation."""
+    if stream is None:
+        # Direct runs-API tests/callers do not create a WebUI stream channel.
+        with _STREAM_RUN_STARTING_CONDITION:
+            _STREAM_RUN_CHANNELS.pop(stream_id, None)
+            if publish:
+                _publish_gateway_run_id_locked(stream_id, run_id)
+            else:
+                _STREAM_RUN_IDS[stream_id] = run_id
+        return True
     with STREAMS_LOCK:
         if STREAMS.get(stream_id) is not stream:
             return False
-        AGENT_INSTANCES.pop(stream_id, None)
-        CANCEL_FLAGS.pop(stream_id, None)
-        STREAM_GOAL_RELATED.pop(stream_id, None)
-        STREAM_PARTIAL_TEXT.pop(stream_id, None)
-        STREAM_REASONING_TEXT.pop(stream_id, None)
-        STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
-        STREAM_LAST_EVENT_ID.pop(stream_id, None)
-        STREAMS.pop(stream_id, None)
-        # Keep run-id publication available until approval waiters have consumed
-        # it. Holding STREAMS_LOCK across this lifecycle cleanup prevents a new
-        # channel reusing stream_id from being registered between the ownership
-        # check above and the lifecycle mutation below.
         with _STREAM_RUN_STARTING_CONDITION:
-            if stream_id in _STREAM_RUN_LIFECYCLE:
-                if runs_api_pending_marked and gateway_run_id_pending(stream_id):
-                    _finish_gateway_run_starting(stream_id)
-                _clear_gateway_run_starting(stream_id)
+            _STREAM_RUN_CHANNELS[stream_id] = stream
+            if publish:
+                _publish_gateway_run_id_locked(stream_id, run_id)
             else:
-                _STREAM_RUN_IDS.pop(stream_id, None)
+                _STREAM_RUN_IDS[stream_id] = run_id
+    return True
+
+
+def _teardown_gateway_stream_globals_if_owned(
+    stream_id, stream, *, session_id=None, turn_id=None, prompt_hash=None,
+    runs_api_pending_marked=False,
+):
+    """Atomically release gateway globals for this exact channel generation."""
     if turn_id and prompt_hash:
-        unregister_active_run_if_matches(
-            stream_id, turn_id=turn_id, prompt_hash=prompt_hash
+        removed = unregister_active_run_if_matches(
+            stream_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            prompt_hash=prompt_hash,
+            expected_stream=stream,
+            cleanup_stream_state=True,
         )
     else:
-        unregister_active_run(stream_id)
+        removed = unregister_active_run(
+            stream_id,
+            expected_stream=stream,
+            expected_session_id=session_id,
+            cleanup_stream_state=True,
+        )
+    if not removed:
+        return False
+    with STREAMS_LOCK:
+        # unregister_active_run* released the old generation under the same
+        # STREAMS lock. If a replacement arrived before this reacquisition,
+        # leave its run-id lifecycle untouched; otherwise settle the old owner.
+        current_stream = STREAMS.get(stream_id)
+        if current_stream is not None and current_stream is not stream:
+            return True
+        with _STREAM_RUN_STARTING_CONDITION:
+            state = _STREAM_RUN_LIFECYCLE.get(stream_id)
+            state_stream = (state or {}).get("stream")
+            if state_stream is not None and state_stream is not stream:
+                return True
+            if state is not None:
+                if runs_api_pending_marked and gateway_run_id_pending(stream_id):
+                    _finish_gateway_run_starting(stream_id, stream=stream)
+                _clear_gateway_run_starting(stream_id, stream=stream)
+            elif _STREAM_RUN_CHANNELS.get(stream_id) is stream:
+                _STREAM_RUN_CHANNELS.pop(stream_id, None)
+                _STREAM_RUN_IDS.pop(stream_id, None)
     return True
 
 
@@ -512,7 +564,7 @@ def _run_gateway_runs_api_streaming(
     session_id, msg_text, model, workspace, stream_id,
     base_url, api_key, prefill_messages, body_extras,
     *, put_gateway_event, cancel_event,
-    attachments=None, cfg=None, session=None,
+    attachments=None, cfg=None, session=None, stream=None,
 ):
     """Submit via POST /v1/runs and relay SSE events including approval."""
     try:
@@ -590,11 +642,11 @@ def _run_gateway_runs_api_streaming(
         if not run_id:
             raise ValueError(f"Gateway runs API returned no run_id: {run_data!r}")
     except Exception:
-        _finish_gateway_run_starting(stream_id)
+        _finish_gateway_run_starting(stream_id, stream=stream)
         raise
 
     usage: dict = {}
-    _publish_gateway_run_id(stream_id, run_id)
+    _record_stream_run_id(stream_id, run_id, stream=stream, publish=True)
 
     url_events = f"{base_url.rstrip('/')}/v1/runs/{run_id}/events"
     headers_sse = dict(headers)
@@ -879,11 +931,12 @@ def _run_gateway_chat_streaming(
     """
     q = stream if stream is not None else STREAMS.get(stream_id)
     if q is None:
-        _finish_gateway_run_starting(stream_id, result="fallback")
-        _clear_gateway_run_starting(stream_id)
-        # Cancelled before the worker started; release the owner entry the route
-        # layer registered so STREAM_SESSION_OWNERS does not leak (no teardown finally runs).
-        unregister_stream_owner(stream_id)
+        with STREAMS_LOCK:
+            if STREAMS.get(stream_id) is None:
+                _finish_gateway_run_starting(stream_id, result="fallback")
+                _clear_gateway_run_starting(stream_id)
+        # Compatibility callers have no immutable channel token here. Route
+        # workers always receive one, so fail closed instead of deleting by key.
         return
     if not register_active_run(
         stream_id,
@@ -898,6 +951,14 @@ def _run_gateway_chat_streaming(
         turn_id=turn_id,
         prompt_hash=prompt_hash,
     ):
+        _teardown_gateway_stream_globals_if_owned(
+            stream_id,
+            q,
+            session_id=session_id,
+            turn_id=turn_id,
+            prompt_hash=prompt_hash,
+            runs_api_pending_marked=True,
+        )
         return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
@@ -968,7 +1029,7 @@ def _run_gateway_chat_streaming(
         _runs_api_enabled = _gateway_use_runs_api_enabled(cfg)
         _use_runs_api = _runs_api_enabled and gateway_supports_approval(base_url, api_key)
         if not _use_runs_api and runs_api_pending_marked:
-            _finish_gateway_run_starting(stream_id, result="fallback")
+            _finish_gateway_run_starting(stream_id, result="fallback", stream=q)
             runs_api_pending_marked = False
         try:
             from api.streaming import (
@@ -1025,6 +1086,7 @@ def _run_gateway_chat_streaming(
                     attachments=attachments,
                     cfg=cfg,
                     session=s,
+                    stream=q,
                 )
             except Exception as exc:
                 error_payload = _settle_gateway_terminal_error(
@@ -1135,7 +1197,9 @@ def _run_gateway_chat_streaming(
                             # No-op when the payload omits run_id.
                             _approval_run_id = str(approval_data.get("run_id") or "").strip()
                             if _approval_run_id:
-                                _STREAM_RUN_IDS[stream_id] = _approval_run_id
+                                _record_stream_run_id(
+                                    stream_id, _approval_run_id, stream=q
+                                )
                             try:
                                 from api.route_approvals import submit_gateway_pending_mirror
                                 head, total = submit_gateway_pending_mirror(session_id, approval_data)
@@ -1434,6 +1498,10 @@ def _run_gateway_chat_streaming(
                 logger.debug("Failed to clear gateway stream state", exc_info=True)
             _cleanup_gateway_pending_mirror(session_id)
         _teardown_gateway_stream_globals_if_owned(
-            stream_id, q, turn_id=turn_id, prompt_hash=prompt_hash,
+            stream_id,
+            q,
+            session_id=session_id,
+            turn_id=turn_id,
+            prompt_hash=prompt_hash,
             runs_api_pending_marked=runs_api_pending_marked,
         )

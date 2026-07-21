@@ -2804,10 +2804,10 @@ from api.config import (
     MAX_UPLOAD_BYTES,
     ACTIVE_RUNS,
     ACTIVE_RUNS_LOCK,
-    register_active_run,
-    register_stream_owner,
+    register_stream_channel,
     stream_owner_session_id,
-    unregister_stream_owner,
+    unregister_active_run,
+    unregister_active_run_if_matches,
     CHAT_LOCK,
     _get_session_agent_lock,
     SESSION_AGENT_LOCKS,
@@ -20807,16 +20807,33 @@ def _handle_btw(handler, body):
     stream_id = uuid.uuid4().hex
     ephemeral.active_stream_id = stream_id
     ephemeral.save()
+    turn_id = uuid.uuid4().hex
+    from api.active_checkpoint import submitted_prompt_sha256
+    prompt_hash = submitted_prompt_sha256(question)
     stream = create_stream_channel()
-    register_stream_owner(stream_id, ephemeral.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
+    register_stream_channel(
+        stream_id,
+        stream,
+        session_id=ephemeral.session_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
+        started_at=time.time(),
+        phase="queued",
+        ephemeral=True,
+        backend="legacy",
+    )
     from api.background import track_btw
     track_btw(body["session_id"], ephemeral.session_id, stream_id, question)
     thr = threading.Thread(
         target=_run_agent_streaming,
         args=(ephemeral.session_id, question, s.model, s.workspace, stream_id, None),
-        kwargs={"ephemeral": True, "model_provider": model_provider},
+        kwargs={
+            "ephemeral": True,
+            "model_provider": model_provider,
+            "stream": stream,
+            "turn_id": turn_id,
+            "prompt_hash": prompt_hash,
+        },
         daemon=True,
     )
     thr.start()
@@ -20853,14 +20870,33 @@ def _handle_background(handler, body):
         profile=getattr(s, 'profile', None),
     )
     bg.title = f"bg: {prompt[:60]}"
-    bg.save()
     stream_id = uuid.uuid4().hex
-    bg.active_stream_id = stream_id
-    bg.save()
+    turn_id = uuid.uuid4().hex
+    from api.active_checkpoint import submitted_prompt_sha256
+    prompt_hash = submitted_prompt_sha256(prompt)
+    _prepare_chat_start_session_for_stream(
+        bg,
+        msg=prompt,
+        attachments=None,
+        workspace=s.workspace,
+        model=s.model,
+        model_provider=model_provider,
+        stream_id=stream_id,
+        turn_id=turn_id,
+        submitted_prompt_text=prompt,
+        source="background",
+    )
     stream = create_stream_channel()
-    register_stream_owner(stream_id, bg.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
+    register_stream_channel(
+        stream_id,
+        stream,
+        session_id=bg.session_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
+        started_at=bg.pending_started_at,
+        phase="queued",
+        backend="legacy",
+    )
     task_id = uuid.uuid4().hex[:8]
     from api.background import track_background, complete_background
     parent_sid = body["session_id"]
@@ -20882,6 +20918,9 @@ def _handle_background(handler, body):
                 stream_id,
                 None,
                 model_provider=model_provider,
+                stream=stream,
+                turn_id=turn_id,
+                prompt_hash=prompt_hash,
             )
             # Reload the bg session from disk and extract the final assistant reply.
             try:
@@ -21102,7 +21141,7 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
         # active-agent-cache consumers read ACTIVE_RUNS as worker-lifecycle truth).
         with _live_config.STREAMS_LOCK:
             live_stream_ids = set(_live_config.STREAMS.keys())
-        stale_stream_ids = []
+        stale_runs = []
         with _live_config.ACTIVE_RUNS_LOCK:
             for run_stream_id, raw in list((_live_config.ACTIVE_RUNS or {}).items()):
                 stream_id = str((raw or {}).get("stream_id") or run_stream_id or "").strip()
@@ -21121,15 +21160,22 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
                 # lifecycle row. Pop by the real dict key. (Codex gate, #4492)
                 if started_at and (now - started_at) > ceiling:
                     if run_stream_id not in live_stream_ids and stream_id not in live_stream_ids:
-                        stale_stream_ids.append(run_stream_id)
+                        stale_runs.append((run_stream_id, dict(raw or {})))
                     continue
                 return stream_id
-            for stale_stream_id in stale_stream_ids:
-                (_live_config.ACTIVE_RUNS or {}).pop(stale_stream_id, None)
-                # The zombie run is pruned directly here (not via the normal teardown
-                # finally / unregister_active_run), so release its stream-owner entry too
-                # or STREAM_SESSION_OWNERS leaks for every reconciled zombie. (#5198 gate)
-                unregister_stream_owner(stale_stream_id)
+        for stale_stream_id, stale_run in stale_runs:
+            stale_turn_id = str(stale_run.get("turn_id") or "").strip()
+            stale_prompt_hash = str(stale_run.get("prompt_hash") or "").strip()
+            stale_session_id = str(stale_run.get("session_id") or "").strip()
+            if stale_turn_id and stale_prompt_hash:
+                unregister_active_run_if_matches(
+                    stale_stream_id,
+                    session_id=stale_session_id,
+                    turn_id=stale_turn_id,
+                    prompt_hash=stale_prompt_hash,
+                )
+            else:
+                unregister_active_run(stale_stream_id)
     except Exception:
         return None
     return None
@@ -21305,12 +21351,9 @@ def _start_chat_stream_for_session(
     set_last_workspace(workspace)
     diag.stage("stream_registration") if diag else None
     stream = create_stream_channel()
-    register_stream_owner(stream_id, s.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
-    register_active_run(
+    register_stream_channel(
         stream_id,
-        expected_stream=stream,
+        stream,
         session_id=s.session_id,
         started_at=s.pending_started_at,
         phase="queued",

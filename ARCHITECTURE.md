@@ -239,17 +239,22 @@ Called after run_conversation() completes to set the session title retroactively
 
 This is the most architecturally interesting part. Two endpoints cooperate:
 
-    POST /api/chat/start     Receives the user message. Creates a queue.Queue, stores it
-                             in STREAMS[stream_id], spawns a daemon thread running
-                             _run_agent_streaming(), returns {stream_id} immediately.
+    POST /api/chat/start     Receives the user message. Creates a StreamChannel, atomically
+                             installs its channel/session/turn ownership, spawns a daemon
+                             thread running _run_agent_streaming(), and returns {stream_id}.
 
     GET  /api/chat/stream    Long-lived SSE connection. Reads from STREAMS[stream_id]
                              and forwards events to the browser until 'done' or 'error'.
 
-Queue registry:
+Stream ownership registries:
 
-    STREAMS = {}               dict: stream_id -> queue.Queue
-    STREAMS_LOCK = threading.Lock()
+    STREAMS = {}               dict: stream_id -> StreamChannel
+    STREAM_SESSION_OWNERS = {} dict: stream_id -> exact channel + session/turn identity
+    ACTIVE_RUNS = {}           dict: stream_id -> worker lifecycle metadata
+
+Route-created channels are installed by register_stream_channel() while holding
+STREAMS_LOCK -> STREAM_SESSION_OWNERS_LOCK -> ACTIVE_RUNS_LOCK. Main chat, /btw,
+and background workers receive that exact channel and complete turn identity.
 
 SSE event types and their data shapes:
 
@@ -268,10 +273,12 @@ The SSE handler loop:
     - On 'done' or 'error' event: breaks the loop and returns
     - Catches BrokenPipeError and ConnectionResetError silently (browser disconnected)
 
-Stream cleanup: _run_agent_streaming() pops its stream_id from STREAMS in a finally
-block. If the browser disconnects mid-stream, the daemon thread runs to completion and
-then cleans up. The queue fills and the put_nowait() calls fail silently (queue.Full
-is caught).
+Stream cleanup: worker finalizers remove STREAMS, STREAM_SESSION_OWNERS, ACTIVE_RUNS,
+cancel flags, and partial/reasoning/tool buffers only while the exact channel and
+session/turn/prompt identity still match. Replacement handoff and matching teardown use
+the same lock order, so a delayed worker cannot remove state for a newer generation that
+reuses the stream id. If the browser disconnects mid-stream, the daemon thread still
+runs to completion and performs the same generation-checked cleanup.
 
 Fallback sync endpoint: POST /api/chat still exists and holds the connection open until
 the agent finishes. The frontend never uses it but it can be useful for debugging.

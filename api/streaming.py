@@ -36,7 +36,6 @@ from api.config import (
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     register_active_run, update_active_run, unregister_active_run,
     unregister_active_run_if_matches,
-    unregister_stream_owner,
     SESSION_AGENT_LOCKS, SESSION_AGENT_LOCKS_LOCK,
     resolve_model_provider,
     resolve_custom_provider_connection,
@@ -5603,27 +5602,24 @@ def _stream_writeback_is_current(
 
 
 def _teardown_stream_globals_if_owned(
-    stream_id, stream, *, turn_id=None, prompt_hash=None
+    stream_id, stream, *, session_id=None, turn_id=None, prompt_hash=None
 ):
-    """Release stream-keyed globals only if this worker still owns the channel."""
-    with STREAMS_LOCK:
-        if STREAMS.get(stream_id) is not stream:
-            return False
-        STREAMS.pop(stream_id, None)
-        CANCEL_FLAGS.pop(stream_id, None)
-        AGENT_INSTANCES.pop(stream_id, None)
-        STREAM_PARTIAL_TEXT.pop(stream_id, None)
-        STREAM_REASONING_TEXT.pop(stream_id, None)
-        STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
-        STREAM_GOAL_RELATED.pop(stream_id, None)
-        STREAM_LAST_EVENT_ID.pop(stream_id, None)
+    """Atomically release globals only for this worker's exact generation."""
     if turn_id and prompt_hash:
-        unregister_active_run_if_matches(
-            stream_id, turn_id=turn_id, prompt_hash=prompt_hash
+        return unregister_active_run_if_matches(
+            stream_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            prompt_hash=prompt_hash,
+            expected_stream=stream,
+            cleanup_stream_state=True,
         )
-    else:
-        unregister_active_run(stream_id)
-    return True
+    return unregister_active_run(
+        stream_id,
+        expected_stream=stream,
+        expected_session_id=session_id,
+        cleanup_stream_state=True,
+    )
 
 
 def _stream_writeback_can_supersede_recovery_marker(session, msg_text):
@@ -7167,10 +7163,9 @@ def _run_agent_streaming(
     _turn_route_provider = model_provider
     q = stream if stream is not None else STREAMS.get(stream_id)
     if q is None:
-        # The stream was cancelled before the worker started; the route layer
-        # already registered the stream owner, so release it here to avoid
-        # leaking a STREAM_SESSION_OWNERS entry that the teardown finally never sees.
-        unregister_stream_owner(stream_id)
+        # Compatibility callers do not carry a generation token here. Fail
+        # closed: route-created workers always receive their exact channel, and
+        # a key-only cleanup could erase a newer owner in the pre-insert window.
         return
     if not register_active_run(
         stream_id,
@@ -7185,6 +7180,22 @@ def _run_agent_streaming(
         turn_id=turn_id,
         prompt_hash=prompt_hash,
     ):
+        if turn_id and prompt_hash:
+            unregister_active_run_if_matches(
+                stream_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                prompt_hash=prompt_hash,
+                expected_stream=q,
+                cleanup_stream_state=True,
+            )
+        else:
+            unregister_active_run(
+                stream_id,
+                expected_stream=q,
+                expected_session_id=session_id,
+                cleanup_stream_state=True,
+            )
         return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
@@ -11082,7 +11093,11 @@ def _run_agent_streaming(
         # restore above.
         _reset_turn_session_identity(_turn_session_identity_tokens)
         _teardown_stream_globals_if_owned(
-            stream_id, q, turn_id=turn_id, prompt_hash=prompt_hash
+            stream_id,
+            q,
+            session_id=session_id,
+            turn_id=turn_id,
+            prompt_hash=prompt_hash,
         )
         # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker is
         # consumed atomically by the next stream start; teardown racing ahead
