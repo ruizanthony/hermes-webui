@@ -149,10 +149,8 @@ def test_async_delegation_wakeup_uses_the_same_executive_envelope(monkeypatch):
     import types
 
     fake_mod = types.ModuleType("tools.process_registry")
-    setattr(
-        fake_mod,
-        "format_process_notification",
-        lambda _evt: "[ASYNC DELEGATION COMPLETE — t_1]\nTechnical review finished.",
+    fake_mod.format_process_notification = (
+        lambda _evt: "[ASYNC DELEGATION COMPLETE — t_1]\nTechnical review finished."
     )
     fake_pkg = sys.modules.get("tools") or types.ModuleType("tools")
     monkeypatch.setitem(sys.modules, "tools", fake_pkg)
