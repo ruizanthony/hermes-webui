@@ -8823,8 +8823,9 @@ def create_stream_channel() -> StreamChannel:
 
 STREAMS: dict = {}
 STREAMS_LOCK = threading.Lock()
-# stream_id -> session_id owner, populated synchronously before worker startup so
-# stream-id authorization does not depend on worker lifecycle registration.
+# stream_id -> legacy session_id string OR route-owned generation metadata.
+# Route-created entries carry the exact channel plus complete turn identity and
+# are installed atomically with STREAMS/ACTIVE_RUNS by register_stream_channel().
 STREAM_SESSION_OWNERS: dict = {}
 STREAM_SESSION_OWNERS_LOCK = threading.Lock()
 CANCEL_FLAGS: dict = {}
@@ -8837,14 +8838,22 @@ STREAM_LAST_EVENT_ID: dict = {}  # stream_id -> latest journal event_id for `id:
 PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
 
 
-def register_stream_owner(stream_id: str, session_id: str) -> None:
-    """Record the session that owns a stream before worker startup."""
+def register_stream_owner(stream_id: str, session_id: str) -> bool:
+    """Register a compatibility owner that cannot replace a route generation.
+
+    Historical tests and direct callers use this session-only shape. Production
+    routes use ``register_stream_channel`` below so cleanup can prove the exact
+    immutable channel/turn generation rather than mutating by stream id alone.
+    """
     stream_id = str(stream_id or "").strip()
     session_id = str(session_id or "").strip()
     if not stream_id or not session_id:
-        return
+        return False
     with STREAM_SESSION_OWNERS_LOCK:
+        if isinstance(STREAM_SESSION_OWNERS.get(stream_id), dict):
+            return False
         STREAM_SESSION_OWNERS[stream_id] = session_id
+    return True
 
 
 def stream_owner_session_id(stream_id: str) -> str | None:
@@ -8854,17 +8863,51 @@ def stream_owner_session_id(stream_id: str) -> str | None:
         return None
     with STREAM_SESSION_OWNERS_LOCK:
         owner = STREAM_SESSION_OWNERS.get(stream_id)
-    owner = str(owner or "").strip()
-    return owner or None
+        if isinstance(owner, dict):
+            owner = owner.get("session_id")
+        owner = str(owner or "").strip()
+        return owner or None
 
 
-def unregister_stream_owner(stream_id: str) -> None:
-    """Forget the pre-worker stream owner once the stream has torn down."""
+def unregister_stream_owner(
+    stream_id: str,
+    *,
+    expected_stream=None,
+    expected_session_id: str | None = None,
+    turn_id: str | None = None,
+    prompt_hash: str | None = None,
+) -> bool:
+    """Remove a stream owner only when the caller proves its generation.
+
+    A route-owned entry requires the exact channel and complete session/turn/
+    prompt identity. Compatibility entries require their session id. A key-only
+    call always fails closed, so delayed workers cannot erase a replacement.
+    """
     stream_id = str(stream_id or "").strip()
     if not stream_id:
-        return
+        return False
+    expected_session_id = str(expected_session_id or "").strip()
+    turn_id = str(turn_id or "").strip()
+    prompt_hash = str(prompt_hash or "").strip()
     with STREAM_SESSION_OWNERS_LOCK:
+        owner = STREAM_SESSION_OWNERS.get(stream_id)
+        if isinstance(owner, dict):
+            if (
+                expected_stream is None
+                or not all((expected_session_id, turn_id, prompt_hash))
+                or owner.get("stream") is not expected_stream
+                or str(owner.get("session_id") or "").strip() != expected_session_id
+                or str(owner.get("turn_id") or "").strip() != turn_id
+                or str(owner.get("prompt_hash") or "").strip() != prompt_hash
+            ):
+                return False
+        else:
+            if not expected_session_id or expected_stream is not None:
+                return False
+            if str(owner or "").strip() != expected_session_id:
+                return False
         STREAM_SESSION_OWNERS.pop(stream_id, None)
+    return True
 
 
 # ── Gateway capability cache ─────────────────────────────────────────────────
@@ -9026,6 +9069,61 @@ LAST_RUN_FINISHED_AT: float | None = None
 SERVER_START_TIME = time.time()
 
 
+def register_stream_channel(
+    stream_id: str,
+    stream,
+    *,
+    session_id: str,
+    turn_id: str,
+    prompt_hash: str,
+    **metadata,
+) -> bool:
+    """Atomically install one route-owned stream generation.
+
+    Lock order for the ownership registry is always STREAMS -> stream owner ->
+    ACTIVE_RUNS. Replacements overwrite all three registries in one critical
+    section, so no worker can observe a new owner without its exact channel and
+    queued run identity. Stream-keyed transient state is cleared before the new
+    generation becomes visible.
+    """
+    stream_id = str(stream_id or "").strip()
+    session_id = str(session_id or "").strip()
+    turn_id = str(turn_id or "").strip()
+    prompt_hash = str(prompt_hash or "").strip()
+    if not stream_id or stream is None or not all((session_id, turn_id, prompt_hash)):
+        return False
+    now = time.time()
+    owner = {
+        "stream": stream,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "prompt_hash": prompt_hash,
+    }
+    entry = dict(metadata or {})
+    entry.update(
+        stream_id=stream_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
+    )
+    entry.setdefault("started_at", now)
+    entry.setdefault("phase", "queued")
+    with STREAMS_LOCK:
+        with STREAM_SESSION_OWNERS_LOCK:
+            with ACTIVE_RUNS_LOCK:
+                CANCEL_FLAGS.pop(stream_id, None)
+                AGENT_INSTANCES.pop(stream_id, None)
+                STREAM_PARTIAL_TEXT.pop(stream_id, None)
+                STREAM_REASONING_TEXT.pop(stream_id, None)
+                STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
+                STREAM_GOAL_RELATED.pop(stream_id, None)
+                STREAM_LAST_EVENT_ID.pop(stream_id, None)
+                STREAMS[stream_id] = stream
+                STREAM_SESSION_OWNERS[stream_id] = owner
+                ACTIVE_RUNS[stream_id] = entry
+    return True
+
+
 def register_active_run(stream_id: str, *, expected_stream=None, **metadata) -> bool:
     """Atomically register or refresh one complete stream/run owner.
 
@@ -9045,15 +9143,37 @@ def register_active_run(stream_id: str, *, expected_stream=None, **metadata) -> 
         for key in ("session_id", "turn_id", "prompt_hash")
     )
 
-    stream_lock = STREAMS_LOCK if expected_stream is not None else contextlib.nullcontext()
-    with stream_lock:
-        if expected_stream is not None:
+    if expected_stream is not None:
+        with STREAMS_LOCK:
             if STREAMS.get(stream_id) is not expected_stream:
                 return False
-            session_id = candidate_owner[0]
-            owner_session_id = stream_owner_session_id(stream_id)
-            if session_id and owner_session_id is not None and owner_session_id != session_id:
-                return False
+            with STREAM_SESSION_OWNERS_LOCK:
+                registered_owner = STREAM_SESSION_OWNERS.get(stream_id)
+                if isinstance(registered_owner, dict):
+                    registered_identity = tuple(
+                        str(registered_owner.get(key) or "").strip()
+                        for key in ("session_id", "turn_id", "prompt_hash")
+                    )
+                    if (
+                        registered_owner.get("stream") is not expected_stream
+                        or not all(candidate_owner)
+                        or candidate_owner != registered_identity
+                    ):
+                        return False
+                elif registered_owner is not None:
+                    if str(registered_owner or "").strip() != candidate_owner[0]:
+                        return False
+                with ACTIVE_RUNS_LOCK:
+                    current = ACTIVE_RUNS.get(stream_id)
+                    current_owner = tuple(
+                        str((current or {}).get(key) or "").strip()
+                        for key in ("session_id", "turn_id", "prompt_hash")
+                    )
+                    if current is not None and all(current_owner):
+                        if not all(candidate_owner) or candidate_owner != current_owner:
+                            return False
+                    ACTIVE_RUNS[stream_id] = entry
+    else:
         with ACTIVE_RUNS_LOCK:
             current = ACTIVE_RUNS.get(stream_id)
             current_owner = tuple(
@@ -9077,41 +9197,178 @@ def update_active_run(stream_id: str, **metadata) -> None:
             entry.update(metadata)
 
 
-def unregister_active_run(stream_id: str) -> None:
-    """Remove a worker from the active-run registry and record idle start."""
-    if not stream_id:
-        return
+def _clear_stream_generation_state_locked(stream_id: str, expected_stream) -> None:
+    """Clear stream-keyed state after exact generation validation.
+
+    The caller holds STREAMS_LOCK plus the owner/ACTIVE_RUNS locks, so a
+    replacement cannot publish state between validation and cleanup.
+    """
+    if STREAMS.get(stream_id) is expected_stream:
+        STREAMS.pop(stream_id, None)
+    CANCEL_FLAGS.pop(stream_id, None)
+    AGENT_INSTANCES.pop(stream_id, None)
+    STREAM_PARTIAL_TEXT.pop(stream_id, None)
+    STREAM_REASONING_TEXT.pop(stream_id, None)
+    STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
+    STREAM_GOAL_RELATED.pop(stream_id, None)
+    STREAM_LAST_EVENT_ID.pop(stream_id, None)
+
+
+def unregister_active_run(
+    stream_id: str,
+    *,
+    expected_stream=None,
+    expected_session_id: str | None = None,
+    cleanup_stream_state: bool = False,
+) -> bool:
+    """Remove an exact channel generation, or a key-only compatibility run.
+
+    Route callers supply their immutable channel. Historical/direct key-only
+    callers remain supported only for non-structured compatibility owners, so
+    they cannot delete a newer route-owned owner or ACTIVE_RUNS row.
+    """
     global LAST_RUN_FINISHED_AT
-    with ACTIVE_RUNS_LOCK:
-        ACTIVE_RUNS.pop(stream_id, None)
-        LAST_RUN_FINISHED_AT = time.time()
-    unregister_stream_owner(stream_id)
+    if not stream_id:
+        return False
+    expected_session_id = str(expected_session_id or "").strip()
+    if expected_stream is not None:
+        with STREAMS_LOCK:
+            current_stream = STREAMS.get(stream_id)
+            if current_stream is not None and current_stream is not expected_stream:
+                return False
+            with STREAM_SESSION_OWNERS_LOCK:
+                owner = STREAM_SESSION_OWNERS.get(stream_id)
+                if isinstance(owner, dict):
+                    if (
+                        owner.get("stream") is not expected_stream
+                        or not expected_session_id
+                        or str(owner.get("session_id") or "").strip()
+                        != expected_session_id
+                    ):
+                        return False
+                elif owner is not None:
+                    if (
+                        not expected_session_id
+                        or str(owner or "").strip() != expected_session_id
+                    ):
+                        return False
+                with ACTIVE_RUNS_LOCK:
+                    entry = ACTIVE_RUNS.get(stream_id)
+                    if entry is None:
+                        return False
+                    active_session_id = str(
+                        (entry or {}).get("session_id") or ""
+                    ).strip()
+                    if expected_session_id and active_session_id != expected_session_id:
+                        return False
+                    ACTIVE_RUNS.pop(stream_id, None)
+                    if owner is not None:
+                        STREAM_SESSION_OWNERS.pop(stream_id, None)
+                    if cleanup_stream_state:
+                        _clear_stream_generation_state_locked(
+                            stream_id, expected_stream
+                        )
+                    LAST_RUN_FINISHED_AT = time.time()
+        return True
+    if cleanup_stream_state:
+        return False
+    with STREAM_SESSION_OWNERS_LOCK:
+        owner = STREAM_SESSION_OWNERS.get(stream_id)
+        if isinstance(owner, dict):
+            return False
+        with ACTIVE_RUNS_LOCK:
+            entry = ACTIVE_RUNS.get(stream_id)
+            if entry is None:
+                return False
+            owner_session_id = str(owner or "").strip()
+            active_session_id = str((entry or {}).get("session_id") or "").strip()
+            if owner_session_id and active_session_id and owner_session_id != active_session_id:
+                return False
+            ACTIVE_RUNS.pop(stream_id, None)
+            if owner_session_id:
+                STREAM_SESSION_OWNERS.pop(stream_id, None)
+            LAST_RUN_FINISHED_AT = time.time()
+    return True
 
 
 def unregister_active_run_if_matches(
-    stream_id: str, *, turn_id: str | None, prompt_hash: str | None
+    stream_id: str,
+    *,
+    turn_id: str | None,
+    prompt_hash: str | None,
+    session_id: str | None = None,
+    expected_stream=None,
+    cleanup_stream_state: bool = False,
 ) -> bool:
-    """Remove only the complete run identity owned by the terminating worker."""
+    """Atomically remove only the complete run/owner generation.
+
+    Route workers pass their exact channel and full identity. A missing STREAMS
+    row is accepted because cancel_stream() deliberately detaches the channel
+    before the worker exits; any different channel or owner generation fails
+    closed. Without an expected channel, a structured owner still requires the
+    complete session/turn/prompt identity (used by stale-run reconciliation).
+    """
     if not stream_id:
         return False
-    candidate = (
+    session_id = str(session_id or "").strip()
+    candidate_run = (
         str(turn_id or "").strip(),
         str(prompt_hash or "").strip(),
     )
-    if not all(candidate):
+    if not all(candidate_run):
+        return False
+    if cleanup_stream_state and expected_stream is None:
         return False
     global LAST_RUN_FINISHED_AT
-    with ACTIVE_RUNS_LOCK:
-        entry = ACTIVE_RUNS.get(stream_id)
-        owner = (
-            str((entry or {}).get("turn_id") or "").strip(),
-            str((entry or {}).get("prompt_hash") or "").strip(),
-        )
-        if candidate != owner:
-            return False
-        ACTIVE_RUNS.pop(stream_id, None)
-        LAST_RUN_FINISHED_AT = time.time()
-    unregister_stream_owner(stream_id)
+    stream_lock = STREAMS_LOCK if expected_stream is not None else contextlib.nullcontext()
+    with stream_lock:
+        if expected_stream is not None:
+            current_stream = STREAMS.get(stream_id)
+            if current_stream is not None and current_stream is not expected_stream:
+                return False
+        with STREAM_SESSION_OWNERS_LOCK:
+            registered_owner = STREAM_SESSION_OWNERS.get(stream_id)
+            if isinstance(registered_owner, dict):
+                candidate_owner = (session_id, *candidate_run)
+                registered_identity = tuple(
+                    str(registered_owner.get(key) or "").strip()
+                    for key in ("session_id", "turn_id", "prompt_hash")
+                )
+                if (
+                    not all(candidate_owner)
+                    or candidate_owner != registered_identity
+                    or (
+                        expected_stream is not None
+                        and registered_owner.get("stream") is not expected_stream
+                    )
+                ):
+                    return False
+            elif registered_owner is not None:
+                legacy_session_id = str(registered_owner or "").strip()
+                if session_id and legacy_session_id != session_id:
+                    return False
+            with ACTIVE_RUNS_LOCK:
+                entry = ACTIVE_RUNS.get(stream_id)
+                active_run = (
+                    str((entry or {}).get("turn_id") or "").strip(),
+                    str((entry or {}).get("prompt_hash") or "").strip(),
+                )
+                active_session_id = str((entry or {}).get("session_id") or "").strip()
+                if candidate_run != active_run:
+                    return False
+                if session_id and active_session_id != session_id:
+                    return False
+                if registered_owner is not None and not isinstance(registered_owner, dict):
+                    if active_session_id and str(registered_owner or "").strip() != active_session_id:
+                        return False
+                ACTIVE_RUNS.pop(stream_id, None)
+                if registered_owner is not None:
+                    STREAM_SESSION_OWNERS.pop(stream_id, None)
+                if cleanup_stream_state:
+                    _clear_stream_generation_state_locked(
+                        stream_id, expected_stream
+                    )
+                LAST_RUN_FINISHED_AT = time.time()
     return True
 
 
