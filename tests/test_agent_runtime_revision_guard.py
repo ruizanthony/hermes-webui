@@ -451,6 +451,7 @@ def test_stream_admission_uses_one_gateway_ownership_snapshot(monkeypatch, gatew
     gateway_reads = []
     revision_checks = []
     worker_targets = []
+    worker_kwargs = []
     session = types.SimpleNamespace(
         session_id="gateway-snapshot",
         profile=None,
@@ -472,6 +473,7 @@ def test_stream_admission_uses_one_gateway_ownership_snapshot(monkeypatch, gatew
     class FakeThread:
         def __init__(self, *, target, args, kwargs, daemon):
             worker_targets.append(target)
+            worker_kwargs.append(kwargs)
 
         def start(self):
             return None
@@ -509,6 +511,7 @@ def test_stream_admission_uses_one_gateway_ownership_snapshot(monkeypatch, gatew
             else routes._run_agent_streaming
         )
         assert worker_targets == [expected_worker]
+        assert worker_kwargs[0]["stream"] is routes.STREAMS[response["stream_id"]]
     finally:
         stream_id = str(response.get("stream_id") or "")
         with routes.STREAMS_LOCK:
