@@ -3,7 +3,7 @@
 - **Status:** Proposed
 - **Author:** @franksong2702
 - **Created:** 2026-05-16
-- **Updated:** 2026-07-16
+- **Updated:** 2026-07-21
 - **Tracking issue:** [#2361](https://github.com/nesquena/hermes-webui/issues/2361)
 - **Related architecture:** [#1925](https://github.com/nesquena/hermes-webui/issues/1925), [`hermes-run-adapter-contract.md`](hermes-run-adapter-contract.md), [`stable-assistant-turn-anchors.md`](stable-assistant-turn-anchors.md)
 
@@ -121,6 +121,12 @@ and 5; it does not mark every run-state boundary implemented.
 8. **Every mutation names its layer.** A PR touching streaming, recovery,
    context reconstruction, compression, replay, or sidebar metadata should state
    which layer it changes and what regression proves the invariant still holds.
+9. **Live state belongs to one immutable generation.** Cancel flags, agent
+   instances, partial/reasoning/tool buffers, journal cursors, channels, owners,
+   and lifecycle rows must be read, mutated, exposed, and cleaned up only through
+   the complete session/turn/prompt/channel generation that created them. Status,
+   cancel, and SSE subscription must authorize that identity and acquire the exact
+   action/channel atomically; a reused string stream id is never sufficient proof.
 
 ## Review Checklist
 
@@ -140,6 +146,8 @@ context reconstruction, or session metadata:
   assistant activity?
 - Can automatic compression or recovery text become visible active-turn content?
 - What test or manual evidence proves the invariant?
+- Can a delayed worker or authorization/action race cross a reused stream id into
+  a replacement generation?
 
 ## Existing Issue Map
 

@@ -249,12 +249,22 @@ This is the most architecturally interesting part. Two endpoints cooperate:
 Stream ownership registries:
 
     STREAMS = {}               dict: stream_id -> StreamChannel
-    STREAM_SESSION_OWNERS = {} dict: stream_id -> exact channel + session/turn identity
+    STREAM_SESSION_OWNERS = {} dict: stream_id -> immutable generation handle + owner identity
     ACTIVE_RUNS = {}           dict: stream_id -> worker lifecycle metadata
 
 Route-created channels are installed by register_stream_channel() while holding
 STREAMS_LOCK -> STREAM_SESSION_OWNERS_LOCK -> ACTIVE_RUNS_LOCK. Main chat, /btw,
-and background workers receive that exact channel and complete turn identity.
+and background workers receive that exact channel and complete turn identity. The
+generation handle also owns its cancel event, agent, partial/reasoning/tool buffers,
+goal marker, and latest journal event id. String-keyed maps are compatibility
+projections of the current handle; workers mutate the handle and publish only after
+revalidating its full identity, so a replaced worker cannot adopt the new generation.
+
+Stream status, cancel, and SSE subscription atomically authorize the handle's
+profile/session identity and acquire its exact channel/action under the same lock
+order. They never authorize one owner and then look up a channel again by reusable
+`stream_id`. Cancellation snapshots and detaches the authorized generation before
+performing session persistence outside the registry locks.
 
 SSE event types and their data shapes:
 
@@ -274,11 +284,12 @@ The SSE handler loop:
     - Catches BrokenPipeError and ConnectionResetError silently (browser disconnected)
 
 Stream cleanup: worker finalizers remove STREAMS, STREAM_SESSION_OWNERS, ACTIVE_RUNS,
-cancel flags, and partial/reasoning/tool buffers only while the exact channel and
-session/turn/prompt identity still match. Replacement handoff and matching teardown use
-the same lock order, so a delayed worker cannot remove state for a newer generation that
-reuses the stream id. If the browser disconnects mid-stream, the daemon thread still
-runs to completion and performs the same generation-checked cleanup.
+cancel flags, and partial/reasoning/tool buffers only while the immutable generation,
+exact channel, and session/turn/prompt identity still match. Replacement handoff and
+matching teardown use the same lock order, so a delayed worker cannot read, publish,
+cancel, or remove state for a newer generation that reuses the stream id. If the browser
+disconnects mid-stream, the daemon thread still runs to completion and performs the
+same generation-checked cleanup.
 
 Fallback sync endpoint: POST /api/chat still exists and holds the connection open until
 the agent finishes. The frontend never uses it but it can be useful for debugging.

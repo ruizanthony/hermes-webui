@@ -55,6 +55,7 @@ _STALE_SECS = 60.0    # consider a session inactive after this
 
 @dataclass
 class _SessionMeter:
+    owner: object | None = None
     output_tokens: int = 0
     reasoning_tokens: int = 0
     first_token_ts: float = 0.0   # time.monotonic() of first token received
@@ -93,11 +94,13 @@ class GlobalMeter:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def begin_session(self, stream_id: str) -> None:
+    def begin_session(self, stream_id: str, *, owner=None) -> None:
         with self._lock:
-            self._sessions[stream_id] = _SessionMeter()
+            self._sessions[stream_id] = _SessionMeter(owner=owner)
 
-    def set_pending_started_at(self, stream_id: str, pending_started_at) -> None:
+    def set_pending_started_at(
+        self, stream_id: str, pending_started_at, *, owner=None
+    ) -> None:
         try:
             value = float(pending_started_at)
         except (TypeError, ValueError):
@@ -106,6 +109,10 @@ class GlobalMeter:
             return
         with self._lock:
             session = self._sessions.get(stream_id)
+            if owner is not None and (
+                session is None or session.owner is not owner
+            ):
+                return
             if session is not None:
                 session.pending_started_at = value
 
@@ -124,11 +131,13 @@ class GlobalMeter:
             }
             return 1.0 if active_sids else 10.0
 
-    def record_token(self, stream_id: str, running_output_tokens: int) -> None:
+    def record_token(
+        self, stream_id: str, running_output_tokens: int, *, owner=None
+    ) -> None:
         now = time.monotonic()
         with self._lock:
             s = self._sessions.get(stream_id)
-            if s is None:
+            if s is None or (owner is not None and s.owner is not owner):
                 return
             if s.first_token_ts == 0.0:
                 s.first_token_ts = now
@@ -137,19 +146,33 @@ class GlobalMeter:
             if s.ttft_ms is None and s.pending_started_at is not None:
                 s.ttft_ms = max(0, round((time.time() - s.pending_started_at) * 1000))
 
-    def record_reasoning(self, stream_id: str, running_reasoning_tokens: int) -> None:
+    def record_reasoning(
+        self, stream_id: str, running_reasoning_tokens: int, *, owner=None
+    ) -> None:
         now = time.monotonic()
         with self._lock:
             s = self._sessions.get(stream_id)
-            if s is None:
+            if s is None or (owner is not None and s.owner is not owner):
                 return
             if s.first_token_ts == 0.0:
                 s.first_token_ts = now
             s.last_token_ts = now
             s.reasoning_tokens = running_reasoning_tokens
 
-    def end_session(self, stream_id: str, final_output_tokens: int, input_tokens: int = 0) -> None:
+    def end_session(
+        self,
+        stream_id: str,
+        final_output_tokens: int,
+        input_tokens: int = 0,
+        *,
+        owner=None,
+    ) -> None:
         with self._lock:
+            session = self._sessions.get(stream_id)
+            if owner is not None and (
+                session is None or session.owner is not owner
+            ):
+                return
             self._sessions.pop(stream_id, None)
 
     def get_ttft_ms(self, stream_id: str) -> int | None:

@@ -13,12 +13,10 @@ import urllib.request
 from typing import Any
 
 from api.config import (
-    CANCEL_FLAGS,
+    CANCEL_FLAGS,  # noqa: F401 - compatibility re-export for direct callers/tests
     PENDING_GOAL_CONTINUATION,
-    STREAM_GOAL_RELATED,
     STREAMS,
     STREAMS_LOCK,
-    STREAM_LAST_EVENT_ID,
     STREAM_LIVE_TOOL_CALLS,
     STREAM_PARTIAL_TEXT,
     STREAM_REASONING_TEXT,
@@ -26,7 +24,16 @@ from api.config import (
     coerce_reasoning_effort_for_model,
     gateway_approval_unavailable_reason,
     gateway_supports_approval,
+    ensure_stream_generation,
     register_active_run,
+    stream_generation_add_tool,
+    stream_generation_append_partial,
+    stream_generation_append_reasoning,
+    stream_generation_complete_tool,
+    stream_generation_is_current,
+    stream_generation_note_event_id,
+    stream_generation_set_partial,
+    stream_generation_snapshot,
     unregister_active_run,
     unregister_active_run_if_matches,
     update_active_run,
@@ -131,15 +138,23 @@ def gateway_run_id_pending(stream_id: str) -> bool:
         return str((_STREAM_RUN_LIFECYCLE.get(stream_id) or {}).get("phase") or "").strip().lower() == "pending"
 
 
-def wait_for_gateway_run_id(stream_id: str, timeout: float) -> tuple[bool, str | None]:
+def wait_for_gateway_run_id(
+    stream_id: str, timeout: float, *, expected_stream=None
+) -> tuple[bool, str | None]:
     deadline = time.monotonic() + max(0.0, float(timeout))
     with _STREAM_RUN_STARTING_CONDITION:
         state = _STREAM_RUN_LIFECYCLE.get(stream_id)
+        state_stream = (state or {}).get("stream")
+        if expected_stream is not None and state_stream is not expected_stream:
+            return False, None
         if state:
             state["waiters"] = int(state.get("waiters") or 0) + 1
         try:
             while True:
                 state = _STREAM_RUN_LIFECYCLE.get(stream_id)
+                state_stream = (state or {}).get("stream")
+                if expected_stream is not None and state_stream is not expected_stream:
+                    return False, None
                 phase = str((state or {}).get("phase") or "").strip().lower()
                 if phase == "fallback":
                     return False, None
@@ -164,6 +179,60 @@ def wait_for_gateway_run_id(stream_id: str, timeout: float) -> tuple[bool, str |
                 state["waiters"] = waiters
                 if _retire_gateway_run_starting_if_done(stream_id):
                     _STREAM_RUN_STARTING_CONDITION.notify_all()
+
+
+def _gateway_append_partial(generation, stream_id: str, text: str) -> None:
+    if generation is None:
+        if stream_id in STREAM_PARTIAL_TEXT:
+            STREAM_PARTIAL_TEXT[stream_id] += str(text)
+        return
+    stream_generation_append_partial(generation, text)
+
+
+def _gateway_set_partial(generation, stream_id: str, text: str) -> None:
+    if generation is None:
+        if stream_id in STREAM_PARTIAL_TEXT:
+            STREAM_PARTIAL_TEXT[stream_id] = str(text)
+        return
+    stream_generation_set_partial(generation, text)
+
+
+def _gateway_append_reasoning(generation, stream_id: str, text: str) -> None:
+    if generation is None:
+        if stream_id in STREAM_REASONING_TEXT:
+            STREAM_REASONING_TEXT[stream_id] += str(text)
+        return
+    stream_generation_append_reasoning(generation, text)
+
+
+def _gateway_add_tool(generation, stream_id: str, tool: dict) -> None:
+    if generation is None:
+        if stream_id in STREAM_LIVE_TOOL_CALLS:
+            STREAM_LIVE_TOOL_CALLS[stream_id].append(dict(tool))
+        return
+    stream_generation_add_tool(generation, tool)
+
+
+def _gateway_complete_tool(
+    generation, stream_id: str, *, name=None, tool_call_id=None, **updates
+) -> None:
+    if generation is None:
+        for tool in reversed(STREAM_LIVE_TOOL_CALLS.get(stream_id, [])):
+            if tool.get("done"):
+                continue
+            if (tool_call_id and tool.get("tid") == tool_call_id) or (
+                not tool_call_id and (not name or tool.get("name") == name)
+            ):
+                tool.update(updates)
+                tool["done"] = True
+                break
+        return
+    stream_generation_complete_tool(
+        generation,
+        name=name,
+        tool_call_id=tool_call_id,
+        **updates,
+    )
 
 
 def _record_stream_run_id(
@@ -564,7 +633,7 @@ def _run_gateway_runs_api_streaming(
     session_id, msg_text, model, workspace, stream_id,
     base_url, api_key, prefill_messages, body_extras,
     *, put_gateway_event, cancel_event,
-    attachments=None, cfg=None, session=None, stream=None,
+    attachments=None, cfg=None, session=None, stream=None, generation=None,
 ):
     """Submit via POST /v1/runs and relay SSE events including approval."""
     try:
@@ -635,7 +704,11 @@ def _run_gateway_runs_api_streaming(
             headers=headers,
             method="POST",
         )
-        update_active_run(stream_id, phase="gateway-request")
+        update_active_run(
+            stream_id,
+            expected_generation=generation,
+            phase="gateway-request",
+        )
         with urllib.request.urlopen(req, timeout=30) as resp:
             run_data = json.loads(resp.read(65536))
         run_id = str(run_data.get("run_id") or run_data.get("id") or "").strip()
@@ -693,37 +766,41 @@ def _run_gateway_runs_api_streaming(
                     event_name, event_payload = translated
                     if event_name == "reasoning":
                         reason_delta = event_payload.get("text")
-                        if reason_delta and stream_id in STREAM_REASONING_TEXT:
-                            STREAM_REASONING_TEXT[stream_id] += reason_delta
-                    elif stream_id in STREAM_LIVE_TOOL_CALLS:
+                        if reason_delta:
+                            _gateway_append_reasoning(
+                                generation, stream_id, reason_delta
+                            )
+                    else:
                         if event_name == "tool":
-                            STREAM_LIVE_TOOL_CALLS[stream_id].append({
+                            _gateway_add_tool(generation, stream_id, {
                                 "name": event_payload.get("name"),
                                 "args": event_payload.get("args") or {},
                                 "done": False,
                                 **({"tid": event_payload.get("tid")} if event_payload.get("tid") else {}),
                             })
                         elif event_name == "tool_complete":
-                            for shared_tc in reversed(STREAM_LIVE_TOOL_CALLS[stream_id]):
-                                if shared_tc.get("done"):
-                                    continue
-                                if (
-                                    event_payload.get("tid") and shared_tc.get("tid") == event_payload.get("tid")
-                                ) or shared_tc.get("name") == event_payload.get("name"):
-                                    shared_tc["done"] = True
-                                    shared_tc["is_error"] = bool(event_payload.get("is_error"))
-                                    break
+                            _gateway_complete_tool(
+                                generation,
+                                stream_id,
+                                name=event_payload.get("name"),
+                                tool_call_id=event_payload.get("tid"),
+                                is_error=bool(event_payload.get("is_error")),
+                            )
                     put_gateway_event(event_name, event_payload)
                     if event_name != "reasoning":
-                        update_active_run(stream_id, phase="gateway-tool", latest_tool=event_payload.get("name"))
+                        update_active_run(
+                            stream_id,
+                            expected_generation=generation,
+                            phase="gateway-tool",
+                            latest_tool=event_payload.get("name"),
+                        )
                 sse_event = "message"
                 continue
             if payload_event == "message.delta":
                 delta = str(payload.get("delta") or "")
                 if delta:
                     final_text += delta
-                    if stream_id in STREAM_PARTIAL_TEXT:
-                        STREAM_PARTIAL_TEXT[stream_id] += delta
+                    _gateway_append_partial(generation, stream_id, delta)
                     put_gateway_event("token", {"text": delta})
                 sse_event = "message"
                 continue
@@ -735,8 +812,7 @@ def _run_gateway_runs_api_streaming(
                 output = str(payload.get("output") or "")
                 if output and not final_text:
                     final_text = output
-                    if stream_id in STREAM_PARTIAL_TEXT:
-                        STREAM_PARTIAL_TEXT[stream_id] = output
+                    _gateway_set_partial(generation, stream_id, output)
                 usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
                 sse_event = "message"
                 continue
@@ -751,14 +827,14 @@ def _run_gateway_runs_api_streaming(
                 return None, usage
             reasoning_delta = _gateway_sse_reasoning_delta(payload)
             if reasoning_delta:
-                if stream_id in STREAM_REASONING_TEXT:
-                    STREAM_REASONING_TEXT[stream_id] += reasoning_delta
+                _gateway_append_reasoning(
+                    generation, stream_id, reasoning_delta
+                )
                 put_gateway_event("reasoning", {"text": reasoning_delta})
             delta = _gateway_sse_delta(payload)
             if delta:
                 final_text += delta
-                if stream_id in STREAM_PARTIAL_TEXT:
-                    STREAM_PARTIAL_TEXT[stream_id] += delta
+                _gateway_append_partial(generation, stream_id, delta)
                 put_gateway_event("token", {"text": delta})
             usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
     return final_text, usage
@@ -800,7 +876,7 @@ def stop_gateway_run(run_id: str) -> bool:
 
 def _settle_gateway_terminal_error(
     session_id, stream_id, workspace, model, model_provider, terminal_error,
-    *, turn_id=None, prompt_hash=None, submitted_prompt_text=None,
+    *, turn_id=None, prompt_hash=None, submitted_prompt_text=None, generation=None,
 ):
     from api.streaming import (
         _classify_provider_error,
@@ -833,7 +909,9 @@ def _settle_gateway_terminal_error(
         session.pending_started_at = None
         session.pending_user_source = None
         try:
-            _snapshot_and_append_partial_on_error(session, stream_id)
+            _snapshot_and_append_partial_on_error(
+                session, stream_id, generation
+            )
         except Exception:
             logger.debug("Failed to snapshot gateway partials on terminal error", exc_info=True)
         error_message = {
@@ -920,6 +998,7 @@ def _run_gateway_chat_streaming(
     turn_id=None,
     prompt_hash=None,
     stream=None,
+    generation=None,
 ):
     """Bridge a WebUI chat turn through Hermes Gateway's API server.
 
@@ -941,6 +1020,7 @@ def _run_gateway_chat_streaming(
     if not register_active_run(
         stream_id,
         expected_stream=q,
+        expected_generation=generation,
         session_id=session_id,
         started_at=time.time(),
         phase="gateway-starting",
@@ -960,22 +1040,28 @@ def _run_gateway_chat_streaming(
             runs_api_pending_marked=True,
         )
         return
+    generation = generation or ensure_stream_generation(
+        stream_id,
+        expected_stream=q,
+        session_id=session_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
+    )
+    if generation is None or not stream_generation_is_current(generation):
+        return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
     except Exception:
         run_journal = None
         logger.debug("Failed to initialize gateway run journal for stream %s", stream_id, exc_info=True)
-    cancel_event = threading.Event()
-    with STREAMS_LOCK:
-        CANCEL_FLAGS[stream_id] = cancel_event
-        STREAM_PARTIAL_TEXT[stream_id] = ""
-        STREAM_REASONING_TEXT[stream_id] = ""
-        STREAM_LIVE_TOOL_CALLS[stream_id] = []
+    cancel_event = generation.state.cancel_event
 
     success_writeback_committed = False
     runs_api_pending_marked = True
 
     def put_gateway_event(event, data):
+        if not stream_generation_is_current(generation):
+            return
         if cancel_event.is_set() and not success_writeback_committed and event not in ("cancel", "error", "apperror"):
             return
         if event == "apperror" and isinstance(data, dict):
@@ -987,7 +1073,7 @@ def _run_gateway_chat_streaming(
                 journaled = run_journal.append_sse_event(event, data)
                 event_id = (journaled or {}).get("event_id") if isinstance(journaled, dict) else None
                 if event_id:
-                    STREAM_LAST_EVENT_ID[stream_id] = event_id
+                    stream_generation_note_event_id(generation, event_id)
             except Exception:
                 logger.debug("Failed to append gateway event %s for stream %s", event, stream_id, exc_info=True)
         if event_id and hasattr(q, "note_last_event_id"):
@@ -1087,6 +1173,7 @@ def _run_gateway_chat_streaming(
                     cfg=cfg,
                     session=s,
                     stream=q,
+                    generation=generation,
                 )
             except Exception as exc:
                 error_payload = _settle_gateway_terminal_error(
@@ -1099,6 +1186,7 @@ def _run_gateway_chat_streaming(
                     turn_id=turn_id,
                     prompt_hash=prompt_hash,
                     submitted_prompt_text=msg_text,
+                    generation=generation,
                 )
                 if error_payload is None:
                     return
@@ -1162,7 +1250,11 @@ def _run_gateway_chat_streaming(
                 headers=headers,
                 method="POST",
             )
-            update_active_run(stream_id, phase="gateway-request")
+            update_active_run(
+                stream_id,
+                expected_generation=generation,
+                phase="gateway-request",
+            )
             last_payload = {}
             sse_event = "message"
             with urllib.request.urlopen(req, timeout=_gateway_read_timeout_secs()) as resp:
@@ -1217,36 +1309,42 @@ def _run_gateway_chat_streaming(
                             event_name, event_payload = translated
                             if event_name == "reasoning":
                                 reason_delta = event_payload.get("text")
-                                if reason_delta and stream_id in STREAM_REASONING_TEXT:
-                                    STREAM_REASONING_TEXT[stream_id] += reason_delta
-                            elif stream_id in STREAM_LIVE_TOOL_CALLS:
+                                if reason_delta:
+                                    _gateway_append_reasoning(
+                                        generation, stream_id, reason_delta
+                                    )
+                            else:
                                 if event_name == "tool":
-                                    STREAM_LIVE_TOOL_CALLS[stream_id].append({
+                                    _gateway_add_tool(generation, stream_id, {
                                         "name": event_payload.get("name"),
                                         "args": event_payload.get("args") or {},
                                         "done": False,
                                         **({"tid": event_payload.get("tid")} if event_payload.get("tid") else {}),
                                     })
                                 else:
-                                    for shared_tc in reversed(STREAM_LIVE_TOOL_CALLS[stream_id]):
-                                        if shared_tc.get("done"):
-                                            continue
-                                        if (
-                                            event_payload.get("tid") and shared_tc.get("tid") == event_payload.get("tid")
-                                        ) or shared_tc.get("name") == event_payload.get("name"):
-                                            shared_tc["done"] = True
-                                            shared_tc["is_error"] = bool(event_payload.get("is_error"))
-                                            break
+                                    _gateway_complete_tool(
+                                        generation,
+                                        stream_id,
+                                        name=event_payload.get("name"),
+                                        tool_call_id=event_payload.get("tid"),
+                                        is_error=bool(event_payload.get("is_error")),
+                                    )
                             put_gateway_event(event_name, event_payload)
                             if event_name != "reasoning":
-                                update_active_run(stream_id, phase="gateway-tool", latest_tool=event_payload.get("name"))
+                                update_active_run(
+                                    stream_id,
+                                    expected_generation=generation,
+                                    phase="gateway-tool",
+                                    latest_tool=event_payload.get("name"),
+                                )
                         sse_event = "message"
                         continue
                     if sse_event == "reasoning.available":
                         reason_delta = _gateway_reasoning_delta(payload)
                         if reason_delta:
-                            if stream_id in STREAM_REASONING_TEXT:
-                                STREAM_REASONING_TEXT[stream_id] += reason_delta
+                            _gateway_append_reasoning(
+                                generation, stream_id, reason_delta
+                            )
                             put_gateway_event("reasoning", {"text": reason_delta})
                         sse_event = "message"
                         continue
@@ -1255,14 +1353,14 @@ def _run_gateway_chat_streaming(
                         terminal_error = str(payload["error"])
                     reasoning_delta = _gateway_sse_reasoning_delta(payload)
                     if reasoning_delta:
-                        if stream_id in STREAM_REASONING_TEXT:
-                            STREAM_REASONING_TEXT[stream_id] += reasoning_delta
+                        _gateway_append_reasoning(
+                            generation, stream_id, reasoning_delta
+                        )
                         put_gateway_event("reasoning", {"text": reasoning_delta})
                     delta = _gateway_sse_delta(payload)
                     if delta:
                         final_text += delta
-                        if stream_id in STREAM_PARTIAL_TEXT:
-                            STREAM_PARTIAL_TEXT[stream_id] += delta
+                        _gateway_append_partial(generation, stream_id, delta)
                         put_gateway_event("token", {"text": delta})
                     usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
             usage.update({k: v for k, v in _gateway_stream_usage(last_payload).items() if v})
@@ -1278,6 +1376,7 @@ def _run_gateway_chat_streaming(
                 turn_id=turn_id,
                 prompt_hash=prompt_hash,
                 submitted_prompt_text=msg_text,
+                generation=generation,
             )
             if error_payload is None:
                 return
@@ -1317,7 +1416,9 @@ def _run_gateway_chat_streaming(
             if attachments:
                 user_msg["attachments"] = list(attachments)
             assistant_msg = {"role": "assistant", "content": assistant_text, "timestamp": assistant_ts}
-            saved_reasoning = STREAM_REASONING_TEXT.get(stream_id, "")
+            saved_reasoning = stream_generation_snapshot(generation)[
+                "reasoning_text"
+            ]
             if saved_reasoning:
                 assistant_msg["reasoning"] = saved_reasoning
             previous_messages = list(getattr(s, "messages", None) or [])
