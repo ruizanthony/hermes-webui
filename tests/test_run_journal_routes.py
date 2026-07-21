@@ -12,7 +12,8 @@ ROUTES_SRC = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
 
 def test_stream_status_exposes_replay_summary():
     status_pos = ROUTES_SRC.index('parsed.path == "/api/chat/stream/status"')
-    block = ROUTES_SRC[status_pos : status_pos + 900]
+    cancel_pos = ROUTES_SRC.index('parsed.path == "/api/chat/cancel"', status_pos)
+    block = ROUTES_SRC[status_pos:cancel_pos]
 
     assert "find_run_summary(stream_id)" in block
     assert '"replay_available"' in block
@@ -22,7 +23,10 @@ def test_stream_status_exposes_replay_summary():
 
 def test_dead_stream_sse_replays_journal_before_404_fallback():
     handler_pos = ROUTES_SRC.index("def _handle_sse_stream")
-    block = ROUTES_SRC[handler_pos : handler_pos + 1800]
+    next_handler_pos = ROUTES_SRC.index(
+        "def _handle_session_run_journal_stream_for_session", handler_pos
+    )
+    block = ROUTES_SRC[handler_pos:next_handler_pos]
 
     assert "find_run_summary(stream_id)" in block
     assert "stream not found" in block

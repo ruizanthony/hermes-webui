@@ -9,15 +9,17 @@ accumulator.
 
 Implementation:
 
-  - api/config.py adds `STREAM_LAST_EVENT_ID: dict = {}` module-level dict.
+  - api/config.py owns the event id in `StreamGenerationState.last_event_id`
+    and projects it to the legacy `STREAM_LAST_EVENT_ID` compatibility map.
   - api/streaming.py `put()` captures `journaled["event_id"]` from
-    `RunJournalWriter.append_sse_event()` return and writes it to
-    `STREAM_LAST_EVENT_ID[stream_id]`.
+    `RunJournalWriter.append_sse_event()` and records it through the exact
+    immutable generation handle.
   - StreamChannel queue items carry `(event, data, event_id)` so active
     subscribers emit each frame with its own id instead of the latest global id.
   - Legacy plain queues keep `(event, data)` and use `STREAM_LAST_EVENT_ID` as a
     compatibility fallback.
-  - api/streaming.py finally-block cleanup pops STREAM_LAST_EVENT_ID.
+  - api/config.py generation teardown pops STREAM_LAST_EVENT_ID with the other
+    projected compatibility state after exact-generation validation.
 """
 
 from pathlib import Path
@@ -38,18 +40,18 @@ def test_stream_last_event_id_dict_exists_in_config():
     )
 
 
-def test_put_writes_event_id_to_side_channel_dict():
+def test_put_records_event_id_on_exact_generation():
     """The `put()` helper must capture the event_id from the journal and
-    write it to STREAM_LAST_EVENT_ID[stream_id]."""
+    record it through the immutable stream-generation handle."""
     put_def_idx = STREAMING_PY.find("def put(event, data):")
     assert put_def_idx != -1, "put(event, data) not found in api/streaming.py"
     put_body = STREAMING_PY[put_def_idx:put_def_idx + 2500]
     assert "journaled = run_journal.append_sse_event(event, data)" in put_body, (
         "put() must capture append_sse_event return value"
     )
-    assert "STREAM_LAST_EVENT_ID[stream_id]" in put_body, (
-        "put() must write event_id to STREAM_LAST_EVENT_ID[stream_id] — "
-        "this is the side-channel the SSE consumer reads at emit time"
+    assert "stream_generation_note_event_id(generation, event_id)" in put_body, (
+        "put() must bind event_id to the exact generation instead of mutating "
+        "replacement state through the reusable stream_id"
     )
 
 
@@ -81,7 +83,10 @@ def test_sse_handler_reads_event_id_from_side_channel():
     and pass it to _sse_with_id when present."""
     handler_idx = ROUTES_PY.find("def _handle_sse_stream(handler, parsed):")
     assert handler_idx != -1, "_handle_sse_stream not found"
-    handler_body = ROUTES_PY[handler_idx:handler_idx + 4000]
+    next_handler_idx = ROUTES_PY.find(
+        "def _handle_session_run_journal_stream_for_session", handler_idx
+    )
+    handler_body = ROUTES_PY[handler_idx:next_handler_idx]
     assert "STREAM_LAST_EVENT_ID.get(stream_id)" in handler_body, (
         "_handle_sse_stream must read STREAM_LAST_EVENT_ID[stream_id] to "
         "get the event_id for emit"
@@ -92,15 +97,14 @@ def test_sse_handler_reads_event_id_from_side_channel():
 
 
 def test_cleanup_pops_stream_last_event_id():
-    """The streaming worker's finally block must pop STREAM_LAST_EVENT_ID
-    alongside the other STREAM_* dicts to prevent memory leak."""
-    # Find the cleanup block — multiple .pop(stream_id, None) lines
-    cleanup_idx = STREAMING_PY.find("STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)")
-    assert cleanup_idx != -1, "cleanup block not found"
-    cleanup_block = STREAMING_PY[cleanup_idx:cleanup_idx + 500]
+    """Exact-generation teardown must clear the projected event-id entry."""
+    cleanup_idx = CONFIG_PY.find("def _clear_stream_generation_state_locked")
+    assert cleanup_idx != -1, "generation cleanup block not found"
+    cleanup_end = CONFIG_PY.find("def unregister_active_run", cleanup_idx)
+    cleanup_block = CONFIG_PY[cleanup_idx:cleanup_end]
     assert "STREAM_LAST_EVENT_ID.pop(stream_id, None)" in cleanup_block, (
-        "STREAM_LAST_EVENT_ID must be popped on worker finally to prevent "
-        "unbounded memory growth across streams"
+        "STREAM_LAST_EVENT_ID must be popped during exact-generation teardown "
+        "to prevent unbounded memory growth across streams"
     )
 
 
@@ -109,3 +113,4 @@ def test_imports_present():
     and routes.py (reader)."""
     assert "STREAM_LAST_EVENT_ID," in STREAMING_PY, "streaming.py must import"
     assert "STREAM_LAST_EVENT_ID," in ROUTES_PY, "routes.py must import"
+    assert "stream_generation_note_event_id," in STREAMING_PY

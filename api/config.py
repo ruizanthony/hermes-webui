@@ -27,8 +27,9 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 # ── Basic layout ──────────────────────────────────────────────────────────────
@@ -8838,6 +8839,504 @@ STREAM_LAST_EVENT_ID: dict = {}  # stream_id -> latest journal event_id for `id:
 PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
 
 
+@dataclass
+class StreamGenerationState:
+    """Mutable state owned by one immutable stream generation."""
+
+    cancel_event: threading.Event = dataclass_field(default_factory=threading.Event)
+    agent: object | None = None
+    partial_text: str = ""
+    reasoning_text: str = ""
+    live_tool_calls: list = dataclass_field(default_factory=list)
+    goal_related: bool = False
+    last_event_id: str | None = None
+    accepting_updates: bool = True
+    lock: threading.RLock = dataclass_field(
+        default_factory=threading.RLock, repr=False
+    )
+
+
+@dataclass(frozen=True)
+class StreamGenerationHandle:
+    """Full route/channel identity captured once and never re-resolved by key."""
+
+    stream_id: str
+    stream: object
+    session_id: str
+    turn_id: str
+    prompt_hash: str
+    profile: str | None
+    state: StreamGenerationState = dataclass_field(
+        default_factory=StreamGenerationState, compare=False, repr=False
+    )
+
+
+@dataclass(frozen=True)
+class StreamAccessSnapshot:
+    """Atomic authorization plus exact channel/action acquisition result."""
+
+    generation: StreamGenerationHandle
+    active: bool
+    active_run: dict
+    subscriber: object | None = None
+    stream_snapshot: dict = dataclass_field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class StreamCancelSnapshot:
+    """Generation-local state captured while atomically detaching its channel."""
+
+    generation: StreamGenerationHandle
+    stream_present: bool
+    active_run: dict
+    agent: object | None
+    partial_text: str
+    reasoning_text: str
+    live_tool_calls: list
+    last_event_id: str | None
+
+
+def _generation_identity(generation: StreamGenerationHandle) -> tuple[str, str, str]:
+    return (
+        generation.session_id,
+        generation.turn_id,
+        generation.prompt_hash,
+    )
+
+
+def _registered_generation_locked(stream_id: str) -> StreamGenerationHandle | None:
+    owner = STREAM_SESSION_OWNERS.get(stream_id)
+    if not isinstance(owner, dict):
+        return None
+    generation = owner.get("generation")
+    if not isinstance(generation, StreamGenerationHandle):
+        return None
+    registered_identity = tuple(
+        str(owner.get(key) or "").strip()
+        for key in ("session_id", "turn_id", "prompt_hash")
+    )
+    if (
+        generation.stream_id != stream_id
+        or owner.get("stream") is not generation.stream
+        or registered_identity != _generation_identity(generation)
+    ):
+        return None
+    return generation
+
+
+def _active_generation_matches_locked(generation: StreamGenerationHandle) -> bool:
+    active = ACTIVE_RUNS.get(generation.stream_id)
+    if not isinstance(active, dict):
+        return False
+    active_identity = tuple(
+        str(active.get(key) or "").strip()
+        for key in ("session_id", "turn_id", "prompt_hash")
+    )
+    return active_identity == _generation_identity(generation)
+
+
+def _generation_is_current_locked(generation: StreamGenerationHandle) -> bool:
+    return (
+        _registered_generation_locked(generation.stream_id) is generation
+        and _active_generation_matches_locked(generation)
+    )
+
+
+def _publish_generation_state_locked(generation: StreamGenerationHandle) -> None:
+    """Project generation-local state into legacy observable maps."""
+    stream_id = generation.stream_id
+    state = generation.state
+    CANCEL_FLAGS[stream_id] = state.cancel_event
+    if state.agent is None:
+        AGENT_INSTANCES.pop(stream_id, None)
+    else:
+        AGENT_INSTANCES[stream_id] = state.agent
+    STREAM_PARTIAL_TEXT[stream_id] = state.partial_text
+    STREAM_REASONING_TEXT[stream_id] = state.reasoning_text
+    STREAM_LIVE_TOOL_CALLS[stream_id] = [
+        dict(tool) if isinstance(tool, dict) else tool
+        for tool in state.live_tool_calls
+    ]
+    if state.goal_related:
+        STREAM_GOAL_RELATED[stream_id] = True
+    else:
+        STREAM_GOAL_RELATED.pop(stream_id, None)
+    if state.last_event_id:
+        STREAM_LAST_EVENT_ID[stream_id] = state.last_event_id
+    else:
+        STREAM_LAST_EVENT_ID.pop(stream_id, None)
+
+
+def get_stream_generation(
+    stream_id: str,
+    *,
+    expected_stream=None,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+    prompt_hash: str | None = None,
+) -> StreamGenerationHandle | None:
+    """Return one exact current generation under the registry lock order."""
+    stream_id = str(stream_id or "").strip()
+    if not stream_id:
+        return None
+    with STREAMS_LOCK:
+        with STREAM_SESSION_OWNERS_LOCK:
+            with ACTIVE_RUNS_LOCK:
+                generation = _registered_generation_locked(stream_id)
+                if generation is None or not _active_generation_matches_locked(generation):
+                    return None
+                if expected_stream is not None and generation.stream is not expected_stream:
+                    return None
+                candidate = (
+                    str(session_id or generation.session_id).strip(),
+                    str(turn_id or generation.turn_id).strip(),
+                    str(prompt_hash or generation.prompt_hash).strip(),
+                )
+                if candidate != _generation_identity(generation):
+                    return None
+                return generation
+
+
+def ensure_stream_generation(
+    stream_id: str,
+    *,
+    expected_stream,
+    session_id: str,
+    turn_id: str | None = None,
+    prompt_hash: str | None = None,
+    profile: str | None = None,
+) -> StreamGenerationHandle | None:
+    """Bind legacy direct callers to an exact channel generation.
+
+    Production routes already install complete identities through
+    ``register_stream_channel``. This compatibility path gives historical tests
+    and direct callers the same state handle without allowing them to adopt a
+    structured replacement owner.
+    """
+    stream_id = str(stream_id or "").strip()
+    session_id = str(session_id or "").strip()
+    if not stream_id or not session_id or expected_stream is None:
+        return None
+    with STREAMS_LOCK:
+        if STREAMS.get(stream_id) is not expected_stream:
+            return None
+        with STREAM_SESSION_OWNERS_LOCK:
+            with ACTIVE_RUNS_LOCK:
+                current = _registered_generation_locked(stream_id)
+                if current is not None:
+                    if (
+                        current.stream is expected_stream
+                        and current.session_id == session_id
+                        and (not turn_id or current.turn_id == str(turn_id).strip())
+                        and (
+                            not prompt_hash
+                            or current.prompt_hash == str(prompt_hash).strip()
+                        )
+                        and _active_generation_matches_locked(current)
+                    ):
+                        return current
+                    return None
+                owner = STREAM_SESSION_OWNERS.get(stream_id)
+                if isinstance(owner, dict):
+                    return None
+                if owner is not None and str(owner or "").strip() != session_id:
+                    return None
+                active = ACTIVE_RUNS.get(stream_id)
+                active_session_id = str((active or {}).get("session_id") or "").strip()
+                if active_session_id and active_session_id != session_id:
+                    return None
+                resolved_turn_id = str(
+                    turn_id or (active or {}).get("turn_id") or f"compat-{uuid.uuid4().hex}"
+                ).strip()
+                resolved_prompt_hash = str(
+                    prompt_hash
+                    or (active or {}).get("prompt_hash")
+                    or f"compat-{uuid.uuid4().hex}"
+                ).strip()
+                generation = StreamGenerationHandle(
+                    stream_id=stream_id,
+                    stream=expected_stream,
+                    session_id=session_id,
+                    turn_id=resolved_turn_id,
+                    prompt_hash=resolved_prompt_hash,
+                    profile=profile,
+                )
+                STREAM_SESSION_OWNERS[stream_id] = {
+                    "stream": expected_stream,
+                    "session_id": session_id,
+                    "turn_id": resolved_turn_id,
+                    "prompt_hash": resolved_prompt_hash,
+                    "profile": profile,
+                    "generation": generation,
+                }
+                entry = dict(active or {})
+                entry.update(
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    turn_id=resolved_turn_id,
+                    prompt_hash=resolved_prompt_hash,
+                )
+                ACTIVE_RUNS[stream_id] = entry
+                _publish_generation_state_locked(generation)
+                return generation
+
+
+def stream_generation_is_current(
+    generation: StreamGenerationHandle,
+) -> bool:
+    """Check full ownership without re-resolving any generation-local value."""
+    with STREAM_SESSION_OWNERS_LOCK:
+        with ACTIVE_RUNS_LOCK:
+            if not _generation_is_current_locked(generation):
+                return False
+            if STREAMS.get(generation.stream_id) is not generation.stream:
+                return False
+            with generation.state.lock:
+                return bool(generation.state.accepting_updates)
+
+
+def _mutate_stream_generation(
+    generation: StreamGenerationHandle,
+    mutator: Callable[[StreamGenerationState], None],
+) -> bool:
+    with STREAM_SESSION_OWNERS_LOCK:
+        with ACTIVE_RUNS_LOCK:
+            if not _generation_is_current_locked(generation):
+                return False
+            if STREAMS.get(generation.stream_id) is not generation.stream:
+                return False
+            with generation.state.lock:
+                if not generation.state.accepting_updates:
+                    return False
+                mutator(generation.state)
+                _publish_generation_state_locked(generation)
+                return True
+
+
+def stream_generation_apply(
+    generation: StreamGenerationHandle,
+    action: Callable[[], Any],
+) -> tuple[bool, Any]:
+    """Run one external side effect while replacement is unable to interleave."""
+    with STREAM_SESSION_OWNERS_LOCK:
+        with ACTIVE_RUNS_LOCK:
+            if not _generation_is_current_locked(generation):
+                return False, None
+            if STREAMS.get(generation.stream_id) is not generation.stream:
+                return False, None
+            with generation.state.lock:
+                if not generation.state.accepting_updates:
+                    return False, None
+            return True, action()
+
+
+def stream_generation_set_agent(generation: StreamGenerationHandle, agent) -> bool:
+    return _mutate_stream_generation(
+        generation, lambda state: setattr(state, "agent", agent)
+    )
+
+
+def stream_generation_append_partial(
+    generation: StreamGenerationHandle, text: str
+) -> bool:
+    return _mutate_stream_generation(
+        generation,
+        lambda state: setattr(state, "partial_text", state.partial_text + str(text)),
+    )
+
+
+def stream_generation_set_partial(
+    generation: StreamGenerationHandle, text: str
+) -> bool:
+    return _mutate_stream_generation(
+        generation, lambda state: setattr(state, "partial_text", str(text or ""))
+    )
+
+
+def stream_generation_append_reasoning(
+    generation: StreamGenerationHandle, text: str
+) -> bool:
+    return _mutate_stream_generation(
+        generation,
+        lambda state: setattr(
+            state, "reasoning_text", state.reasoning_text + str(text)
+        ),
+    )
+
+
+def stream_generation_set_reasoning(
+    generation: StreamGenerationHandle, text: str
+) -> bool:
+    return _mutate_stream_generation(
+        generation, lambda state: setattr(state, "reasoning_text", str(text or ""))
+    )
+
+
+def stream_generation_add_tool(
+    generation: StreamGenerationHandle, tool: dict
+) -> bool:
+    return _mutate_stream_generation(
+        generation, lambda state: state.live_tool_calls.append(dict(tool))
+    )
+
+
+def stream_generation_complete_tool(
+    generation: StreamGenerationHandle,
+    *,
+    name: str | None = None,
+    tool_call_id: str | None = None,
+    **updates,
+) -> bool:
+    def complete(state: StreamGenerationState) -> None:
+        for tool in reversed(state.live_tool_calls):
+            if not isinstance(tool, dict) or tool.get("done"):
+                continue
+            if tool_call_id and tool.get("tid") == tool_call_id:
+                tool.update(updates)
+                tool["done"] = True
+                return
+            if not tool_call_id and (not name or tool.get("name") == name):
+                tool.update(updates)
+                tool["done"] = True
+                return
+            if tool_call_id and not tool.get("tid") and tool.get("name") == name:
+                tool.update(updates)
+                tool["done"] = True
+                return
+
+    return _mutate_stream_generation(generation, complete)
+
+
+def stream_generation_note_event_id(
+    generation: StreamGenerationHandle, event_id: str | None
+) -> bool:
+    if not event_id:
+        return False
+    return _mutate_stream_generation(
+        generation, lambda state: setattr(state, "last_event_id", str(event_id))
+    )
+
+
+def stream_generation_snapshot(generation: StreamGenerationHandle) -> dict:
+    """Read only this handle's state; never follow its reusable string key."""
+    state = generation.state
+    with state.lock:
+        return {
+            "cancel_event": state.cancel_event,
+            "agent": state.agent,
+            "partial_text": state.partial_text,
+            "reasoning_text": state.reasoning_text,
+            "live_tool_calls": [
+                dict(tool) if isinstance(tool, dict) else tool
+                for tool in state.live_tool_calls
+            ],
+            "goal_related": state.goal_related,
+            "last_event_id": state.last_event_id,
+        }
+
+
+def acquire_stream_access(
+    stream_id: str,
+    *,
+    active_profile: str | None,
+    profiles_match: Callable[[str | None, str | None], bool],
+    subscribe: bool = False,
+    expected_session_id: str | None = None,
+) -> tuple[str, StreamAccessSnapshot | None]:
+    """Authorize identity and acquire the exact channel/action atomically.
+
+    Returns ``("legacy", None)`` for historical unstructured owners so callers
+    may use their compatibility/journal path. Structured generations never fall
+    back to a second lookup by ``stream_id``.
+    """
+    stream_id = str(stream_id or "").strip()
+    if not stream_id:
+        return "missing", None
+    with STREAMS_LOCK:
+        with STREAM_SESSION_OWNERS_LOCK:
+            with ACTIVE_RUNS_LOCK:
+                owner = STREAM_SESSION_OWNERS.get(stream_id)
+                if not isinstance(owner, dict) or not isinstance(
+                    owner.get("generation"), StreamGenerationHandle
+                ):
+                    return "legacy", None
+                generation = _registered_generation_locked(stream_id)
+                if generation is None or not _active_generation_matches_locked(generation):
+                    return "changed", None
+                if (
+                    expected_session_id is not None
+                    and generation.session_id != str(expected_session_id).strip()
+                ):
+                    return "forbidden", None
+                if not profiles_match(generation.profile, active_profile):
+                    return "forbidden", None
+                active = STREAMS.get(stream_id) is generation.stream
+                subscriber = None
+                stream_snapshot = {}
+                if subscribe:
+                    if not active:
+                        return "changed", None
+                    stream = generation.stream
+                    if hasattr(stream, "subscribe_with_snapshot"):
+                        subscriber, stream_snapshot = stream.subscribe_with_snapshot()
+                    else:
+                        subscriber = stream.subscribe() if hasattr(stream, "subscribe") else stream
+                return (
+                    "ok",
+                    StreamAccessSnapshot(
+                        generation=generation,
+                        active=active,
+                        active_run=dict(ACTIVE_RUNS.get(stream_id) or {}),
+                        subscriber=subscriber,
+                        stream_snapshot=dict(stream_snapshot or {}),
+                    ),
+                )
+
+
+def detach_stream_generation_for_cancel(
+    generation: StreamGenerationHandle,
+) -> StreamCancelSnapshot | None:
+    """Revalidate, snapshot, signal, and detach exactly one generation."""
+    with STREAMS_LOCK:
+        with STREAM_SESSION_OWNERS_LOCK:
+            with ACTIVE_RUNS_LOCK:
+                if not _generation_is_current_locked(generation):
+                    return None
+                state = generation.state
+                with state.lock:
+                    if not state.accepting_updates:
+                        return None
+                    stream_present = (
+                        STREAMS.get(generation.stream_id) is generation.stream
+                    )
+                    snapshot = StreamCancelSnapshot(
+                        generation=generation,
+                        stream_present=stream_present,
+                        active_run=dict(ACTIVE_RUNS.get(generation.stream_id) or {}),
+                        agent=state.agent,
+                        partial_text=state.partial_text,
+                        reasoning_text=state.reasoning_text,
+                        live_tool_calls=[
+                            dict(tool) if isinstance(tool, dict) else tool
+                            for tool in state.live_tool_calls
+                        ],
+                        last_event_id=state.last_event_id,
+                    )
+                    state.accepting_updates = False
+                    state.cancel_event.set()
+                ACTIVE_RUNS[generation.stream_id]["phase"] = "cancelling"
+                if stream_present:
+                    STREAMS.pop(generation.stream_id, None)
+                CANCEL_FLAGS.pop(generation.stream_id, None)
+                AGENT_INSTANCES.pop(generation.stream_id, None)
+                STREAM_PARTIAL_TEXT.pop(generation.stream_id, None)
+                STREAM_REASONING_TEXT.pop(generation.stream_id, None)
+                STREAM_LIVE_TOOL_CALLS.pop(generation.stream_id, None)
+                STREAM_GOAL_RELATED.pop(generation.stream_id, None)
+                STREAM_LAST_EVENT_ID.pop(generation.stream_id, None)
+                return snapshot
+
+
 def register_stream_owner(stream_id: str, session_id: str) -> bool:
     """Register a compatibility owner that cannot replace a route generation.
 
@@ -9093,11 +9592,24 @@ def register_stream_channel(
     if not stream_id or stream is None or not all((session_id, turn_id, prompt_hash)):
         return False
     now = time.time()
+    profile = metadata.get("profile")
+    goal_related = bool(metadata.get("goal_related"))
+    generation = StreamGenerationHandle(
+        stream_id=stream_id,
+        stream=stream,
+        session_id=session_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
+        profile=profile,
+    )
+    generation.state.goal_related = goal_related
     owner = {
         "stream": stream,
         "session_id": session_id,
         "turn_id": turn_id,
         "prompt_hash": prompt_hash,
+        "profile": profile,
+        "generation": generation,
     }
     entry = dict(metadata or {})
     entry.update(
@@ -9111,20 +9623,20 @@ def register_stream_channel(
     with STREAMS_LOCK:
         with STREAM_SESSION_OWNERS_LOCK:
             with ACTIVE_RUNS_LOCK:
-                CANCEL_FLAGS.pop(stream_id, None)
-                AGENT_INSTANCES.pop(stream_id, None)
-                STREAM_PARTIAL_TEXT.pop(stream_id, None)
-                STREAM_REASONING_TEXT.pop(stream_id, None)
-                STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
-                STREAM_GOAL_RELATED.pop(stream_id, None)
-                STREAM_LAST_EVENT_ID.pop(stream_id, None)
                 STREAMS[stream_id] = stream
                 STREAM_SESSION_OWNERS[stream_id] = owner
                 ACTIVE_RUNS[stream_id] = entry
+                _publish_generation_state_locked(generation)
     return True
 
 
-def register_active_run(stream_id: str, *, expected_stream=None, **metadata) -> bool:
+def register_active_run(
+    stream_id: str,
+    *,
+    expected_stream=None,
+    expected_generation: StreamGenerationHandle | None = None,
+    **metadata,
+) -> bool:
     """Atomically register or refresh one complete stream/run owner.
 
     When ``expected_stream`` is supplied, registration also proves that the
@@ -9158,6 +9670,11 @@ def register_active_run(stream_id: str, *, expected_stream=None, **metadata) -> 
                         registered_owner.get("stream") is not expected_stream
                         or not all(candidate_owner)
                         or candidate_owner != registered_identity
+                        or (
+                            expected_generation is not None
+                            and registered_owner.get("generation")
+                            is not expected_generation
+                        )
                     ):
                         return False
                 elif registered_owner is not None:
@@ -9187,14 +9704,33 @@ def register_active_run(stream_id: str, *, expected_stream=None, **metadata) -> 
     return True
 
 
-def update_active_run(stream_id: str, **metadata) -> None:
+def update_active_run(
+    stream_id: str,
+    *,
+    expected_generation: StreamGenerationHandle | None = None,
+    **metadata,
+) -> bool:
     """Update active-run metadata without creating a new run implicitly."""
     if not stream_id:
-        return
+        return False
+    if expected_generation is not None:
+        with STREAM_SESSION_OWNERS_LOCK:
+            with ACTIVE_RUNS_LOCK:
+                if not _generation_is_current_locked(expected_generation):
+                    return False
+                if STREAMS.get(stream_id) is not expected_generation.stream:
+                    return False
+                with expected_generation.state.lock:
+                    if not expected_generation.state.accepting_updates:
+                        return False
+                ACTIVE_RUNS[stream_id].update(metadata)
+                return True
     with ACTIVE_RUNS_LOCK:
         entry = ACTIVE_RUNS.get(stream_id)
         if entry is not None:
             entry.update(metadata)
+            return True
+    return False
 
 
 def _clear_stream_generation_state_locked(stream_id: str, expected_stream) -> None:

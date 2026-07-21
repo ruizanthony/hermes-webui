@@ -30,12 +30,24 @@ from api.config import (
     get_config,
     STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, STREAM_PARTIAL_TEXT,
     STREAM_REASONING_TEXT, STREAM_LIVE_TOOL_CALLS,
-    STREAM_GOAL_RELATED, PENDING_GOAL_CONTINUATION,
+    PENDING_GOAL_CONTINUATION,
     STREAM_LAST_EVENT_ID,
     LOCK, SESSIONS, SESSIONS_MAX, SESSION_DIR,
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     register_active_run, update_active_run, unregister_active_run,
     unregister_active_run_if_matches,
+    detach_stream_generation_for_cancel,
+    ensure_stream_generation,
+    stream_generation_add_tool,
+    stream_generation_apply,
+    stream_generation_append_partial,
+    stream_generation_append_reasoning,
+    stream_generation_complete_tool,
+    stream_generation_is_current,
+    stream_generation_note_event_id,
+    stream_generation_set_agent,
+    stream_generation_set_reasoning,
+    stream_generation_snapshot,
     SESSION_AGENT_LOCKS, SESSION_AGENT_LOCKS_LOCK,
     resolve_model_provider,
     resolve_custom_provider_connection,
@@ -6627,11 +6639,23 @@ def _build_partial_message(content_text, reasoning_text, tool_calls) -> dict | N
     return _msg
 
 
-def _snapshot_and_append_partial_on_error(session, stream_id) -> dict | None:
+def _snapshot_and_append_partial_on_error(
+    session, stream_id, generation=None
+) -> dict | None:
     """Snapshot streaming buffers under STREAMS_LOCK and append a _partial message.
 
     Uses _build_partial_message() for the shared thinking-strip + dict-build logic.
     """
+    if generation is not None:
+        snapshot = stream_generation_snapshot(generation)
+        _snap_partial_text = snapshot["partial_text"]
+        _snap_reasoning = snapshot["reasoning_text"]
+        _snap_tool_calls = snapshot["live_tool_calls"]
+    else:
+        _snap_partial_text = None
+        _snap_reasoning = None
+        _snap_tool_calls = None
+
     from api import config as _live_config
 
     streams_lock = STREAMS_LOCK
@@ -6646,35 +6670,28 @@ def _snapshot_and_append_partial_on_error(session, stream_id) -> dict | None:
         reasoning_texts = getattr(_live_config, 'STREAM_REASONING_TEXT', reasoning_texts)
         live_tool_calls = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', live_tool_calls)
 
-    _snap_partial_text = None
-    _snap_reasoning = None
-    _snap_tool_calls = None
+    # Structured workers snapshot their generation-local state above. Historical
+    # direct callers still use the projected maps and take STREAMS_LOCK so their
+    # read remains atomic with compatibility cleanup.
+    if generation is None:
+        with streams_lock:
+            _snap_partial_text = partial_texts.get(stream_id, '')
+            if not _snap_partial_text:
+                _live_partials = getattr(_live_config, 'STREAM_PARTIAL_TEXT', partial_texts)
+                if _live_partials is not partial_texts:
+                    _snap_partial_text = _live_partials.get(stream_id, '')
 
-    # The streaming thread mirrors these three buffers lock-free (GIL-atomic; see
-    # the STREAMS_LOCK contract note at on_token in the streaming loop). We take
-    # STREAMS_LOCK here to read atomically w.r.t. the worker's cleanup `finally`
-    # (which pops all three under STREAMS_LOCK) — NOT w.r.t. the writer, which
-    # holds no lock, so the three reads may still reflect slightly different
-    # points in time. That is acceptable: each individual read is complete (never
-    # torn) and a slightly-stale partial is reconciled by later journal/SSE events.
-    with streams_lock:
-        _snap_partial_text = partial_texts.get(stream_id, '')
-        if not _snap_partial_text:
-            _live_partials = getattr(_live_config, 'STREAM_PARTIAL_TEXT', partial_texts)
-            if _live_partials is not partial_texts:
-                _snap_partial_text = _live_partials.get(stream_id, '')
+            _snap_reasoning = reasoning_texts.get(stream_id, '')
+            if not _snap_reasoning:
+                _live_reasoning = getattr(_live_config, 'STREAM_REASONING_TEXT', reasoning_texts)
+                if _live_reasoning is not reasoning_texts:
+                    _snap_reasoning = _live_reasoning.get(stream_id, '')
 
-        _snap_reasoning = reasoning_texts.get(stream_id, '')
-        if not _snap_reasoning:
-            _live_reasoning = getattr(_live_config, 'STREAM_REASONING_TEXT', reasoning_texts)
-            if _live_reasoning is not reasoning_texts:
-                _snap_reasoning = _live_reasoning.get(stream_id, '')
-
-        _snap_tool_calls = list(live_tool_calls.get(stream_id, []) or [])
-        if not _snap_tool_calls:
-            _live_tools = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', live_tool_calls)
-            if _live_tools is not live_tool_calls:
-                _snap_tool_calls = list(_live_tools.get(stream_id, []) or [])
+            _snap_tool_calls = list(live_tool_calls.get(stream_id, []) or [])
+            if not _snap_tool_calls:
+                _live_tools = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', live_tool_calls)
+                if _live_tools is not live_tool_calls:
+                    _snap_tool_calls = list(_live_tools.get(stream_id, []) or [])
 
     # Seal projected live tool rows so the durable scene cannot disagree with
     # the settled terminal state (#6309). Any tool call that was still running
@@ -6696,7 +6713,7 @@ def _snapshot_and_append_partial_on_error(session, stream_id) -> dict | None:
     return None
 
 
-def _last_resort_sync_from_core(session, stream_id, agent_lock):
+def _last_resort_sync_from_core(session, stream_id, agent_lock, generation=None):
     """Final-exit guard: if the stream exits with pending_user_message still set,
     sync messages from the core transcript or add an error marker.
     Called from the outer finally block of _run_agent_streaming.
@@ -6706,7 +6723,12 @@ def _last_resort_sync_from_core(session, stream_id, agent_lock):
     try:
         # Guard: if a cancel was already requested, bail out — cancel_stream() has
         # already saved partial content and we must not double-append error markers.
-        if stream_id in CANCEL_FLAGS and CANCEL_FLAGS[stream_id].is_set():
+        cancel_event = (
+            generation.state.cancel_event
+            if generation is not None
+            else CANCEL_FLAGS.get(stream_id)
+        )
+        if cancel_event is not None and cancel_event.is_set():
             return
 
         profile_home = _get_profile_home(session.profile)
@@ -7183,6 +7205,7 @@ def _run_agent_streaming(
     prompt_hash=None,
     moa_config=None,
     stream=None,
+    generation=None,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
 
@@ -7200,6 +7223,7 @@ def _run_agent_streaming(
     if not register_active_run(
         stream_id,
         expected_stream=q,
+        expected_generation=generation,
         session_id=session_id,
         started_at=time.time(),
         phase="starting",
@@ -7226,6 +7250,15 @@ def _run_agent_streaming(
                 expected_session_id=session_id,
                 cleanup_stream_state=True,
             )
+        return
+    generation = generation or ensure_stream_generation(
+        stream_id,
+        expected_stream=q,
+        session_id=session_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
+    )
+    if generation is None or not stream_generation_is_current(generation):
         return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
@@ -7268,12 +7301,7 @@ def _run_agent_streaming(
     # rewritten yet.  See https://github.com/nesquena/hermes-webui/issues/1968.
 
     # Sprint 10: create a cancel event for this stream
-    cancel_event = threading.Event()
-    with STREAMS_LOCK:
-        CANCEL_FLAGS[stream_id] = cancel_event
-        STREAM_PARTIAL_TEXT[stream_id] = ''  # start accumulating partial text (#893)
-        STREAM_REASONING_TEXT[stream_id] = ''  # start accumulating reasoning trace (#1361 §A)
-        STREAM_LIVE_TOOL_CALLS[stream_id] = []  # start accumulating tool calls (#1361 §B)
+    cancel_event = generation.state.cancel_event
 
     agent = None
     _live_prompt_estimate_tokens = [0]
@@ -7578,6 +7606,8 @@ def _run_agent_streaming(
     _success_writeback_committed = False
 
     def put(event, data):
+        if not stream_generation_is_current(generation):
+            return
         # If cancelled, drop all further events except the cancel event itself
         if cancel_event.is_set() and not _success_writeback_committed and event not in ('cancel', 'apperror'):
             return
@@ -7592,7 +7622,7 @@ def _run_agent_streaming(
                 # undelivered event.
                 event_id = (journaled or {}).get('event_id') if isinstance(journaled, dict) else None
                 if event_id:
-                    STREAM_LAST_EVENT_ID[stream_id] = event_id
+                    stream_generation_note_event_id(generation, event_id)
             except Exception:
                 logger.debug("Failed to append run journal event %s for stream %s", event, stream_id, exc_info=True)
         if event_id and hasattr(q, "note_last_event_id"):
@@ -7673,7 +7703,12 @@ def _run_agent_streaming(
         # Register this stream with the global streaming meter and start the 1 Hz
         # metering ticker. Kept INSIDE the outer try so the outer `finally`'s
         # end_session()/_metering_stop.set() teardown is always paired (#4633/#2476).
-        meter().begin_session(stream_id)
+        meter_started, _ = stream_generation_apply(
+            generation,
+            lambda: meter().begin_session(stream_id, owner=generation),
+        )
+        if not meter_started:
+            return
         _metering_thread.start()
         # Bind THIS turn's session identity to the worker thread/context BEFORE
         # any agent work (so every mid-turn notify_on_complete background spawn
@@ -7683,7 +7718,13 @@ def _run_agent_streaming(
         _turn_session_identity_tokens = _set_turn_session_identity(session_id)
         s = get_session(session_id)
         _turn_pending_source = getattr(s, 'pending_user_source', None) or 'webui'
-        update_active_run(stream_id, phase="running", session_id=session_id)
+        if not update_active_run(
+            stream_id,
+            expected_generation=generation,
+            phase="running",
+            session_id=session_id,
+        ):
+            return
         s.workspace = str(Path(workspace).expanduser().resolve())
         _last_persisted_model = None
         _last_persisted_provider = None
@@ -8044,7 +8085,7 @@ def _run_agent_streaming(
                 candidate = _compact_for_echo_compare(text)
                 if not candidate:
                     return False
-                visible_output = STREAM_PARTIAL_TEXT.get(stream_id, '')
+                visible_output = generation.state.partial_text
                 visible_tail = _compact_for_echo_compare(
                     visible_output[-max(len(str(text)) * 2, 512):]
                 )
@@ -8064,14 +8105,13 @@ def _run_agent_streaming(
             def _strip_reasoning_output_echo(text: str) -> bool:
                 nonlocal _reasoning_segments
                 removed = False
-                if stream_id in STREAM_REASONING_TEXT:
-                    next_text, did_remove = _strip_compact_echo_suffix(
-                        STREAM_REASONING_TEXT.get(stream_id, ''),
-                        text,
-                    )
-                    if did_remove:
-                        STREAM_REASONING_TEXT[stream_id] = next_text
-                        removed = True
+                next_text, did_remove = _strip_compact_echo_suffix(
+                    generation.state.reasoning_text,
+                    text,
+                )
+                if did_remove:
+                    stream_generation_set_reasoning(generation, next_text)
+                    removed = True
                 next_buffer, did_remove_buffer = _strip_compact_echo_suffix(_reasoning_buffer[0], text)
                 if did_remove_buffer:
                     _reasoning_buffer[0] = next_buffer
@@ -8103,34 +8143,20 @@ def _run_agent_streaming(
                 _token_sent = True
                 # Accumulate partial text so cancel_stream() can persist it (#893).
                 #
-                # STREAMS_LOCK contract for the three STREAM_* buffers (partial text,
-                # reasoning, live tool calls): the per-token hot path below mirrors
-                # into them WITHOUT holding STREAMS_LOCK, while snapshot readers hold
-                # STREAMS_LOCK (_snapshot_and_append_partial_on_error / cancel_stream).
-                # This is deliberate and safe for two reasons, NOT because `+=` is one
-                # bytecode (it is not — `d[k] += s` compiles to load/add/STORE_SUBSCR):
-                #  1. Single writer: only this streaming thread ever writes a given
-                #     stream_id's buffers, so there is no writer/writer race to tear.
-                #  2. Reader/writer atomicity under the GIL: `+=` builds a complete new
-                #     immutable str, then the final STORE_SUBSCR that binds it into the
-                #     dict is a single atomic bytecode; a concurrent reader's dict.get
-                #     therefore returns either the old or the new *complete* string
-                #     object (strings are immutable — never a half-built one). Same for
-                #     the atomic list.append / single-key dict writes on the other two.
-                # So a reader sees a complete-but-possibly-stale value, never a torn one.
-                # The snapshot is a best-effort partial that later journal/SSE events
-                # reconcile, so exact-latest is not required. Taking STREAMS_LOCK per
-                # token would add real contention against readers copying large buffers
-                # and would entangle the documented LOCK -> STREAMS_LOCK ordering — not
-                # worth it for a recoverable staleness window.
-                if stream_id in STREAM_PARTIAL_TEXT:
-                    STREAM_PARTIAL_TEXT[stream_id] += str(text)
+                # The immutable generation owns all partial state. Its helper
+                # revalidates owner + active identity at the point of mutation and
+                # only then refreshes the string-keyed compatibility projection.
+                stream_generation_append_partial(generation, str(text))
                 put('token', {'text': text})
                 # Update live throughput from stream delta callbacks, not from
                 # byte/character length. If a backend cannot provide live deltas,
                 # the frontend hides TPS rather than showing an estimate.
                 _metering_output_deltas[0] += 1
-                meter().record_token(stream_id, _metering_output_deltas[0])
+                meter().record_token(
+                    stream_id,
+                    _metering_output_deltas[0],
+                    owner=generation,
+                )
                 _emit_metering()
 
             def on_reasoning(text):
@@ -8155,9 +8181,7 @@ def _run_agent_streaming(
                 # Mirror full concatenation to shared dict so cancel_stream() can persist
                 # it (#1361 §A). Cancel only creates one partial message, so the flat
                 # concatenation is correct there.
-                # Lock-free GIL-atomic mirror — see the STREAMS_LOCK contract in on_token.
-                if stream_id in STREAM_REASONING_TEXT:
-                    STREAM_REASONING_TEXT[stream_id] += reasoning_delta
+                stream_generation_append_reasoning(generation, reasoning_delta)
                 # Accumulate into a coalescing buffer so every delta reaches the
                 # browser — reasoning deltas are incremental, not idempotent.
                 _reasoning_buffer[0] += reasoning_delta
@@ -8173,7 +8197,11 @@ def _run_agent_streaming(
                     _reasoning_buffer[0] = ''
                 # Track reasoning deltas in the meter so live TPS reflects all AI output.
                 _metering_reasoning_deltas[0] += 1
-                meter().record_reasoning(stream_id, _metering_reasoning_deltas[0])
+                meter().record_reasoning(
+                    stream_id,
+                    _metering_reasoning_deltas[0],
+                    owner=generation,
+                )
                 _emit_metering()
 
             def on_interim_assistant(text, **cb_kwargs):
@@ -8280,12 +8308,14 @@ def _run_agent_streaming(
                             _reasoning_segments.get(_current_reasoning_idx, '') + reason_delta
                         )
                         # Mirror full concatenation to shared dict (#1361 §A)
-                        # Lock-free GIL-atomic mirror — see STREAMS_LOCK contract in on_token.
-                        if stream_id in STREAM_REASONING_TEXT:
-                            STREAM_REASONING_TEXT[stream_id] += reason_delta
+                        stream_generation_append_reasoning(generation, reason_delta)
                         put('reasoning', {'text': reason_delta})
                         _metering_reasoning_deltas[0] += 1
-                        meter().record_reasoning(stream_id, _metering_reasoning_deltas[0])
+                        meter().record_reasoning(
+                            stream_id,
+                            _metering_reasoning_deltas[0],
+                            owner=generation,
+                        )
                         _emit_metering()
                     return
 
@@ -8313,13 +8343,11 @@ def _run_agent_streaming(
                         'args': args if isinstance(args, dict) else {},
                     })
                     # Mirror to shared dict so cancel_stream() can persist it (#1361 §B)
-                    # Lock-free GIL-atomic mirror — see STREAMS_LOCK contract in on_token.
-                    if stream_id in STREAM_LIVE_TOOL_CALLS:
-                        STREAM_LIVE_TOOL_CALLS[stream_id].append({
-                            'name': name,
-                            'args': args if isinstance(args, dict) else {},
-                            'done': False,
-                        })
+                    stream_generation_add_tool(generation, {
+                        'name': name,
+                        'args': args if isinstance(args, dict) else {},
+                        'done': False,
+                    })
                     put('tool', {
                         'event_type': event_type or 'tool.started',
                         'name': name,
@@ -8365,15 +8393,12 @@ def _run_agent_streaming(
                             live_tc['is_error'] = bool(cb_kwargs.get('is_error', False))
                             break
                     # Mirror done state to shared dict (#1361 §B)
-                    if stream_id in STREAM_LIVE_TOOL_CALLS:
-                        for shared_tc in reversed(STREAM_LIVE_TOOL_CALLS[stream_id]):
-                            if shared_tc.get('done'):
-                                continue
-                            if not name or shared_tc.get('name') == name:
-                                shared_tc['done'] = True
-                                shared_tc['duration'] = cb_kwargs.get('duration')
-                                shared_tc['is_error'] = bool(cb_kwargs.get('is_error', False))
-                                break
+                    stream_generation_complete_tool(
+                        generation,
+                        name=name,
+                        duration=cb_kwargs.get('duration'),
+                        is_error=bool(cb_kwargs.get('is_error', False)),
+                    )
                     # Signal the checkpoint thread that new work has completed (Issue #765).
                     # Each completed tool call is a meaningful unit of progress worth persisting.
                     _checkpoint_activity[0] += 1
@@ -8431,14 +8456,12 @@ def _run_agent_streaming(
                             'tid': tool_call_id,
                         })
                         # Mirror to shared dict so cancel_stream() can persist it (#1361 §B)
-                        # Lock-free GIL-atomic mirror — see STREAMS_LOCK contract in on_token.
-                        if stream_id in STREAM_LIVE_TOOL_CALLS:
-                            STREAM_LIVE_TOOL_CALLS[stream_id].append({
-                                'name': name,
-                                'args': args if isinstance(args, dict) else {},
-                                'done': False,
-                                'tid': tool_call_id,
-                            })
+                        stream_generation_add_tool(generation, {
+                            'name': name,
+                            'args': args if isinstance(args, dict) else {},
+                            'done': False,
+                            'tid': tool_call_id,
+                        })
                         put('tool', {
                             'event_type': 'tool.started',
                             'name': name,
@@ -8466,14 +8489,12 @@ def _run_agent_streaming(
                                 live_tc['done'] = True
                                 live_tc['snippet'] = result_snippet
                                 break
-                        if stream_id in STREAM_LIVE_TOOL_CALLS:
-                            for shared_tc in reversed(STREAM_LIVE_TOOL_CALLS[stream_id]):
-                                if shared_tc.get('done'):
-                                    continue
-                                if shared_tc.get('tid') == tool_call_id or (not shared_tc.get('tid') and shared_tc.get('name') == name):
-                                    shared_tc['done'] = True
-                                    shared_tc['snippet'] = result_snippet
-                                    break
+                        stream_generation_complete_tool(
+                            generation,
+                            name=name,
+                            tool_call_id=tool_call_id,
+                            snippet=result_snippet,
+                        )
                         _checkpoint_activity[0] += 1
                         put('tool_complete', {
                             'event_type': 'tool.completed',
@@ -8958,26 +8979,37 @@ def _run_agent_streaming(
                                     _active_sids.add(_sid)
                     except Exception:
                         _active_sids = set()
-                    with SESSION_AGENT_CACHE_LOCK:
-                        SESSION_AGENT_CACHE[session_id] = (agent, _agent_sig)
-                        SESSION_AGENT_CACHE.move_to_end(session_id)  # LRU: mark as recently used
-                        from api.config import SESSION_AGENT_CACHE_MAX
-                        # Evict the oldest INACTIVE entries first. Walk LRU order
-                        # (front = oldest); skip any session with a live run. If
-                        # every over-cap entry is active, leave the cache
-                        # temporarily above cap rather than close a live worker's
-                        # agent — a later insertion/finalization trims it once the
-                        # run ends.
-                        while len(SESSION_AGENT_CACHE) > SESSION_AGENT_CACHE_MAX:
-                            _evictable_sid = None
-                            for _sid in list(SESSION_AGENT_CACHE.keys()):
-                                if _sid not in _active_sids:
-                                    _evictable_sid = _sid
-                                    break
-                            if _evictable_sid is None:
-                                break  # all over-cap entries are active; defer
-                            evicted_entry = SESSION_AGENT_CACHE.pop(_evictable_sid)
-                            _evicted_items.append((_evictable_sid, evicted_entry))
+                    def _cache_created_agent():
+                        with SESSION_AGENT_CACHE_LOCK:
+                            SESSION_AGENT_CACHE[session_id] = (agent, _agent_sig)
+                            SESSION_AGENT_CACHE.move_to_end(session_id)
+                            from api.config import SESSION_AGENT_CACHE_MAX
+                            # Evict the oldest INACTIVE entries first. Walk LRU order
+                            # (front = oldest); skip any session with a live run. If
+                            # every over-cap entry is active, leave the cache
+                            # temporarily above cap rather than close a live worker's
+                            # agent — a later insertion/finalization trims it once the
+                            # run ends.
+                            while len(SESSION_AGENT_CACHE) > SESSION_AGENT_CACHE_MAX:
+                                _evictable_sid = None
+                                for _sid in list(SESSION_AGENT_CACHE.keys()):
+                                    if _sid not in _active_sids:
+                                        _evictable_sid = _sid
+                                        break
+                                if _evictable_sid is None:
+                                    break  # all over-cap entries are active; defer
+                                evicted_entry = SESSION_AGENT_CACHE.pop(
+                                    _evictable_sid
+                                )
+                                _evicted_items.append(
+                                    (_evictable_sid, evicted_entry)
+                                )
+
+                    cache_owned, _ = stream_generation_apply(
+                        generation, _cache_created_agent
+                    )
+                    if not cache_owned:
+                        return
                     # Commit and close evicted agents outside the cache lock so
                     # concurrent cache users are not blocked by provider I/O.
                     for _evicted_sid, _evicted_entry in _evicted_items:
@@ -8990,19 +9022,19 @@ def _run_agent_streaming(
                     logger.debug('[webui] Created new agent for session %s', session_id)
 
             # Store agent instance for cancel/interrupt propagation
-            with STREAMS_LOCK:
-                AGENT_INSTANCES[stream_id] = agent
-                # Check if cancel was requested during agent initialization
-                if stream_id in CANCEL_FLAGS and CANCEL_FLAGS[stream_id].is_set():
-                    # Cancel arrived during agent creation - interrupt immediately
-                    try:
-                        agent.interrupt("Cancelled before start")
-                    except Exception:
-                        logger.debug("Failed to interrupt agent before start")
-                    with _agent_lock:
-                        _finalize_owned_cancel(message='Task cancelled before start.')
-                    put('cancel', _cancel_event_payload('Cancelled by user'))
-                    return
+            if not stream_generation_set_agent(generation, agent):
+                return
+            # Check if cancel was requested during agent initialization
+            if cancel_event.is_set():
+                # Cancel arrived during agent creation - interrupt immediately
+                try:
+                    agent.interrupt("Cancelled before start")
+                except Exception:
+                    logger.debug("Failed to interrupt agent before start")
+                with _agent_lock:
+                    _finalize_owned_cancel(message='Task cancelled before start.')
+                put('cancel', _cancel_event_payload('Cancelled by user'))
+                return
 
             # Prepend workspace context so the agent always knows which directory
             # to use for file operations, regardless of session age or AGENTS.md defaults.
@@ -9051,7 +9083,9 @@ def _run_agent_streaming(
                 config_data=_cfg,
             )
             _pending_started_at = getattr(s, 'pending_started_at', None)
-            meter().set_pending_started_at(stream_id, _pending_started_at)
+            meter().set_pending_started_at(
+                stream_id, _pending_started_at, owner=generation
+            )
             # Normal chat-start sets pending_started_at before spawning this thread;
             # fallback to now only for recovered/legacy flows where that marker is absent
             # or has been zeroed out (e.g. via a buggy migration / manual file edit).
@@ -9608,8 +9642,8 @@ def _run_agent_streaming(
                             if 'credential_pool' in _agent_params:
                                 _agent_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
                             agent = _AIAgent(**_agent_kwargs)
-                            with STREAMS_LOCK:
-                                AGENT_INSTANCES[stream_id] = agent
+                            if not stream_generation_set_agent(generation, agent):
+                                return
                             from api.config import SESSION_AGENT_CACHE as _SAC, SESSION_AGENT_CACHE_LOCK as _SAC_L
                             with _SAC_L:
                                 _SAC[session_id] = (agent, _agent_sig)
@@ -9760,7 +9794,9 @@ def _run_agent_streaming(
                         s.pending_started_at = None
                         s.pending_user_source = None
                         try:
-                            _snapshot_and_append_partial_on_error(s, stream_id)
+                            _snapshot_and_append_partial_on_error(
+                                s, stream_id, generation
+                            )
                         except Exception:
                             logger.debug("Failed to snapshot partials on error for %s", stream_id, exc_info=True)
                         _error_content = (
@@ -10853,8 +10889,8 @@ def _run_agent_streaming(
                     if 'credential_pool' in _agent_params:
                         _heal_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
                     _heal_agent = _AIAgent(**_heal_kwargs)
-                    with STREAMS_LOCK:
-                        AGENT_INSTANCES[stream_id] = _heal_agent
+                    if not stream_generation_set_agent(generation, _heal_agent):
+                        return
                     from api.config import SESSION_AGENT_CACHE as _SAC2, SESSION_AGENT_CACHE_LOCK as _SAC2_L
                     with _SAC2_L:
                         _SAC2[session_id] = (_heal_agent, _agent_sig)
@@ -11020,7 +11056,9 @@ def _run_agent_streaming(
                 s.pending_started_at = None
                 s.pending_user_source = None
                 try:
-                    _snapshot_and_append_partial_on_error(s, stream_id)
+                    _snapshot_and_append_partial_on_error(
+                        s, stream_id, generation
+                    )
                 except Exception:
                     logger.debug("Failed to snapshot partials on error for %s", stream_id, exc_info=True)
                 _error_message = {
@@ -11081,7 +11119,7 @@ def _run_agent_streaming(
             # count (e.g. persisting final output tokens to a billing ledger),
             # this teardown caller will need to supply the real total; the outer
             # finally doesn't have easy access to it today.
-            meter().end_session(stream_id, 0)
+            meter().end_session(stream_id, 0, owner=generation)
         except Exception:
             logger.debug("Failed to end metering session for stream %s", stream_id, exc_info=True)
         _metering_stop.set()
@@ -11098,8 +11136,14 @@ def _run_agent_streaming(
                     s, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,
                     submitted_prompt_text=msg_text,
                 )):
-            update_active_run(stream_id, phase="finalizing")
-            _last_resort_sync_from_core(s, stream_id, _agent_lock)
+            update_active_run(
+                stream_id,
+                expected_generation=generation,
+                phase="finalizing",
+            )
+            _last_resort_sync_from_core(
+                s, stream_id, _agent_lock, generation
+            )
         _clear_thread_env()  # TD1: always clear thread-local context
         if _streaming_cron_profile_home_token is not None:
             _STREAMING_CRON_PROFILE_HOME.reset(_streaming_cron_profile_home_token)
@@ -11287,7 +11331,7 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                        "stream_id": active_stream_id})
 
 
-def cancel_stream(stream_id: str) -> bool:
+def cancel_stream(stream_id: str, *, expected_generation=None) -> bool:
     """Signal an in-flight stream to cancel. Returns True if work was found.
 
     Eagerly releases the session lock (pops STREAMS/CANCEL_FLAGS/AGENT_INSTANCES
@@ -11334,41 +11378,57 @@ def cancel_stream(stream_id: str) -> bool:
     _snap_agent = None
     _cancel_session_payload = None
 
-    with streams_lock:
-        stream_present = stream_id in streams
-        # Snapshot everything the worker's finally could pop, WHILE the lock is
-        # held and before any interrupt lets that finally run — for BOTH the
-        # STREAMS-present and the ACTIVE_RUNS-only (detached) paths. The buffers
-        # are keyed by stream_id independent of STREAMS membership, so a detached
-        # cancel must snapshot them too or it loses the already-streamed text.
-        _snap_flag = cancel_flags.get(stream_id)
-        _snap_agent = agent_instances.get(stream_id)
-        _snap_partial_text = partial_texts.get(stream_id, '')
-        if not _snap_partial_text:
-            _live_partials = getattr(_live_config, 'STREAM_PARTIAL_TEXT', partial_texts)
-            if _live_partials is not partial_texts:
-                _snap_partial_text = _live_partials.get(stream_id, '')
-        _snap_reasoning = STREAM_REASONING_TEXT.get(stream_id, '')
-        if not _snap_reasoning:
-            _live_reasoning = getattr(_live_config, 'STREAM_REASONING_TEXT', STREAM_REASONING_TEXT)
-            if _live_reasoning is not STREAM_REASONING_TEXT:
-                _snap_reasoning = _live_reasoning.get(stream_id, '')
-        _snap_tool_calls = list(STREAM_LIVE_TOOL_CALLS.get(stream_id, []) or [])
-        if not _snap_tool_calls:
-            _live_tools = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', STREAM_LIVE_TOOL_CALLS)
-            if _live_tools is not STREAM_LIVE_TOOL_CALLS:
-                _snap_tool_calls = list(_live_tools.get(stream_id, []) or [])
-        if stream_present:
-            q = streams.get(stream_id)
-        else:
-            try:
-                with _live_config.ACTIVE_RUNS_LOCK:
-                    active_run_entry = dict((_live_config.ACTIVE_RUNS or {}).get(stream_id) or {})
-            except Exception:
-                active_run_entry = None
-            if not active_run_entry:
-                return False
-            active_run_session_id = str(active_run_entry.get("session_id") or "").strip() or None
+    if expected_generation is not None:
+        generation_cancel = detach_stream_generation_for_cancel(
+            expected_generation
+        )
+        if generation_cancel is None:
+            return False
+        stream_present = generation_cancel.stream_present
+        q = expected_generation.stream if stream_present else None
+        active_run_entry = generation_cancel.active_run
+        active_run_session_id = (
+            str(active_run_entry.get("session_id") or "").strip() or None
+        )
+        _snap_flag = expected_generation.state.cancel_event
+        _snap_agent = generation_cancel.agent
+        _snap_partial_text = generation_cancel.partial_text
+        _snap_reasoning = generation_cancel.reasoning_text
+        _snap_tool_calls = generation_cancel.live_tool_calls
+    else:
+        with streams_lock:
+            stream_present = stream_id in streams
+            # Snapshot everything the worker's finally could pop, WHILE the lock
+            # is held and before any interrupt lets that finally run — for BOTH
+            # the STREAMS-present and ACTIVE_RUNS-only (detached) paths.
+            _snap_flag = cancel_flags.get(stream_id)
+            _snap_agent = agent_instances.get(stream_id)
+            _snap_partial_text = partial_texts.get(stream_id, '')
+            if not _snap_partial_text:
+                _live_partials = getattr(_live_config, 'STREAM_PARTIAL_TEXT', partial_texts)
+                if _live_partials is not partial_texts:
+                    _snap_partial_text = _live_partials.get(stream_id, '')
+            _snap_reasoning = STREAM_REASONING_TEXT.get(stream_id, '')
+            if not _snap_reasoning:
+                _live_reasoning = getattr(_live_config, 'STREAM_REASONING_TEXT', STREAM_REASONING_TEXT)
+                if _live_reasoning is not STREAM_REASONING_TEXT:
+                    _snap_reasoning = _live_reasoning.get(stream_id, '')
+            _snap_tool_calls = list(STREAM_LIVE_TOOL_CALLS.get(stream_id, []) or [])
+            if not _snap_tool_calls:
+                _live_tools = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', STREAM_LIVE_TOOL_CALLS)
+                if _live_tools is not STREAM_LIVE_TOOL_CALLS:
+                    _snap_tool_calls = list(_live_tools.get(stream_id, []) or [])
+            if stream_present:
+                q = streams.get(stream_id)
+            else:
+                try:
+                    with _live_config.ACTIVE_RUNS_LOCK:
+                        active_run_entry = dict((_live_config.ACTIVE_RUNS or {}).get(stream_id) or {})
+                except Exception:
+                    active_run_entry = None
+                if not active_run_entry:
+                    return False
+                active_run_session_id = str(active_run_entry.get("session_id") or "").strip() or None
 
     if active_run_entry is None:
         try:
@@ -11382,7 +11442,8 @@ def cancel_stream(stream_id: str) -> bool:
     # Mark the worker lifecycle registry immediately. The SSE maps may be popped
     # below while the worker is still unwinding; ACTIVE_RUNS is what recovery /
     # health polling sees during that detached window.
-    update_active_run(stream_id, phase="cancelling")
+    if expected_generation is None:
+        update_active_run(stream_id, phase="cancelling")
 
     # Set WebUI layer cancel flag. Prefer the snapshot captured under the lock;
     # fall back to a fresh lookup for the ACTIVE_RUNS-only path (stream absent).
@@ -11393,8 +11454,10 @@ def cancel_stream(stream_id: str) -> bool:
     # Interrupt the AIAgent instance to stop tool execution. Use the
     # lock-snapshot agent when the stream was present; otherwise fall back to
     # the session agent cache via the active-run session id.
-    agent = _snap_agent if _snap_agent is not None else agent_instances.get(stream_id)
-    if agent is None and active_run_session_id:
+    agent = _snap_agent
+    if agent is None and expected_generation is None:
+        agent = agent_instances.get(stream_id)
+    if agent is None and active_run_session_id and expected_generation is None:
         try:
             with _live_config.SESSION_AGENT_CACHE_LOCK:
                 cached = _live_config.SESSION_AGENT_CACHE.get(active_run_session_id)
@@ -11441,7 +11504,7 @@ def cancel_stream(stream_id: str) -> bool:
     # even if the agent thread is still blocked in a C-level syscall.
     # The worker thread's finally block uses .pop(key, None) too, so a
     # double-pop here is safe (no-op).
-    if stream_present:
+    if stream_present and expected_generation is None:
         streams.pop(stream_id, None)
         cancel_flags.pop(stream_id, None)
         agent_instances.pop(stream_id, None)
@@ -11463,18 +11526,18 @@ def cancel_stream(stream_id: str) -> bool:
     # ACTIVE_RUNS-only path (stream absent) the snapshots are None → fall back to
     # a best-effort live read.
     _cancel_partial_text = _snap_partial_text if _snap_partial_text is not None else partial_texts.get(stream_id, '')
-    if not _cancel_partial_text:
+    if not _cancel_partial_text and expected_generation is None:
         live_partials = getattr(_live_config, 'STREAM_PARTIAL_TEXT', partial_texts)
         if live_partials is not partial_texts:
             _cancel_partial_text = live_partials.get(stream_id, '')
     # Capture reasoning trace and live tool calls (#1361 §A + §B)
     _cancel_reasoning = _snap_reasoning if _snap_reasoning is not None else STREAM_REASONING_TEXT.get(stream_id, '')
-    if not _cancel_reasoning:
+    if not _cancel_reasoning and expected_generation is None:
         live_reasoning = getattr(_live_config, 'STREAM_REASONING_TEXT', STREAM_REASONING_TEXT)
         if live_reasoning is not STREAM_REASONING_TEXT:
             _cancel_reasoning = live_reasoning.get(stream_id, '')
     _cancel_tool_calls = _snap_tool_calls if _snap_tool_calls is not None else STREAM_LIVE_TOOL_CALLS.get(stream_id, [])
-    if not _cancel_tool_calls:
+    if not _cancel_tool_calls and expected_generation is None:
         live_tools = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', STREAM_LIVE_TOOL_CALLS)
         if live_tools is not STREAM_LIVE_TOOL_CALLS:
             _cancel_tool_calls = live_tools.get(stream_id, [])
@@ -11645,7 +11708,11 @@ def cancel_stream(stream_id: str) -> bool:
                 logger.debug("Failed to clear session state on cancel for %s", _cancel_session_id)
 
     if _emit_cancel_event and q:
-        _cancel_event_id = STREAM_LAST_EVENT_ID.get(stream_id)
+        _cancel_event_id = (
+            expected_generation.state.last_event_id
+            if expected_generation is not None
+            else STREAM_LAST_EVENT_ID.get(stream_id)
+        )
         if _cancel_event_id and hasattr(q, "note_last_event_id"):
             try:
                 q.note_last_event_id(_cancel_event_id)

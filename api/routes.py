@@ -2804,6 +2804,9 @@ from api.config import (
     MAX_UPLOAD_BYTES,
     ACTIVE_RUNS,
     ACTIVE_RUNS_LOCK,
+    acquire_stream_access,
+    ensure_stream_generation,
+    get_stream_generation,
     register_stream_channel,
     stream_owner_session_id,
     unregister_active_run,
@@ -2827,7 +2830,6 @@ from api.config import (
     get_config,
     get_webui_session_save_mode,
     get_config_snapshot,
-    STREAM_GOAL_RELATED,
     PENDING_GOAL_CONTINUATION,
     _get_config_path,
     _load_yaml_config_file,
@@ -13401,9 +13403,19 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/chat/stream/status":
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
-        if not _stream_id_visible_to_request_profile(handler, stream_id):
-            return True
-        active = stream_id in STREAMS
+        access_status, access = acquire_stream_access(
+            stream_id,
+            active_profile=_get_active_profile_name(),
+            profiles_match=_profiles_match,
+        )
+        if access_status == "forbidden":
+            return bad(handler, "Session not found", 404)
+        if access_status == "legacy":
+            if not _stream_id_visible_to_request_profile(handler, stream_id):
+                return True
+            active = stream_id in STREAMS
+        else:
+            active = bool(access and access.active)
         payload = {"active": active, "stream_id": stream_id, "replay_available": False}
         try:
             journal = find_run_summary(stream_id) if stream_id else None
@@ -13418,8 +13430,25 @@ def handle_get(handler, parsed) -> bool:
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
         if not stream_id:
             return bad(handler, "stream_id required")
-        if not _stream_id_visible_to_request_profile(handler, stream_id):
-            return True
+        access_status, access = acquire_stream_access(
+            stream_id,
+            active_profile=_get_active_profile_name(),
+            profiles_match=_profiles_match,
+        )
+        if access_status == "forbidden":
+            return bad(handler, "Session not found", 404)
+        if access_status not in {"ok", "legacy"}:
+            return j(
+                handler,
+                {"ok": True, "cancelled": False, "stream_id": stream_id},
+            )
+        if access_status == "legacy":
+            if not _stream_id_visible_to_request_profile(handler, stream_id):
+                return True
+            expected_generation = None
+        else:
+            expected_generation = access.generation if access else None
+
         gateway_stop_blocked = False
         try:
             from api.gateway_chat import (
@@ -13428,12 +13457,22 @@ def handle_get(handler, parsed) -> bool:
                 wait_for_gateway_run_id,
             )
 
-            structured_gateway, run_id = wait_for_gateway_run_id(stream_id, GATEWAY_RUN_ID_WAIT_TIMEOUT)
+            structured_gateway, run_id = wait_for_gateway_run_id(
+                stream_id,
+                GATEWAY_RUN_ID_WAIT_TIMEOUT,
+                expected_stream=(
+                    expected_generation.stream if expected_generation is not None else None
+                ),
+            )
             if not run_id and structured_gateway:
                 gateway_stop_blocked = True
             if run_id:
                 if stop_gateway_run(run_id):
-                    owner_sid = stream_owner_session_id(stream_id)
+                    owner_sid = (
+                        expected_generation.session_id
+                        if expected_generation is not None
+                        else stream_owner_session_id(stream_id)
+                    )
                     if owner_sid:
                         retire_gateway_pending_mirror(owner_sid, run_id=run_id)
                 else:
@@ -13456,10 +13495,20 @@ def handle_get(handler, parsed) -> bool:
         from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
 
         if runtime_adapter_enabled():
-            adapter = LegacyJournalRuntimeAdapter(cancel_delegate=cancel_stream)
+            cancel_delegate = cancel_stream
+            if expected_generation is not None:
+                cancel_delegate = lambda sid: cancel_stream(
+                    sid, expected_generation=expected_generation
+                )
+            adapter = LegacyJournalRuntimeAdapter(cancel_delegate=cancel_delegate)
             cancelled = adapter.cancel_run(stream_id).accepted
         else:
-            cancelled = cancel_stream(stream_id)
+            if expected_generation is None:
+                cancelled = cancel_stream(stream_id)
+            else:
+                cancelled = cancel_stream(
+                    stream_id, expected_generation=expected_generation
+                )
         return j(handler, {"ok": True, "cancelled": cancelled, "stream_id": stream_id})
 
     if parsed.path == "/api/chat/stream":
@@ -17530,9 +17579,35 @@ def _stream_runner_run_events(handler, run_id: str, cursor: str | None = None) -
 def _handle_sse_stream(handler, parsed):
     qs = parse_qs(parsed.query)
     stream_id = qs.get("stream_id", [""])[0]
-    if not _stream_id_visible_to_request_profile(handler, stream_id):
-        return True
-    stream = STREAMS.get(stream_id)
+    access_status, access = acquire_stream_access(
+        stream_id,
+        active_profile=_get_active_profile_name(),
+        profiles_match=_profiles_match,
+        subscribe=True,
+    )
+    if access_status == "forbidden":
+        return bad(handler, "Session not found", 404)
+    if access_status not in {"ok", "legacy"}:
+        return j(handler, {"error": "stream not found"}, status=404)
+    if access_status == "legacy":
+        if not _stream_id_visible_to_request_profile(handler, stream_id):
+            return True
+        stream = STREAMS.get(stream_id)
+        if stream is not None:
+            if hasattr(stream, "subscribe_with_snapshot"):
+                subscriber, stream_snapshot = stream.subscribe_with_snapshot()
+            else:
+                subscriber = stream.subscribe() if hasattr(stream, "subscribe") else stream
+                stream_snapshot = {}
+        else:
+            subscriber = None
+            stream_snapshot = {}
+        generation = None
+    else:
+        stream = access.generation.stream if access else None
+        subscriber = access.subscriber if access else None
+        stream_snapshot = access.stream_snapshot if access else {}
+        generation = access.generation if access else None
     if stream is None:
         if _stream_runner_run_events(handler, stream_id, _runner_stream_cursor_from_query(qs)):
             return True
@@ -17553,11 +17628,6 @@ def _handle_sse_stream(handler, parsed):
         except _CLIENT_DISCONNECT_ERRORS:
             pass
         return True
-    if hasattr(stream, "subscribe_with_snapshot"):
-        subscriber, stream_snapshot = stream.subscribe_with_snapshot()
-    else:
-        subscriber = stream.subscribe() if hasattr(stream, "subscribe") else stream
-        stream_snapshot = {}
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
     handler.send_header("Cache-Control", "no-cache")
@@ -17583,12 +17653,20 @@ def _handle_sse_stream(handler, parsed):
                 event, data, queued_event_id = item[0], item[1], item[2]
             else:
                 event, data = item
-                queued_event_id = STREAM_LAST_EVENT_ID.get(stream_id)
+                queued_event_id = (
+                    generation.state.last_event_id
+                    if generation is not None
+                    else STREAM_LAST_EVENT_ID.get(stream_id)
+                )
             # Stage-364: emit `id:` from STREAM_LAST_EVENT_ID side-channel so
             # the frontend's `_lastRunJournalSeq` cursor advances during live
             # streaming. Without this, mid-stream error→replay would arrive
             # with after_seq=0 and double-render every journaled event.
-            event_id = queued_event_id or STREAM_LAST_EVENT_ID.get(stream_id)
+            event_id = queued_event_id or (
+                generation.state.last_event_id
+                if generation is not None
+                else STREAM_LAST_EVENT_ID.get(stream_id)
+            )
             event_seq = _run_journal_same_run_seq(event_id, stream_id)
             if replay_cutoff_seq is not None and event_seq is not None and event_seq <= replay_cutoff_seq:
                 continue
@@ -17651,15 +17729,58 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
 
     def attach_active_stream():
         stream_id = _active_run_stream_for_session(session_id)
-        stream = STREAMS.get(stream_id) if stream_id else None
-        if stream is None:
+        if not stream_id:
             return None, None, None, stream_id
-        if hasattr(stream, "subscribe_with_snapshot"):
-            queue_, snapshot = stream.subscribe_with_snapshot()
-        else:
-            queue_ = stream.subscribe() if hasattr(stream, "subscribe") else stream
-            snapshot = {}
-        return queue_, stream, snapshot, stream_id
+        access_status, access = acquire_stream_access(
+            stream_id,
+            active_profile=_get_active_profile_name(),
+            profiles_match=_profiles_match,
+            subscribe=True,
+            expected_session_id=session_id,
+        )
+        if access_status == "legacy":
+            with STREAMS_LOCK:
+                legacy_stream = STREAMS.get(stream_id)
+            with ACTIVE_RUNS_LOCK:
+                legacy_active = dict(ACTIVE_RUNS.get(stream_id) or {})
+            ensure_stream_generation(
+                stream_id,
+                expected_stream=legacy_stream,
+                session_id=session_id,
+                turn_id=legacy_active.get("turn_id"),
+                prompt_hash=legacy_active.get("prompt_hash"),
+                profile=getattr(session, "profile", None),
+            )
+            access_status, access = acquire_stream_access(
+                stream_id,
+                active_profile=_get_active_profile_name(),
+                profiles_match=_profiles_match,
+                subscribe=True,
+                expected_session_id=session_id,
+            )
+            if (
+                access_status != "ok"
+                and legacy_stream is not None
+                and STREAMS is not api_config.STREAMS
+            ):
+                if hasattr(legacy_stream, "subscribe_with_snapshot"):
+                    queue_, snapshot = legacy_stream.subscribe_with_snapshot()
+                else:
+                    queue_ = (
+                        legacy_stream.subscribe()
+                        if hasattr(legacy_stream, "subscribe")
+                        else legacy_stream
+                    )
+                    snapshot = {}
+                return queue_, legacy_stream, snapshot, stream_id
+        if access_status != "ok" or access is None:
+            return None, None, None, stream_id
+        return (
+            access.subscriber,
+            access.generation.stream,
+            access.stream_snapshot,
+            stream_id,
+        )
 
     def emit_replay(events, stream_id, cutoff_seq):
         for entry in events:
@@ -20834,6 +20955,14 @@ def _handle_btw(handler, body):
         phase="queued",
         ephemeral=True,
         backend="legacy",
+        profile=getattr(ephemeral, "profile", None),
+    )
+    generation = get_stream_generation(
+        stream_id,
+        expected_stream=stream,
+        session_id=ephemeral.session_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
     )
     from api.background import track_btw
     track_btw(body["session_id"], ephemeral.session_id, stream_id, question)
@@ -20844,6 +20973,7 @@ def _handle_btw(handler, body):
             "ephemeral": True,
             "model_provider": model_provider,
             "stream": stream,
+            "generation": generation,
             "turn_id": turn_id,
             "prompt_hash": prompt_hash,
         },
@@ -20909,6 +21039,14 @@ def _handle_background(handler, body):
         started_at=bg.pending_started_at,
         phase="queued",
         backend="legacy",
+        profile=getattr(bg, "profile", None),
+    )
+    generation = get_stream_generation(
+        stream_id,
+        expected_stream=stream,
+        session_id=bg.session_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
     )
     task_id = uuid.uuid4().hex[:8]
     from api.background import track_background, complete_background
@@ -20932,6 +21070,7 @@ def _handle_background(handler, body):
                 None,
                 model_provider=model_provider,
                 stream=stream,
+                generation=generation,
                 turn_id=turn_id,
                 prompt_hash=prompt_hash,
             )
@@ -21372,10 +21511,16 @@ def _start_chat_stream_for_session(
         phase="queued",
         turn_id=turn_id,
         prompt_hash=prompt_hash,
+        profile=getattr(s, "profile", None),
+        goal_related=goal_related,
     )
-    # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
-    if goal_related:
-        STREAM_GOAL_RELATED[stream_id] = True
+    generation = get_stream_generation(
+        stream_id,
+        expected_stream=stream,
+        session_id=s.session_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
+    )
     diag.stage("worker_thread_start") if diag else None
     worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
     worker_kwargs = {
@@ -21384,6 +21529,7 @@ def _start_chat_stream_for_session(
         "turn_id": turn_id,
         "prompt_hash": prompt_hash,
         "stream": stream,
+        "generation": generation,
     }
     if moa_config and not backend_is_gateway:
         worker_kwargs["moa_config"] = moa_config
