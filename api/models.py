@@ -1196,9 +1196,11 @@ class Session:
                  cache_read_tokens: int=0, cache_write_tokens: int=0,
                  personality=None,
                  active_stream_id: str=None,
+                 active_checkpoint=None,
                  pending_user_message: str=None,
                  pending_attachments=None,
                  pending_started_at=None,
+                 pending_turn_id: str=None,
                  pending_user_source: str=None,
                  context_messages=None,
                  compression_anchor_visible_idx=None,
@@ -1265,9 +1267,11 @@ class Session:
         self.cache_write_tokens = cache_write_tokens or 0
         self.personality = personality
         self.active_stream_id = active_stream_id
+        self.active_checkpoint = active_checkpoint if isinstance(active_checkpoint, dict) else None
         self.pending_user_message = pending_user_message
         self.pending_attachments = pending_attachments or []
         self.pending_started_at = pending_started_at
+        self.pending_turn_id = pending_turn_id
         self.pending_user_source = pending_user_source
         self.context_messages = context_messages if isinstance(context_messages, list) else []
         self.compression_anchor_visible_idx = compression_anchor_visible_idx
@@ -1373,8 +1377,8 @@ class Session:
             'pinned', 'archived', 'project_id', 'profile',
             'input_tokens', 'output_tokens', 'estimated_cost',
             'cache_read_tokens', 'cache_write_tokens',
-            'personality', 'active_stream_id',
-            'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_user_source',
+            'personality', 'active_stream_id', 'active_checkpoint',
+            'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_turn_id', 'pending_user_source',
             'compression_anchor_visible_idx', 'compression_anchor_message_key',
             'compression_anchor_summary', 'pre_compression_snapshot',
             'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
@@ -3163,9 +3167,11 @@ def _apply_core_sync_or_error_marker(
                 dedupe_existing=True,
             )
             session.active_stream_id = None
+            session.active_checkpoint = None
             session.pending_user_message = None
             session.pending_attachments = []
             session.pending_started_at = None
+            session.pending_turn_id = None
             session.pending_user_source = None
             session.save(touch_updated_at=touch_updated_at)
             logger.info(
@@ -3194,9 +3200,11 @@ def _apply_core_sync_or_error_marker(
             _stream_id,
         )
         session.active_stream_id = None
+        session.active_checkpoint = None
         session.pending_user_message = None
         session.pending_attachments = []
         session.pending_started_at = None
+        session.pending_turn_id = None
         session.pending_user_source = None
         session.messages.append(
             _build_recovery_marker_with_retry_hook(
@@ -3253,9 +3261,11 @@ def _apply_core_sync_or_error_marker(
             )
             _pending_started_at = session.pending_started_at
             session.active_stream_id = None
+            session.active_checkpoint = None
             session.pending_user_message = None
             session.pending_attachments = []
             session.pending_started_at = None
+            session.pending_turn_id = None
             session.pending_user_source = None
             if recovered_output:
                 session.messages.append(
@@ -3301,9 +3311,11 @@ def _apply_core_sync_or_error_marker(
     _stream_id = stream_id_for_recheck or session.active_stream_id
     _pending_started_at = session.pending_started_at
     session.active_stream_id = None
+    session.active_checkpoint = None
     session.pending_user_message = None
     session.pending_attachments = []
     session.pending_started_at = None
+    session.pending_turn_id = None
     session.pending_user_source = None
     session.messages.append(
         _build_recovery_marker_with_retry_hook(
@@ -3658,9 +3670,11 @@ def _sync_sidecar_from_state_db_if_newer(session) -> bool:
         locked.messages = merged_messages
         locked.context_messages = merged_context
         locked.active_stream_id = None
+        locked.active_checkpoint = None
         locked.pending_user_message = None
         locked.pending_attachments = []
         locked.pending_started_at = None
+        locked.pending_turn_id = None
         locked.pending_user_source = None
         try:
             locked.save(touch_updated_at=True)
@@ -3676,9 +3690,11 @@ def _sync_sidecar_from_state_db_if_newer(session) -> bool:
         session.messages = merged_messages
         session.context_messages = merged_context
         session.active_stream_id = None
+        session.active_checkpoint = None
         session.pending_user_message = None
         session.pending_attachments = []
         session.pending_started_at = None
+        session.pending_turn_id = None
         session.pending_user_source = None
         logger.info(
             "Session %s: synced sidecar from newer state.db transcript (%d -> %d messages)",

@@ -2804,6 +2804,7 @@ from api.config import (
     MAX_UPLOAD_BYTES,
     ACTIVE_RUNS,
     ACTIVE_RUNS_LOCK,
+    register_active_run,
     register_stream_owner,
     stream_owner_session_id,
     unregister_stream_owner,
@@ -2961,12 +2962,15 @@ def _clear_stale_stream_state(session) -> bool:
             # would attempt one ghost SSE reconnect before recovering).
             try:
                 original_stub.active_stream_id = None
+                original_stub.active_checkpoint = None
                 if hasattr(original_stub, "pending_user_message"):
                     original_stub.pending_user_message = None
                 if hasattr(original_stub, "pending_attachments"):
                     original_stub.pending_attachments = []
                 if hasattr(original_stub, "pending_started_at"):
                     original_stub.pending_started_at = None
+                if hasattr(original_stub, "pending_turn_id"):
+                    original_stub.pending_turn_id = None
                 if hasattr(original_stub, "pending_user_source"):
                     original_stub.pending_user_source = None
             except Exception:
@@ -3002,12 +3006,15 @@ def _clear_stale_stream_state(session) -> bool:
                 if original_stub is not session:
                     try:
                         original_stub.active_stream_id = None
+                        original_stub.active_checkpoint = None
                         if hasattr(original_stub, "pending_user_message"):
                             original_stub.pending_user_message = None
                         if hasattr(original_stub, "pending_attachments"):
                             original_stub.pending_attachments = []
                         if hasattr(original_stub, "pending_started_at"):
                             original_stub.pending_started_at = None
+                        if hasattr(original_stub, "pending_turn_id"):
+                            original_stub.pending_turn_id = None
                         if hasattr(original_stub, "pending_user_source"):
                             original_stub.pending_user_source = None
                     except Exception:
@@ -3017,12 +3024,15 @@ def _clear_stale_stream_state(session) -> bool:
                 return False
         _materialize_pending_user_turn_before_error(session)
         session.active_stream_id = None
+        session.active_checkpoint = None
         if hasattr(session, "pending_user_message"):
             session.pending_user_message = None
         if hasattr(session, "pending_attachments"):
             session.pending_attachments = []
         if hasattr(session, "pending_started_at"):
             session.pending_started_at = None
+        if hasattr(session, "pending_turn_id"):
+            session.pending_turn_id = None
         if hasattr(session, "pending_user_source"):
             session.pending_user_source = None
         try:
@@ -3040,12 +3050,15 @@ def _clear_stale_stream_state(session) -> bool:
     if original_stub is not session:
         try:
             original_stub.active_stream_id = None
+            original_stub.active_checkpoint = None
             if hasattr(original_stub, "pending_user_message"):
                 original_stub.pending_user_message = None
             if hasattr(original_stub, "pending_attachments"):
                 original_stub.pending_attachments = []
             if hasattr(original_stub, "pending_started_at"):
                 original_stub.pending_started_at = None
+            if hasattr(original_stub, "pending_turn_id"):
+                original_stub.pending_turn_id = None
             if hasattr(original_stub, "pending_user_source"):
                 original_stub.pending_user_source = None
         except Exception:
@@ -20926,6 +20939,8 @@ def _prepare_chat_start_session_for_stream(
     model: str,
     model_provider,
     stream_id: str,
+    turn_id: str | None = None,
+    submitted_prompt_text: str | None = None,
     started_at: float | None = None,
     source: str = "webui",
 ):
@@ -20941,11 +20956,20 @@ def _prepare_chat_start_session_for_stream(
     s.workspace = workspace
     s.model = model
     s.model_provider = model_provider
+    turn_id = str(turn_id or uuid.uuid4().hex)
+    submitted_prompt_text = str(submitted_prompt_text if submitted_prompt_text is not None else msg)
     s.active_stream_id = stream_id
+    from api.active_checkpoint import build_active_checkpoint
+    s.active_checkpoint = build_active_checkpoint(
+        stream_id=stream_id,
+        turn_id=turn_id,
+        submitted_prompt_text=submitted_prompt_text,
+    )
     s.post_compression_context_tokens_estimate = None
     s.pending_user_message = msg
     s.pending_attachments = attachments
     s.pending_started_at = started_at if started_at is not None else time.time()
+    s.pending_turn_id = turn_id
     s.pending_user_source = source
     current_title = getattr(s, "title", None)
     if _is_default_or_empty_session_title(current_title):
@@ -21114,6 +21138,7 @@ def _start_chat_stream_for_session(
     source: str = "webui",
     moa_config=None,
     external_runtime_owned: bool | None = None,
+    submitted_prompt_text: str | None = None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     if external_runtime_owned is None:
@@ -21126,6 +21151,10 @@ def _start_chat_stream_for_session(
         stale_response["_status"] = 409
         return stale_response
     attachments = attachments or []
+    submitted_prompt_text = str(submitted_prompt_text if submitted_prompt_text is not None else msg)
+    turn_id = uuid.uuid4().hex
+    from api.active_checkpoint import submitted_prompt_sha256
+    prompt_hash = submitted_prompt_sha256(submitted_prompt_text)
     # Prevent duplicate runs in the same session while a stream is still active.
     # This commonly happens after page refresh/reconnect races and can produce
     # duplicated clarify cards for what appears to be a single user request.
@@ -21193,6 +21222,8 @@ def _start_chat_stream_for_session(
                     model=model,
                     model_provider=model_provider,
                     stream_id=stream_id,
+                    turn_id=turn_id,
+                    submitted_prompt_text=submitted_prompt_text,
                     source=source,
                 )
                 break
@@ -21228,6 +21259,8 @@ def _start_chat_stream_for_session(
                 "model": model,
                 "model_provider": model_provider,
                 "created_at": s.pending_started_at,
+                "turn_id": turn_id,
+                "prompt_hash": prompt_hash,
             },
         )
     except Exception:
@@ -21239,12 +21272,25 @@ def _start_chat_stream_for_session(
     register_stream_owner(stream_id, s.session_id)
     with STREAMS_LOCK:
         STREAMS[stream_id] = stream
+    register_active_run(
+        stream_id,
+        session_id=s.session_id,
+        started_at=s.pending_started_at,
+        phase="queued",
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
+    )
     # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
     if goal_related:
         STREAM_GOAL_RELATED[stream_id] = True
     diag.stage("worker_thread_start") if diag else None
     worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
-    worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
+    worker_kwargs = {
+        "model_provider": model_provider,
+        "goal_related": goal_related,
+        "turn_id": turn_id,
+        "prompt_hash": prompt_hash,
+    }
     if moa_config and not backend_is_gateway:
         worker_kwargs["moa_config"] = moa_config
     if backend_is_gateway:
@@ -21272,7 +21318,7 @@ def _start_chat_stream_for_session(
         "stream_id": stream_id,
         "session_id": s.session_id,
         "pending_started_at": s.pending_started_at,
-        "turn_id": journal_event.get("turn_id"),
+        "turn_id": turn_id,
         "title": s.title,
     }
     if normalized_model:
@@ -21348,6 +21394,7 @@ def _start_run(
     diag=None,
     moa_config=None,
     gateway_chat_enabled: bool | None = None,
+    submitted_prompt_text: str | None = None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -21389,6 +21436,7 @@ def _start_run(
                 source=request.source or source,
                 moa_config=moa_config,
                 external_runtime_owned=gateway_chat_enabled,
+                submitted_prompt_text=submitted_prompt_text,
             )
 
         def _legacy_adapter_factory():
@@ -21430,6 +21478,7 @@ def _start_run(
         source=source,
         moa_config=moa_config,
         external_runtime_owned=gateway_chat_enabled,
+        submitted_prompt_text=submitted_prompt_text,
     )
 
 
@@ -22123,7 +22172,8 @@ def _handle_chat_start(handler, body, diag=None):
             else:
                 return bad(handler, "Session not found", 404)
         diag.stage("normalize_message") if diag else None
-        msg = str(body.get("message", "")).strip()
+        submitted_prompt_text = str(body.get("message", ""))
+        msg = submitted_prompt_text.strip()
         if not msg:
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
@@ -22243,6 +22293,7 @@ def _handle_chat_start(handler, body, diag=None):
             "route": "/api/chat/start",
             "diag": diag,
             "gateway_chat_enabled": gateway_chat_enabled,
+            "submitted_prompt_text": submitted_prompt_text,
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config

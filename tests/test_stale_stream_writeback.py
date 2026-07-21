@@ -49,6 +49,23 @@ def test_stream_writeback_requires_active_stream_ownership():
     assert streaming._stream_writeback_is_current(s, "current-stream") is False
 
 
+def test_stream_writeback_rejects_late_turn_with_reused_stream_id():
+    s = Session(session_id="checkpoint_ownership", messages=[])
+    s.active_stream_id = "shared-stream"
+    s.active_checkpoint = {
+        "stream_id": "shared-stream",
+        "turn_id": "newer-turn",
+        "prompt_hash": "newer-prompt-hash",
+    }
+
+    assert streaming._stream_writeback_is_current(
+        s,
+        "shared-stream",
+        turn_id="older-turn",
+        prompt_hash="older-prompt-hash",
+    ) is False
+
+
 def test_cancel_stream_does_not_append_marker_after_stream_ownership_rotated():
     sid = "rotated_cancel_sid"
     old_stream = "old-stream"
@@ -172,7 +189,7 @@ def test_stale_stream_clear_trusts_completed_run_journal_instead_of_adding_marke
 
 def test_success_path_checks_stream_ownership_before_persisting_result():
     src = Path("api/streaming.py").read_text(encoding="utf-8")
-    guard = "if not ephemeral and not _stream_writeback_is_current(s, stream_id):"
+    guard = "if not ephemeral and not _stream_writeback_is_current("
     guard_pos = src.find(guard)
     result_merge_pos = src.find("_result_messages = result.get('messages') or _previous_context_messages")
     compression_pos = src.find("Handle context compression side effects")
@@ -189,7 +206,7 @@ def test_self_heal_retry_success_checks_stream_ownership_before_writeback():
     start = src.index("logger.info('[webui] self-heal (except path): retrying stream")
     end = src.index("logger.info('[webui] self-heal (except path): retry succeeded')", start)
     block = src[start:end]
-    guard = "if not ephemeral and not _stream_writeback_is_current(s, stream_id):"
+    guard = "if not ephemeral and not _stream_writeback_is_current("
 
     assert guard in block
     assert block.index(guard) < block.index("_result_messages = _heal_result.get('messages') or _previous_context_messages")
@@ -202,7 +219,7 @@ def test_outer_exception_path_checks_stream_ownership_before_error_writeback():
     start = src.index("# Persist the error so it survives page reload.", outer_error_payload)
     end = src.index("put('apperror', _error_payload)", start)
     block = src[start:end]
-    guard = "if not ephemeral and not _stream_writeback_is_current(s, stream_id):"
+    guard = "if not ephemeral and not _stream_writeback_is_current("
 
     assert guard in block
     assert block.index(guard) < block.index("_materialize_pending_user_turn_before_error(s)")

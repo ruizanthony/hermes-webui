@@ -35,6 +35,7 @@ from api.config import (
 from api.helpers import _redact_text, redact_session_data
 from api.models import clear_process_wakeup_pause, get_session, merge_session_messages_append_only
 from api.run_journal import RunJournalWriter, bound_run_journal_snapshot_args
+from api.active_checkpoint import active_checkpoint_matches, clear_active_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -707,7 +708,10 @@ def stop_gateway_run(run_id: str) -> bool:
         return False
 
 
-def _settle_gateway_terminal_error(session_id, stream_id, workspace, model, model_provider, terminal_error):
+def _settle_gateway_terminal_error(
+    session_id, stream_id, workspace, model, model_provider, terminal_error,
+    *, turn_id=None, prompt_hash=None, submitted_prompt_text=None,
+):
     from api.streaming import (
         _classify_provider_error,
         _materialize_pending_user_turn_before_error,
@@ -719,7 +723,10 @@ def _settle_gateway_terminal_error(session_id, stream_id, workspace, model, mode
 
     with _get_session_agent_lock(session_id):
         session = get_session(session_id)
-        if not _stream_writeback_is_current(session, stream_id):
+        if not _stream_writeback_is_current(
+            session, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,
+            submitted_prompt_text=submitted_prompt_text,
+        ):
             return None
         error_classification = _classify_provider_error(terminal_error)
         error_payload = _provider_error_payload(
@@ -730,6 +737,7 @@ def _settle_gateway_terminal_error(session_id, stream_id, workspace, model, mode
         turn_duration = _terminal_turn_duration(session)
         _materialize_pending_user_turn_before_error(session)
         session.active_stream_id = None
+        clear_active_checkpoint(session)
         session.pending_user_message = None
         session.pending_attachments = []
         session.pending_started_at = None
@@ -768,14 +776,29 @@ def _settle_gateway_terminal_error(session_id, stream_id, workspace, model, mode
         return error_payload
 
 
-def _stream_writeback_is_current(session: Any, stream_id: str) -> bool:
-    return bool(stream_id and getattr(session, "active_stream_id", None) == stream_id)
+def _stream_writeback_is_current(
+    session: Any, stream_id: str, *, turn_id=None, prompt_hash=None,
+    submitted_prompt_text=None,
+) -> bool:
+    if not (turn_id or prompt_hash or isinstance(getattr(session, "active_checkpoint", None), dict)):
+        return bool(stream_id and getattr(session, "active_stream_id", None) == stream_id)
+    return active_checkpoint_matches(
+        session, stream_id=stream_id, turn_id=turn_id, prompt_hash=prompt_hash,
+        submitted_prompt_text=submitted_prompt_text,
+    )
 
 
-def _clear_gateway_pending_state(session: Any, stream_id: str) -> None:
-    if not _stream_writeback_is_current(session, stream_id):
+def _clear_gateway_pending_state(
+    session: Any, stream_id: str, *, turn_id=None, prompt_hash=None,
+    submitted_prompt_text=None,
+) -> None:
+    if not _stream_writeback_is_current(
+        session, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,
+        submitted_prompt_text=submitted_prompt_text,
+    ):
         return
     session.active_stream_id = None
+    clear_active_checkpoint(session)
     session.pending_user_message = None
     session.pending_attachments = None
     session.pending_started_at = None
@@ -804,6 +827,8 @@ def _run_gateway_chat_streaming(
     *,
     model_provider=None,
     goal_related=False,
+    turn_id=None,
+    prompt_hash=None,
 ):
     """Bridge a WebUI chat turn through Hermes Gateway's API server.
 
@@ -830,6 +855,8 @@ def _run_gateway_chat_streaming(
         model=model,
         provider=model_provider,
         backend="gateway",
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
     )
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
@@ -966,6 +993,9 @@ def _run_gateway_chat_streaming(
                     model,
                     model_provider,
                     str(exc),
+                    turn_id=turn_id,
+                    prompt_hash=prompt_hash,
+                    submitted_prompt_text=msg_text,
                 )
                 if error_payload is None:
                     return
@@ -1140,6 +1170,9 @@ def _run_gateway_chat_streaming(
                 model,
                 model_provider,
                 terminal_error,
+                turn_id=turn_id,
+                prompt_hash=prompt_hash,
+                submitted_prompt_text=msg_text,
             )
             if error_payload is None:
                 return
@@ -1155,7 +1188,10 @@ def _run_gateway_chat_streaming(
             return
         with _get_session_agent_lock(session_id):
             s = get_session(session_id)
-            if not _stream_writeback_is_current(s, stream_id):
+            if not _stream_writeback_is_current(
+                s, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,
+                submitted_prompt_text=msg_text,
+            ):
                 return
             # A late Stop can land after Gateway has yielded a full answer but
             # before success writeback. Treat it as cancellation so any
@@ -1233,6 +1269,7 @@ def _run_gateway_chat_streaming(
                             display = display[:-1]
                 s.messages = display + [user_msg, assistant_msg]
             s.active_stream_id = None
+            clear_active_checkpoint(s)
             s.pending_user_message = None
             s.pending_attachments = None
             s.pending_started_at = None
@@ -1348,7 +1385,10 @@ def _run_gateway_chat_streaming(
         if s is not None:
             try:
                 with _get_session_agent_lock(session_id):
-                    _clear_gateway_pending_state(get_session(session_id), stream_id)
+                    _clear_gateway_pending_state(
+                        get_session(session_id), stream_id, turn_id=turn_id,
+                        prompt_hash=prompt_hash, submitted_prompt_text=msg_text,
+                    )
             except Exception:
                 logger.debug("Failed to clear gateway stream state", exc_info=True)
             _cleanup_gateway_pending_mirror(session_id)

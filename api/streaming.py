@@ -54,6 +54,7 @@ from api.metering import meter
 from api.run_journal import RunJournalWriter
 from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
+from api.active_checkpoint import active_checkpoint_matches, clear_active_checkpoint
 from api.usage import prompt_cache_hit_percent
 from api.models import (
     _is_empty_partial_activity_message,
@@ -1560,6 +1561,7 @@ def _persist_cancelled_turn(session, *, message: str = 'Task cancelled.') -> Non
     """
     _materialize_pending_user_turn_before_error(session)
     session.active_stream_id = None
+    clear_active_checkpoint(session)
     session.pending_user_message = None
     session.pending_attachments = []
     session.pending_started_at = None
@@ -5568,14 +5570,29 @@ def _context_messages_for_new_turn(session, msg_text):
     return _new_turn_context_from_messages(_session_context_messages(session), msg_text)
 
 
-def _stream_writeback_is_current(session, stream_id):
+def _stream_writeback_is_current(
+    session,
+    stream_id,
+    *,
+    turn_id=None,
+    prompt_hash=None,
+    submitted_prompt_text=None,
+):
     """Return True only while a worker still owns the session writeback.
 
     cancel_stream() intentionally clears ``active_stream_id`` early so the UI can
     accept a follow-up turn while the old worker is unwinding. That old worker
     must not later persist its stale result over the newer transcript.
     """
-    return bool(stream_id) and getattr(session, 'active_stream_id', None) == stream_id
+    if not (turn_id or prompt_hash or isinstance(getattr(session, 'active_checkpoint', None), dict)):
+        return bool(stream_id) and getattr(session, 'active_stream_id', None) == stream_id
+    return active_checkpoint_matches(
+        session,
+        stream_id=stream_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
+        submitted_prompt_text=submitted_prompt_text,
+    )
 
 
 def _stream_writeback_can_supersede_recovery_marker(session, msg_text):
@@ -7105,6 +7122,8 @@ def _run_agent_streaming(
     ephemeral=False,
     model_provider=None,
     goal_related=False,
+    turn_id=None,
+    prompt_hash=None,
     moa_config=None,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
@@ -7130,6 +7149,8 @@ def _run_agent_streaming(
         model=model,
         provider=model_provider,
         ephemeral=bool(ephemeral),
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
     )
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
@@ -7146,6 +7167,17 @@ def _run_agent_streaming(
         except Exception:
             logger.debug("Failed to append worker_started turn journal event", exc_info=True)
     s = None
+
+    def _finalize_owned_cancel(*, message='Task cancelled.'):
+        if not ephemeral and not _stream_writeback_is_current(
+            s, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,
+            submitted_prompt_text=msg_text,
+        ):
+            logger.info("Skipping stale cancel writeback for session %s stream %s", session_id, stream_id)
+            return False
+        _finalize_cancelled_turn(s, ephemeral=ephemeral, message=message)
+        return True
+
     _rt = {}
     old_cwd = None
     old_exec_ask = None
@@ -7611,7 +7643,7 @@ def _run_agent_streaming(
         # Check for pre-flight cancel (user cancelled before agent even started)
         if cancel_event.is_set():
             with _agent_lock:
-                _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.')
+                _finalize_owned_cancel(message='Task cancelled before start.')
             put('cancel', _cancel_event_payload('Cancelled before start'))
             return
 
@@ -8893,7 +8925,7 @@ def _run_agent_streaming(
                     except Exception:
                         logger.debug("Failed to interrupt agent before start")
                     with _agent_lock:
-                        _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.')
+                        _finalize_owned_cancel(message='Task cancelled before start.')
                     put('cancel', _cancel_event_payload('Cancelled by user'))
                     return
 
@@ -9084,7 +9116,7 @@ def _run_agent_streaming(
                     _cleanup_ephemeral_cancelled_turn(s)
                 else:
                     with _agent_lock:
-                        _finalize_cancelled_turn(s, ephemeral=False)
+                        _finalize_owned_cancel()
                         try:
                             append_turn_journal_event_for_stream(
                                 s.session_id,
@@ -9126,7 +9158,7 @@ def _run_agent_streaming(
                 _ckpt_thread.join(timeout=15)
             if cancel_event.is_set():
                 with _agent_lock:
-                    _finalize_cancelled_turn(s, ephemeral=False)
+                    _finalize_owned_cancel()
                     try:
                         append_turn_journal_event_for_stream(
                             s.session_id,
@@ -9144,7 +9176,10 @@ def _run_agent_streaming(
             _writeback_timings = []
             _writeback_started = time.perf_counter()
             with _agent_lock:
-                if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                if not ephemeral and not _stream_writeback_is_current(
+                    s, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,
+                    submitted_prompt_text=msg_text,
+                ):
                     if _stream_writeback_can_supersede_recovery_marker(s, msg_text):
                         logger.info(
                             "Superseding stale recovery marker for session %s stream %s",
@@ -9185,7 +9220,7 @@ def _run_agent_streaming(
                         if isinstance(result, dict):
                             result = {**result, 'messages': _result_messages}
                     if cancel_event.is_set():
-                        _finalize_cancelled_turn(s, ephemeral=False)
+                        _finalize_owned_cancel()
                         try:
                             append_turn_journal_event_for_stream(
                                 s.session_id,
@@ -9446,7 +9481,7 @@ def _run_agent_streaming(
                 # _token_sent tracks whether on_token() was called (any streamed text)
                 if _terminal_failure or (not _assistant_added and not _token_sent):
                     if cancel_event.is_set():
-                        _finalize_cancelled_turn(s, ephemeral=ephemeral)
+                        _finalize_owned_cancel()
                         if not ephemeral:
                             try:
                                 append_turn_journal_event_for_stream(
@@ -9845,6 +9880,7 @@ def _run_agent_streaming(
                 )
                 s.tool_calls = tool_calls
                 s.active_stream_id = None
+                clear_active_checkpoint(s)
                 s.pending_user_message = None
                 s.pending_attachments = []
                 s.pending_started_at = None
@@ -10115,7 +10151,7 @@ def _run_agent_streaming(
                         except Exception:
                             logger.debug("Failed to append assistant_started turn journal event", exc_info=True)
                 if cancel_event.is_set():
-                    _finalize_cancelled_turn(s, ephemeral=False)
+                    _finalize_owned_cancel()
                     try:
                         append_turn_journal_event_for_stream(
                             s.session_id,
@@ -10133,7 +10169,7 @@ def _run_agent_streaming(
                 with _stream_writeback_stage(_writeback_timings, "session_save"):
                     s.save()
                 if cancel_event.is_set():
-                    _finalize_cancelled_turn(s, ephemeral=False)
+                    _finalize_owned_cancel()
                     try:
                         append_turn_journal_event_for_stream(
                             s.session_id,
@@ -10237,7 +10273,7 @@ def _run_agent_streaming(
             _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
             with _lock_ctx:
                 if cancel_event.is_set():
-                    _finalize_cancelled_turn(s, ephemeral=False)
+                    _finalize_owned_cancel()
                     try:
                         append_turn_journal_event_for_stream(
                             s.session_id,
@@ -10269,7 +10305,7 @@ def _run_agent_streaming(
                             s.save(touch_updated_at=False)
                         except Exception:
                             logger.debug("Failed to persist restored process wakeup pause", exc_info=True)
-                        _finalize_cancelled_turn(s, ephemeral=False)
+                        _finalize_owned_cancel()
                         try:
                             append_turn_journal_event_for_stream(
                                 s.session_id,
@@ -10292,7 +10328,7 @@ def _run_agent_streaming(
                             s.save(touch_updated_at=False)
                         except Exception:
                             logger.debug("Failed to persist restored process wakeup pause", exc_info=True)
-                        _finalize_cancelled_turn(s, ephemeral=False)
+                        _finalize_owned_cancel()
                         try:
                             append_turn_journal_event_for_stream(
                                 s.session_id,
@@ -10661,7 +10697,7 @@ def _run_agent_streaming(
                             model=_turn_route_model,
                             provider=_turn_route_provider,
                         )
-                    _finalize_cancelled_turn(s, ephemeral=ephemeral)
+                    _finalize_owned_cancel()
                     if not ephemeral:
                         try:
                             append_turn_journal_event_for_stream(
@@ -10764,7 +10800,10 @@ def _run_agent_streaming(
                                 _ckpt_thread.join(timeout=15)
                             _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
                             with _lock_ctx:
-                                if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                                if not ephemeral and not _stream_writeback_is_current(
+                                    s, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,
+                                    submitted_prompt_text=msg_text,
+                                ):
                                     logger.info(
                                         "Skipping stale stream self-heal writeback for session %s stream %s; active_stream_id=%s",
                                         getattr(s, 'session_id', session_id),
@@ -10797,6 +10836,12 @@ def _run_agent_streaming(
                                 )
                                 _compact_session_image_parts_for_persistence(s)
                                 _advance_truncation_watermark_after_commit(s)  # #3831
+                                s.active_stream_id = None
+                                clear_active_checkpoint(s)
+                                s.pending_user_message = None
+                                s.pending_attachments = []
+                                s.pending_started_at = None
+                                s.pending_user_source = None
                                 s.save()
                         logger.info('[webui] self-heal (except path): retry succeeded')
                         return  # skip error emission
@@ -10835,7 +10880,10 @@ def _run_agent_streaming(
             # API calls so the LLM never sees its own error as prior context on the next turn.
             _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
             with _lock_ctx:
-                if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                if not ephemeral and not _stream_writeback_is_current(
+                    s, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,
+                    submitted_prompt_text=msg_text,
+                ):
                     if _turn_pending_source == 'process_wakeup':
                         _pause = record_process_wakeup_provider_unavailable_pause(
                             s,
@@ -10880,6 +10928,7 @@ def _run_agent_streaming(
                 _turn_duration = _terminal_turn_duration(s)
                 _materialize_pending_user_turn_before_error(s)
                 s.active_stream_id = None
+                clear_active_checkpoint(s)
                 s.pending_user_message = None
                 s.pending_attachments = []
                 s.pending_started_at = None
@@ -10958,8 +11007,11 @@ def _run_agent_streaming(
         if _ckpt_thread is not None:
             _ckpt_thread.join(timeout=15)
         if (s is not None
-                and getattr(s, 'active_stream_id', None) == stream_id
-                and getattr(s, 'pending_user_message', None)):
+                and getattr(s, 'pending_user_message', None)
+                and _stream_writeback_is_current(
+                    s, stream_id, turn_id=turn_id, prompt_hash=prompt_hash,
+                    submitted_prompt_text=msg_text,
+                )):
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
         _clear_thread_env()  # TD1: always clear thread-local context
@@ -11364,7 +11416,14 @@ def cancel_stream(stream_id: str) -> bool:
                 _cs = get_session(_cancel_session_id)
                 if not isinstance(getattr(_cs, 'messages', None), list):
                     _cs.messages = []
-                if not _stream_writeback_is_current(_cs, stream_id):
+                _cancel_turn_id = (active_run_entry or {}).get('turn_id')
+                _cancel_prompt_hash = (active_run_entry or {}).get('prompt_hash')
+                if not _stream_writeback_is_current(
+                    _cs,
+                    stream_id,
+                    turn_id=_cancel_turn_id,
+                    prompt_hash=_cancel_prompt_hash,
+                ):
                     # The stream has rotated to a different stream id (newer
                     # turn started, or the worker already finalized this one).
                     # Skip the cancel-marker append AND suppress the terminal
@@ -11441,6 +11500,7 @@ def cancel_stream(stream_id: str) -> bool:
                         _cancel_session_id,
                     )
                 _cs.active_stream_id = None
+                clear_active_checkpoint(_cs)
                 _cs.pending_user_message = None
                 _cs.pending_attachments = []
                 _cs.pending_started_at = None
