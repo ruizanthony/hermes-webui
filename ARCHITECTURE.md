@@ -259,6 +259,11 @@ generation handle also owns its cancel event, agent, partial/reasoning/tool buff
 goal marker, and latest journal event id. String-keyed maps are compatibility
 projections of the current handle; workers mutate the handle and publish only after
 revalidating its full identity, so a replaced worker cannot adopt the new generation.
+Each handle also has a one-way retired publication state. Replacement marks the old
+handle retired under its state lock before installing the new registries; journal
+publication holds only that exact state lock across the final retired check and disk
+append. An append therefore finishes before retirement or is rejected afterward,
+without holding the global stream/owner/run locks across journal I/O.
 
 Stream status, cancel, and SSE subscription atomically authorize the handle's
 profile/session identity and acquire its exact channel/action under the same lock

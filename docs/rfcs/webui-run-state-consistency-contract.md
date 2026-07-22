@@ -127,6 +127,9 @@ and 5; it does not mark every run-state boundary implemented.
    the complete session/turn/prompt/channel generation that created them. Status,
    cancel, and SSE subscription must authorize that identity and acquire the exact
    action/channel atomically; a reused string stream id is never sufficient proof.
+   Run-journal publication must use the generation's one-way retirement state as
+   the final authority: an append completes before retirement or becomes a no-op
+   afterward, with no authorization-to-append check/use gap.
 
 ## Review Checklist
 

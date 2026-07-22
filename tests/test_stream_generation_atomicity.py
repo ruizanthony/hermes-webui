@@ -14,6 +14,7 @@ import pytest
 from api import config, gateway_chat, models, routes, streaming
 from api.active_checkpoint import build_active_checkpoint, submitted_prompt_sha256
 from api.metering import meter
+from api.run_journal import RunJournalWriter, read_run_events
 
 
 @pytest.fixture(autouse=True)
@@ -462,6 +463,253 @@ def _capture_json(monkeypatch):
     monkeypatch.setattr(routes, "j", fake_j)
     monkeypatch.setattr(routes, "bad", fake_bad)
     return captured
+
+
+def _channel_items(channel):
+    subscriber, snapshot = channel.subscribe_with_snapshot()
+    items = []
+    try:
+        while True:
+            items.append(subscriber.get_nowait())
+    except queue.Empty:
+        pass
+    finally:
+        channel.unsubscribe(subscriber)
+    return snapshot, items
+
+
+def _assert_replacement_publication_replays(
+    session_id, stream_id, replacement_generation, stale_marker
+):
+    writer = RunJournalWriter(session_id, stream_id)
+    accepted, journaled, journal_error = (
+        config.stream_generation_publish_run_journal_event(
+            replacement_generation,
+            writer,
+            "token",
+            {"text": "replacement-token"},
+        )
+    )
+    assert accepted is True
+    assert journal_error is None
+    assert journaled["event_id"].startswith(f"{stream_id}:")
+    accepted, terminal, journal_error = (
+        config.stream_generation_publish_run_journal_event(
+            replacement_generation,
+            writer,
+            "stream_end",
+            {"session_id": session_id},
+        )
+    )
+    assert accepted is True
+    assert journal_error is None
+    assert terminal["terminal"] is True
+
+    journal = read_run_events(session_id, stream_id)
+    journal_text = repr(journal["events"])
+    assert stale_marker not in journal_text
+    assert journal_text.count("replacement-token") == 1
+    assert journal["events"][-1]["event"] == "stream_end"
+    handler = _Handler()
+    assert routes._replay_run_journal(
+        handler, stream_id, 0, include_stale=False
+    ) is True
+    replay = handler.wfile.getvalue().decode("utf-8")
+    assert "replacement-token" in replay
+    assert stale_marker not in replay
+
+
+def test_legacy_journal_publication_rechecks_after_generation_replacement(
+    monkeypatch, tmp_path, _mock_hermes_modules
+):
+    stream_id = "legacy-publication-race"
+    turn_id = "old-turn"
+    prompt = "old prompt"
+    stale_marker = "stale-legacy-publication"
+    session = _session("legacy_publication_session", stream_id, turn_id, prompt, tmp_path)
+    old_channel = config.create_stream_channel()
+    assert _register(stream_id, old_channel, session.session_id, turn_id, prompt)
+    old_generation = config.get_stream_generation(
+        stream_id, expected_stream=old_channel
+    )
+    assert old_generation is not None
+    arm_barrier = threading.Event()
+    validated = threading.Event()
+    resume = threading.Event()
+    real_is_current = streaming.stream_generation_is_current
+
+    def pause_after_validation(generation):
+        current = real_is_current(generation)
+        if current and arm_barrier.is_set() and not validated.is_set():
+            validated.set()
+            assert resume.wait(3)
+        return current
+
+    class PublicationRaceAgent(_BaseAgent):
+        def run_conversation(self, **kwargs):
+            arm_barrier.set()
+            self.stream_delta_callback(stale_marker)
+            raise RuntimeError("stop stale legacy worker")
+
+    monkeypatch.setattr(streaming, "stream_generation_is_current", pause_after_validation)
+    worker = threading.Thread(
+        target=_run_legacy_with_agent,
+        args=(
+            monkeypatch,
+            PublicationRaceAgent,
+            session,
+            old_channel,
+            turn_id,
+            prompt,
+        ),
+    )
+    worker.start()
+    assert validated.wait(3)
+    replacement = _install_replacement(stream_id, session, tmp_path)
+    replacement_generation = config.get_stream_generation(
+        stream_id, expected_stream=replacement[0]
+    )
+    assert replacement_generation is not None
+    meter().begin_session(stream_id, owner=replacement_generation)
+    resume.set()
+    worker.join(5)
+    assert not worker.is_alive()
+
+    journal = read_run_events(session.session_id, stream_id)
+    assert stale_marker not in repr(journal["events"])
+    with old_generation.state.lock:
+        assert old_generation.state.retired is True
+    with replacement_generation.state.lock:
+        assert replacement_generation.state.retired is False
+    old_snapshot, old_items = _channel_items(old_channel)
+    assert stale_marker not in repr((old_snapshot, old_items))
+    with meter()._lock:
+        replacement_meter = meter()._sessions[stream_id]
+        assert replacement_meter.owner is replacement_generation
+        assert replacement_meter.output_tokens == 0
+    _assert_replacement_intact(stream_id, *replacement)
+    _assert_replacement_publication_replays(
+        session.session_id,
+        stream_id,
+        replacement_generation,
+        stale_marker,
+    )
+
+
+def test_gateway_journal_publication_rechecks_after_generation_replacement(
+    monkeypatch, tmp_path
+):
+    stream_id = "gateway-publication-race"
+    turn_id = "old-turn"
+    prompt = "old prompt"
+    stale_marker = "stale-gateway-publication"
+    session = _session("gateway_publication_session", stream_id, turn_id, prompt, tmp_path)
+    old_channel = config.create_stream_channel()
+    assert _register(stream_id, old_channel, session.session_id, turn_id, prompt)
+    old_generation = config.get_stream_generation(
+        stream_id, expected_stream=old_channel
+    )
+    assert old_generation is not None
+    arm_barrier = threading.Event()
+    validated = threading.Event()
+    resume = threading.Event()
+    real_is_current = gateway_chat.stream_generation_is_current
+
+    def pause_after_validation(generation):
+        current = real_is_current(generation)
+        if current and arm_barrier.is_set() and not validated.is_set():
+            validated.set()
+            assert resume.wait(3)
+        return current
+
+    class PublicationRaceResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            arm_barrier.set()
+            yield (
+                f'data: {{"choices":[{{"delta":{{"content":"{stale_marker}"}}}}]}}\n\n'
+            ).encode()
+            yield b"data: [DONE]\n\n"
+
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.invalid")
+    monkeypatch.setattr(gateway_chat, "get_session", lambda _sid: session)
+    monkeypatch.setattr(config, "get_config", lambda: {})
+    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *args: False)
+    monkeypatch.setattr(
+        gateway_chat, "gateway_approval_unavailable_reason", lambda *args: None
+    )
+    monkeypatch.setattr(
+        gateway_chat.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: PublicationRaceResponse(),
+    )
+    monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {})
+    monkeypatch.setattr(
+        streaming, "_prefill_messages_with_webui_context", lambda ctx, cfg: []
+    )
+    monkeypatch.setattr(
+        streaming,
+        "_normalize_prefill_messages_before_user_turn",
+        lambda rows: rows,
+    )
+    monkeypatch.setattr(
+        streaming, "_webui_ephemeral_system_prompt", lambda *args, **kwargs: "system"
+    )
+    monkeypatch.setattr(
+        gateway_chat, "stream_generation_is_current", pause_after_validation
+    )
+    worker = threading.Thread(
+        target=gateway_chat._run_gateway_chat_streaming,
+        args=(
+            session.session_id,
+            prompt,
+            "test-model",
+            str(tmp_path),
+            stream_id,
+            [],
+        ),
+        kwargs={
+            "stream": old_channel,
+            "turn_id": turn_id,
+            "prompt_hash": submitted_prompt_sha256(prompt),
+        },
+    )
+    worker.start()
+    assert validated.wait(3)
+    replacement = _install_replacement(stream_id, session, tmp_path)
+    replacement_generation = config.get_stream_generation(
+        stream_id, expected_stream=replacement[0]
+    )
+    assert replacement_generation is not None
+    meter().begin_session(stream_id, owner=replacement_generation)
+    resume.set()
+    worker.join(5)
+    assert not worker.is_alive()
+
+    journal = read_run_events(session.session_id, stream_id)
+    assert stale_marker not in repr(journal["events"])
+    with old_generation.state.lock:
+        assert old_generation.state.retired is True
+    with replacement_generation.state.lock:
+        assert replacement_generation.state.retired is False
+    old_snapshot, old_items = _channel_items(old_channel)
+    assert stale_marker not in repr((old_snapshot, old_items))
+    with meter()._lock:
+        replacement_meter = meter()._sessions[stream_id]
+        assert replacement_meter.owner is replacement_generation
+        assert replacement_meter.output_tokens == 0
+    _assert_replacement_intact(stream_id, *replacement)
+    _assert_replacement_publication_replays(
+        session.session_id,
+        stream_id,
+        replacement_generation,
+        stale_marker,
+    )
 
 
 def test_sse_authorization_cannot_subscribe_replacement_channel(monkeypatch):

@@ -8851,6 +8851,7 @@ class StreamGenerationState:
     goal_related: bool = False
     last_event_id: str | None = None
     accepting_updates: bool = True
+    retired: bool = False
     lock: threading.RLock = dataclass_field(
         default_factory=threading.RLock, repr=False
     )
@@ -8940,6 +8941,19 @@ def _generation_is_current_locked(generation: StreamGenerationHandle) -> bool:
         _registered_generation_locked(generation.stream_id) is generation
         and _active_generation_matches_locked(generation)
     )
+
+
+def _retire_stream_generation_locked(generation: StreamGenerationHandle) -> None:
+    """Permanently close one generation to updates and journal publication.
+
+    Registry callers already hold the established global lock order before
+    taking this exact generation's state lock. Journal publishers take only the
+    state lock, so replacement either waits for an in-flight append to finish or
+    retires the generation before a later append can begin.
+    """
+    with generation.state.lock:
+        generation.state.retired = True
+        generation.state.accepting_updates = False
 
 
 def _publish_generation_state_locked(generation: StreamGenerationHandle) -> None:
@@ -9092,7 +9106,10 @@ def stream_generation_is_current(
             if STREAMS.get(generation.stream_id) is not generation.stream:
                 return False
             with generation.state.lock:
-                return bool(generation.state.accepting_updates)
+                return bool(
+                    generation.state.accepting_updates
+                    and not generation.state.retired
+                )
 
 
 def _mutate_stream_generation(
@@ -9106,7 +9123,10 @@ def _mutate_stream_generation(
             if STREAMS.get(generation.stream_id) is not generation.stream:
                 return False
             with generation.state.lock:
-                if not generation.state.accepting_updates:
+                if (
+                    not generation.state.accepting_updates
+                    or generation.state.retired
+                ):
                     return False
                 mutator(generation.state)
                 _publish_generation_state_locked(generation)
@@ -9125,7 +9145,10 @@ def stream_generation_apply(
             if STREAMS.get(generation.stream_id) is not generation.stream:
                 return False, None
             with generation.state.lock:
-                if not generation.state.accepting_updates:
+                if (
+                    not generation.state.accepting_updates
+                    or generation.state.retired
+                ):
                     return False, None
             return True, action()
 
@@ -9217,6 +9240,49 @@ def stream_generation_note_event_id(
     )
 
 
+def stream_generation_publish_run_journal_event(
+    generation: StreamGenerationHandle,
+    run_journal,
+    event_name: str,
+    payload,
+) -> tuple[bool, dict | None, Exception | None]:
+    """Append one event while its exact generation remains publishable.
+
+    The immutable writer identity must match the generation. The generation
+    state lock is the sole publication lock: replacement and teardown mark the
+    generation retired under this same lock while following the global registry
+    lock order. No global registry lock is acquired here or held across disk I/O.
+
+    Returns ``(accepted, journaled_event, error)``. A journal failure still
+    leaves the already-authorized live event deliverable, matching the existing
+    best-effort journal contract; a retired generation returns ``accepted=False``.
+    """
+    state = generation.state
+    with state.lock:
+        if state.retired or not state.accepting_updates:
+            return False, None, None
+        if run_journal is None:
+            return True, None, None
+        if (
+            getattr(run_journal, "session_id", None) != generation.session_id
+            or getattr(run_journal, "run_id", None) != generation.stream_id
+        ):
+            return False, None, None
+        try:
+            journaled = run_journal.append_sse_event(event_name, payload)
+        except Exception as exc:
+            return True, None, exc
+        if isinstance(journaled, dict):
+            event_id = journaled.get("event_id")
+            if event_id:
+                state.last_event_id = str(event_id)
+                # Replacement cannot interleave this projection: it must first
+                # take this state lock to retire us, then publishes its own map
+                # values while still holding the global registry locks.
+                STREAM_LAST_EVENT_ID[generation.stream_id] = str(event_id)
+        return True, journaled, None
+
+
 def stream_generation_snapshot(generation: StreamGenerationHandle) -> dict:
     """Read only this handle's state; never follow its reusable string key."""
     state = generation.state
@@ -9304,7 +9370,7 @@ def detach_stream_generation_for_cancel(
                     return None
                 state = generation.state
                 with state.lock:
-                    if not state.accepting_updates:
+                    if not state.accepting_updates or state.retired:
                         return None
                     stream_present = (
                         STREAMS.get(generation.stream_id) is generation.stream
@@ -9322,6 +9388,7 @@ def detach_stream_generation_for_cancel(
                         ],
                         last_event_id=state.last_event_id,
                     )
+                    state.retired = True
                     state.accepting_updates = False
                     state.cancel_event.set()
                 ACTIVE_RUNS[generation.stream_id]["phase"] = "cancelling"
@@ -9405,6 +9472,10 @@ def unregister_stream_owner(
                 return False
             if str(owner or "").strip() != expected_session_id:
                 return False
+        if isinstance(owner, dict):
+            generation = owner.get("generation")
+            if isinstance(generation, StreamGenerationHandle):
+                _retire_stream_generation_locked(generation)
         STREAM_SESSION_OWNERS.pop(stream_id, None)
     return True
 
@@ -9623,6 +9694,11 @@ def register_stream_channel(
     with STREAMS_LOCK:
         with STREAM_SESSION_OWNERS_LOCK:
             with ACTIVE_RUNS_LOCK:
+                displaced_owner = STREAM_SESSION_OWNERS.get(stream_id)
+                if isinstance(displaced_owner, dict):
+                    displaced_generation = displaced_owner.get("generation")
+                    if isinstance(displaced_generation, StreamGenerationHandle):
+                        _retire_stream_generation_locked(displaced_generation)
                 STREAMS[stream_id] = stream
                 STREAM_SESSION_OWNERS[stream_id] = owner
                 ACTIVE_RUNS[stream_id] = entry
@@ -9721,7 +9797,10 @@ def update_active_run(
                 if STREAMS.get(stream_id) is not expected_generation.stream:
                     return False
                 with expected_generation.state.lock:
-                    if not expected_generation.state.accepting_updates:
+                    if (
+                        not expected_generation.state.accepting_updates
+                        or expected_generation.state.retired
+                    ):
                         return False
                 ACTIVE_RUNS[stream_id].update(metadata)
                 return True
@@ -9797,6 +9876,10 @@ def unregister_active_run(
                     ).strip()
                     if expected_session_id and active_session_id != expected_session_id:
                         return False
+                    if isinstance(owner, dict):
+                        generation = owner.get("generation")
+                        if isinstance(generation, StreamGenerationHandle):
+                            _retire_stream_generation_locked(generation)
                     ACTIVE_RUNS.pop(stream_id, None)
                     if owner is not None:
                         STREAM_SESSION_OWNERS.pop(stream_id, None)
@@ -9897,6 +9980,10 @@ def unregister_active_run_if_matches(
                 if registered_owner is not None and not isinstance(registered_owner, dict):
                     if active_session_id and str(registered_owner or "").strip() != active_session_id:
                         return False
+                if isinstance(registered_owner, dict):
+                    generation = registered_owner.get("generation")
+                    if isinstance(generation, StreamGenerationHandle):
+                        _retire_stream_generation_locked(generation)
                 ACTIVE_RUNS.pop(stream_id, None)
                 if registered_owner is not None:
                     STREAM_SESSION_OWNERS.pop(stream_id, None)
