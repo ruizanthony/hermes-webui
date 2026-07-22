@@ -44,7 +44,7 @@ from api.config import (
     stream_generation_append_reasoning,
     stream_generation_complete_tool,
     stream_generation_is_current,
-    stream_generation_note_event_id,
+    stream_generation_publish_run_journal_event,
     stream_generation_set_agent,
     stream_generation_set_reasoning,
     stream_generation_snapshot,
@@ -7611,20 +7611,33 @@ def _run_agent_streaming(
         # If cancelled, drop all further events except the cancel event itself
         if cancel_event.is_set() and not _success_writeback_committed and event not in ('cancel', 'apperror'):
             return
-        event_id = None
-        if run_journal is not None:
-            try:
-                journaled = run_journal.append_sse_event(event, data)
-                # Carry the exact journal id for this queued frame. A global
-                # "latest event" side channel is still kept for legacy queues,
-                # but StreamChannel subscribers need the per-item id so a
-                # queued backlog cannot advance the browser cursor past an
-                # undelivered event.
-                event_id = (journaled or {}).get('event_id') if isinstance(journaled, dict) else None
-                if event_id:
-                    stream_generation_note_event_id(generation, event_id)
-            except Exception:
-                logger.debug("Failed to append run journal event %s for stream %s", event, stream_id, exc_info=True)
+        accepted, journaled, journal_error = (
+            stream_generation_publish_run_journal_event(
+                generation, run_journal, event, data
+            )
+        )
+        if not accepted:
+            return
+        if journal_error is not None:
+            logger.debug(
+                "Failed to append run journal event %s for stream %s",
+                event,
+                stream_id,
+                exc_info=(
+                    type(journal_error),
+                    journal_error,
+                    journal_error.__traceback__,
+                ),
+            )
+        # Carry the exact journal id for this queued frame. A global "latest
+        # event" side channel is still kept for legacy queues, but StreamChannel
+        # subscribers need the per-item id so a queued backlog cannot advance
+        # the browser cursor past an undelivered event.
+        event_id = (
+            (journaled or {}).get('event_id')
+            if isinstance(journaled, dict)
+            else None
+        )
         if event_id and hasattr(q, "note_last_event_id"):
             try:
                 q.note_last_event_id(event_id)

@@ -31,7 +31,7 @@ from api.config import (
     stream_generation_append_reasoning,
     stream_generation_complete_tool,
     stream_generation_is_current,
-    stream_generation_note_event_id,
+    stream_generation_publish_run_journal_event,
     stream_generation_set_partial,
     stream_generation_snapshot,
     unregister_active_run,
@@ -1067,15 +1067,29 @@ def _run_gateway_chat_streaming(
         if event == "apperror" and isinstance(data, dict):
             data = data.copy()
             data.setdefault("session_id", session_id)
-        event_id = None
-        if run_journal is not None:
-            try:
-                journaled = run_journal.append_sse_event(event, data)
-                event_id = (journaled or {}).get("event_id") if isinstance(journaled, dict) else None
-                if event_id:
-                    stream_generation_note_event_id(generation, event_id)
-            except Exception:
-                logger.debug("Failed to append gateway event %s for stream %s", event, stream_id, exc_info=True)
+        accepted, journaled, journal_error = (
+            stream_generation_publish_run_journal_event(
+                generation, run_journal, event, data
+            )
+        )
+        if not accepted:
+            return
+        if journal_error is not None:
+            logger.debug(
+                "Failed to append gateway event %s for stream %s",
+                event,
+                stream_id,
+                exc_info=(
+                    type(journal_error),
+                    journal_error,
+                    journal_error.__traceback__,
+                ),
+            )
+        event_id = (
+            (journaled or {}).get("event_id")
+            if isinstance(journaled, dict)
+            else None
+        )
         if event_id and hasattr(q, "note_last_event_id"):
             try:
                 q.note_last_event_id(event_id)

@@ -11,9 +11,9 @@ Implementation:
 
   - api/config.py owns the event id in `StreamGenerationState.last_event_id`
     and projects it to the legacy `STREAM_LAST_EVENT_ID` compatibility map.
-  - api/streaming.py `put()` captures `journaled["event_id"]` from
-    `RunJournalWriter.append_sse_event()` and records it through the exact
-    immutable generation handle.
+  - api/streaming.py `put()` publishes through the exact immutable generation
+    handle; the publication helper records `journaled["event_id"]` while the
+    generation's publication lock is still held.
   - StreamChannel queue items carry `(event, data, event_id)` so active
     subscribers emit each frame with its own id instead of the latest global id.
   - Legacy plain queues keep `(event, data)` and use `STREAM_LAST_EVENT_ID` as a
@@ -46,12 +46,15 @@ def test_put_records_event_id_on_exact_generation():
     put_def_idx = STREAMING_PY.find("def put(event, data):")
     assert put_def_idx != -1, "put(event, data) not found in api/streaming.py"
     put_body = STREAMING_PY[put_def_idx:put_def_idx + 2500]
-    assert "journaled = run_journal.append_sse_event(event, data)" in put_body, (
-        "put() must capture append_sse_event return value"
+    assert "stream_generation_publish_run_journal_event(" in put_body, (
+        "put() must authorize and append through the exact generation"
     )
-    assert "stream_generation_note_event_id(generation, event_id)" in put_body, (
-        "put() must bind event_id to the exact generation instead of mutating "
-        "replacement state through the reusable stream_id"
+    assert 'event_id = (' in put_body, (
+        "put() must capture the generation-authorized journal event id"
+    )
+    assert 'state.last_event_id = str(event_id)' in CONFIG_PY, (
+        "publication must bind event_id to generation state before replacement "
+        "can publish through the reusable stream_id"
     )
 
 
@@ -113,4 +116,4 @@ def test_imports_present():
     and routes.py (reader)."""
     assert "STREAM_LAST_EVENT_ID," in STREAMING_PY, "streaming.py must import"
     assert "STREAM_LAST_EVENT_ID," in ROUTES_PY, "routes.py must import"
-    assert "stream_generation_note_event_id," in STREAMING_PY
+    assert "stream_generation_publish_run_journal_event," in STREAMING_PY
