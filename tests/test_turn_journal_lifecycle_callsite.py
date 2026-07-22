@@ -5,9 +5,10 @@ def test_streaming_appends_worker_started_before_running_phase():
     src = Path("api/streaming.py").read_text(encoding="utf-8")
     run_idx = src.index("def _run_agent_streaming(")
     worker_idx = src.index('"event": "worker_started"', run_idx)
-    running_idx = src.index('update_active_run(stream_id, phase="running"', run_idx)
+    update_idx = src.index("if not update_active_run(", run_idx)
+    running_idx = src.index('phase="running"', update_idx)
 
-    assert worker_idx < running_idx
+    assert worker_idx < update_idx < running_idx
 
 
 def test_streaming_appends_assistant_started_before_final_save():
