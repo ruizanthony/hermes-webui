@@ -1,8 +1,8 @@
-"""Fail-closed Git primitives for auditing and collecting linked worktrees.
+"""Fail-closed Git primitives for auditing linked worktrees.
 
 This module deliberately has no dependency on WebUI sessions or models.  Its
 inputs are the Git identities needed to prove whether a linked worktree can be
-removed without discarding local content.
+considered inactive without inspecting file contents.
 """
 
 from __future__ import annotations
@@ -14,13 +14,23 @@ from dataclasses import dataclass
 from pathlib import Path
 
 KEEP_DIRTY = "KEEP_DIRTY"
+KEEP_IGNORED_FILES = "KEEP_IGNORED_FILES"
+KEEP_STALE_METADATA = "KEEP_STALE_METADATA"
 KEEP_UNIQUE_COMMITS = "KEEP_UNIQUE_COMMITS"
 KEEP_UNCERTAIN = "KEEP_UNCERTAIN"
 REMOVE_ANCESTOR = "REMOVE_ANCESTOR"
 REMOVE_PATCH_EQUIVALENT_KEEP_BRANCH = "REMOVE_PATCH_EQUIVALENT_KEEP_BRANCH"
-PRUNE_STALE_METADATA = "PRUNE_STALE_METADATA"
 
 GIT_TIMEOUT = 10
+IGNORED_OUTPUT_LIMIT = 1024 * 1024
+IGNORED_ENTRY_LIMIT = 10_000
+_IGNORED_FILES_ARGS = (
+    "ls-files",
+    "--others",
+    "--ignored",
+    "--exclude-standard",
+    "-z",
+)
 
 _GIT_ENV_KEYS = (
     "GIT_DIR",
@@ -66,6 +76,7 @@ class GitWorktreeDecision:
     listed: bool | None
     dirty: bool | None
     untracked_count: int | None
+    ignored_count: int | None
     ancestor_of_target: bool | None
     cherry_unique_count: int | None
     reasons: tuple[str, ...]
@@ -86,6 +97,7 @@ def _clean_git_env() -> dict[str, str]:
             env.pop(key, None)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     return env
@@ -100,17 +112,72 @@ def _git_argv(args: list[str], hooks_path: str) -> list[str]:
     return argv
 
 
+def _read_only_git_args(args: list[str]) -> bool:
+    command = tuple(args)
+    if command in {
+        ("rev-parse", "--show-toplevel"),
+        ("worktree", "list", "--porcelain"),
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        _IGNORED_FILES_ARGS,
+    }:
+        return True
+    if (
+        len(command) == 5
+        and command[:4]
+        == (
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+        )
+    ):
+        return True
+    if len(command) == 3 and command[:2] == ("check-ref-format", "--branch"):
+        return True
+    if len(command) == 4 and command[:2] == ("merge-base", "--is-ancestor"):
+        return True
+    if (
+        len(command) == 4
+        and command[:3] == ("show-ref", "--verify", "--quiet")
+    ):
+        return True
+    return len(command) == 3 and command[0] == "cherry"
+
+
 def _run_git(
     args: list[str],
     cwd: str | Path,
     *,
     timeout: float = GIT_TIMEOUT,
 ) -> subprocess.CompletedProcess[bytes]:
+    if not _read_only_git_args(args):
+        raise _GitInvocationError("git_command_not_allowed")
     hooks_path: str | None = None
     try:
         hooks_path = tempfile.mkdtemp(prefix="hermes-webui-worktree-git-hooks-")
+        argv = _git_argv(args, hooks_path)
+        if tuple(args) == _IGNORED_FILES_ARGS:
+            with tempfile.TemporaryFile() as stdout:
+                result = subprocess.run(
+                    argv,
+                    cwd=str(cwd),
+                    shell=False,
+                    stdout=stdout,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=timeout,
+                    env=_clean_git_env(),
+                )
+                stdout.seek(0)
+                bounded_stdout = stdout.read(IGNORED_OUTPUT_LIMIT + 1)
+            return subprocess.CompletedProcess(
+                result.args,
+                result.returncode,
+                bounded_stdout,
+                b"",
+            )
         return subprocess.run(
-            _git_argv(args, hooks_path),
+            argv,
             cwd=str(cwd),
             shell=False,
             capture_output=True,
@@ -215,25 +282,6 @@ def _verify_branch(repo_root: Path, branch: str | None) -> tuple[str | None, str
     if exists.returncode != 0:
         return None, "branch_missing"
     return branch_ref, None
-
-
-def _branch_exists(repo_root: Path, branch: str | None) -> bool | None:
-    branch_ref, error = _local_branch_ref(branch)
-    if error:
-        return None
-    assert branch_ref is not None
-    try:
-        result = _run_git(
-            ["show-ref", "--verify", "--quiet", branch_ref],
-            repo_root,
-        )
-    except _GitInvocationError:
-        return None
-    if result.returncode == 0:
-        return True
-    if result.returncode == 1:
-        return False
-    return None
 
 
 def _parse_worktree_list(output: bytes) -> list[tuple[Path, str | None]]:
@@ -368,6 +416,34 @@ def _status(repo_path: Path) -> tuple[bool | None, int | None, str | None]:
     return dirty, untracked_count, None
 
 
+def _parse_ignored_paths(output: bytes) -> int:
+    if not output:
+        return 0
+    if len(output) > IGNORED_OUTPUT_LIMIT or not output.endswith(b"\0"):
+        raise ValueError("ignored-file output is invalid")
+    fields = output[:-1].split(b"\0")
+    if (
+        not fields
+        or any(not field for field in fields)
+        or len(fields) > IGNORED_ENTRY_LIMIT
+    ):
+        raise ValueError("ignored-file output is invalid")
+    return len(fields)
+
+
+def _ignored_files(repo_path: Path) -> tuple[int | None, str | None]:
+    try:
+        result = _run_git(list(_IGNORED_FILES_ARGS), repo_path)
+    except _GitInvocationError as exc:
+        return None, exc.code
+    if result.returncode != 0:
+        return None, "ignored_files_failed"
+    try:
+        return _parse_ignored_paths(result.stdout), None
+    except ValueError:
+        return None, "ignored_files_unparseable"
+
+
 def _decision(
     *,
     path: str,
@@ -380,6 +456,7 @@ def _decision(
     listed: bool | None = None,
     dirty: bool | None = None,
     untracked_count: int | None = None,
+    ignored_count: int | None = None,
     ancestor_of_target: bool | None = None,
     cherry_unique_count: int | None = None,
     reasons: tuple[str, ...],
@@ -395,52 +472,11 @@ def _decision(
         listed=listed,
         dirty=dirty,
         untracked_count=untracked_count,
+        ignored_count=ignored_count,
         ancestor_of_target=ancestor_of_target,
         cherry_unique_count=cherry_unique_count,
         reasons=reasons,
     )
-
-
-def refresh_target_ref(
-    repo_root,
-    *,
-    remote: str = "origin",
-    timeout: float = 30,
-) -> tuple[bool, str | None]:
-    """Fetch a configured remote without ever treating uncertainty as success."""
-    raw_repo_root = _input_text(repo_root)
-    if not raw_repo_root:
-        return False, "repo_root_input_invalid"
-    try:
-        repo_path = _resolved_path(raw_repo_root)
-    except (OSError, RuntimeError, ValueError):
-        return False, "repo_root_invalid"
-    repo_error = _verify_repo_root(repo_path)
-    if repo_error:
-        return False, repo_error
-    remote = str(remote or "").strip()
-    if not _valid_ref_input(remote):
-        return False, "remote_invalid"
-    try:
-        remotes = _run_git(["remote"], repo_path, timeout=timeout)
-    except _GitInvocationError as exc:
-        return False, exc.code
-    if remotes.returncode != 0:
-        return False, "remote_list_failed"
-    configured = {os.fsdecode(line) for line in remotes.stdout.splitlines() if line}
-    if remote not in configured:
-        return False, "remote_missing"
-    try:
-        fetched = _run_git(
-            ["fetch", "--no-tags", remote],
-            repo_path,
-            timeout=timeout,
-        )
-    except _GitInvocationError as exc:
-        return False, exc.code
-    if fetched.returncode != 0:
-        return False, "fetch_failed"
-    return True, None
 
 
 def classify_git_worktree(
@@ -495,6 +531,7 @@ def classify_git_worktree(
         "listed": None,
         "dirty": None,
         "untracked_count": None,
+        "ignored_count": None,
         "ancestor_of_target": None,
         "cherry_unique_count": None,
     }
@@ -529,7 +566,7 @@ def classify_git_worktree(
         return result(KEEP_UNCERTAIN, "worktree_branch_mismatch")
     if audit["exists"] is False:
         if listed:
-            return result(PRUNE_STALE_METADATA, "worktree_metadata_stale")
+            return result(KEEP_STALE_METADATA, "worktree_metadata_stale")
         return result(KEEP_UNCERTAIN, "worktree_path_absent")
     if not worktree_path.is_dir():
         return result(KEEP_UNCERTAIN, "worktree_path_not_directory")
@@ -541,11 +578,20 @@ def classify_git_worktree(
     audit["untracked_count"] = untracked_count
     if status_error:
         return result(KEEP_UNCERTAIN, status_error)
+
+    ignored_count, ignored_error = _ignored_files(worktree_path)
+    audit["ignored_count"] = ignored_count
+    if ignored_error:
+        return result(KEEP_UNCERTAIN, ignored_error)
     if dirty:
         reasons = ["dirty_worktree"]
         if untracked_count:
             reasons.append("untracked_files_present")
+        if ignored_count:
+            reasons.append("ignored_files_present")
         return result(KEEP_DIRTY, *reasons)
+    if ignored_count:
+        return result(KEEP_IGNORED_FILES, "ignored_files_present")
 
     try:
         ancestor = _run_git(
@@ -599,183 +645,3 @@ def classify_git_worktree(
             eligible=True,
         )
     return result(KEEP_UNCERTAIN, "cherry_unparseable")
-
-
-def collect_git_worktree(
-    decision: GitWorktreeDecision,
-    *,
-    dry_run: bool = True,
-    delete_ancestor_branch: bool = True,
-) -> dict:
-    """Reclassify and collect one worktree without force or global pruning."""
-    if not isinstance(decision, GitWorktreeDecision):
-        raise TypeError("decision must be a GitWorktreeDecision")
-
-    current = classify_git_worktree(
-        decision.path,
-        decision.branch,
-        decision.repo_root,
-        target_ref=decision.target_ref,
-    )
-    branch_would_be_deleted = (
-        current.verdict == REMOVE_ANCESTOR and bool(delete_ancestor_branch)
-    )
-
-    def result(
-        *,
-        ok: bool,
-        action: str,
-        refused: bool = False,
-        refusal_reason: str | None = None,
-        idempotent: bool = False,
-        removed_worktree: bool = False,
-        branch_deleted: bool = False,
-        branch_kept: bool | None = True,
-        warnings: list[str] | None = None,
-        errors: list[str] | None = None,
-    ) -> dict:
-        return {
-            "ok": ok,
-            "dry_run": bool(dry_run),
-            "refused": refused,
-            "refusal_reason": refusal_reason,
-            "idempotent": idempotent,
-            "action": action,
-            "path": current.path,
-            "branch": current.branch,
-            "initial_verdict": decision.verdict,
-            "current_verdict": current.verdict,
-            "removed_worktree": removed_worktree,
-            "would_remove_worktree": bool(dry_run and current.eligible),
-            "branch_deleted": branch_deleted,
-            "would_delete_branch": bool(dry_run and branch_would_be_deleted),
-            "branch_kept": branch_kept,
-            "warnings": list(warnings or []),
-            "errors": list(errors or []),
-        }
-
-    # A successful previous pass removes both the directory and its exact
-    # worktree-list record.  No mutation remains to protect with a new verdict,
-    # so repeating the same eligible request is a successful no-op.
-    if (
-        decision.eligible
-        and decision.verdict
-        in {REMOVE_ANCESTOR, REMOVE_PATCH_EQUIVALENT_KEEP_BRANCH}
-        and current.exists is False
-        and current.listed is False
-    ):
-        branch_kept = _branch_exists(Path(current.repo_root), current.branch)
-        return result(
-            ok=True,
-            action="already_absent",
-            idempotent=True,
-            branch_kept=branch_kept,
-        )
-
-    if current != decision:
-        return result(
-            ok=False,
-            action="refused",
-            refused=True,
-            refusal_reason="decision_changed",
-        )
-    if (
-        not current.eligible
-        or current.verdict
-        not in {REMOVE_ANCESTOR, REMOVE_PATCH_EQUIVALENT_KEEP_BRANCH}
-    ):
-        return result(
-            ok=False,
-            action="refused",
-            refused=True,
-            refusal_reason="decision_not_eligible",
-        )
-    if dry_run:
-        return result(ok=True, action="dry_run")
-
-    repo_path = Path(current.repo_root)
-    warnings: list[str] = []
-
-    # Git's bookkeeping lock is not the safety boundary.  Unlock is fail-soft;
-    # the fresh classification and non-force remove below remain authoritative.
-    try:
-        unlocked = _run_git(
-            ["worktree", "unlock", current.path],
-            repo_path,
-        )
-        if unlocked.returncode != 0:
-            warnings.append("worktree_unlock_failed")
-    except _GitInvocationError:
-        warnings.append("worktree_unlock_failed")
-
-    try:
-        removed = _run_git(
-            ["worktree", "remove", current.path],
-            repo_path,
-        )
-    except _GitInvocationError:
-        return result(
-            ok=False,
-            action="error",
-            branch_kept=True,
-            warnings=warnings,
-            errors=["worktree_remove_failed"],
-        )
-    if removed.returncode != 0:
-        return result(
-            ok=False,
-            action="error",
-            branch_kept=True,
-            warnings=warnings,
-            errors=["worktree_remove_failed"],
-        )
-
-    if current.verdict == REMOVE_PATCH_EQUIVALENT_KEEP_BRANCH:
-        return result(
-            ok=True,
-            action="removed",
-            removed_worktree=True,
-            branch_kept=True,
-            warnings=warnings,
-        )
-    if not delete_ancestor_branch:
-        return result(
-            ok=True,
-            action="removed",
-            removed_worktree=True,
-            branch_kept=True,
-            warnings=warnings,
-        )
-
-    assert current.branch is not None
-    try:
-        deleted = _run_git(
-            ["branch", "-d", "--", current.branch],
-            repo_path,
-        )
-    except _GitInvocationError:
-        return result(
-            ok=False,
-            action="partial",
-            removed_worktree=True,
-            branch_kept=True,
-            warnings=warnings,
-            errors=["branch_delete_failed"],
-        )
-    if deleted.returncode != 0:
-        return result(
-            ok=False,
-            action="partial",
-            removed_worktree=True,
-            branch_kept=True,
-            warnings=warnings,
-            errors=["branch_delete_failed"],
-        )
-    return result(
-        ok=True,
-        action="removed",
-        removed_worktree=True,
-        branch_deleted=True,
-        branch_kept=False,
-        warnings=warnings,
-    )

@@ -8,14 +8,14 @@ import pytest
 
 from api.worktree_gc_git import (
     KEEP_DIRTY,
+    KEEP_IGNORED_FILES,
+    KEEP_STALE_METADATA,
     KEEP_UNCERTAIN,
     KEEP_UNIQUE_COMMITS,
-    PRUNE_STALE_METADATA,
     REMOVE_ANCESTOR,
     REMOVE_PATCH_EQUIVALENT_KEEP_BRANCH,
     GitWorktreeDecision,
     classify_git_worktree,
-    refresh_target_ref,
 )
 
 
@@ -191,7 +191,172 @@ def test_dirty_or_untracked_content_is_kept(tmp_path, untracked):
     assert decision.eligible is False
     assert decision.dirty is True
     assert decision.untracked_count == (1 if untracked else 0)
+    assert decision.ignored_count == 0
     assert decision.ancestor_of_target is None
+
+
+@pytest.mark.parametrize(
+    "ignored_name",
+    [
+        ".env",
+        "ignored directory/private.txt",
+        "ignored name with spaces.txt",
+        "ignored-newline-directory/ignored-name-with-\n-newline.txt",
+    ],
+)
+def test_ignored_files_are_kept_without_reading_contents(tmp_path, ignored_name):
+    case = make_remote_repo(tmp_path)
+    worktree = add_worktree(case, tmp_path, "gc/ignored")
+    ignored = worktree / ignored_name
+    ignored.parent.mkdir(parents=True, exist_ok=True)
+    ignored.write_text("must remain private\n", encoding="utf-8")
+    (worktree / ".gitignore").write_text(
+        f"/{ignored_name.split('/', 1)[0]}\n",
+        encoding="utf-8",
+    )
+    _git(worktree, "add", ".gitignore")
+    _git(worktree, "commit", "-m", "ignore private file")
+
+    decision = classify_git_worktree(
+        worktree,
+        "gc/ignored",
+        case["repo"],
+    )
+
+    assert decision.verdict == KEEP_IGNORED_FILES
+    assert decision.eligible is False
+    assert decision.dirty is False
+    assert decision.untracked_count == 0
+    assert decision.ignored_count == 1
+    assert decision.reasons == ("ignored_files_present",)
+    assert "must remain private" not in repr(decision)
+
+
+def test_no_ignored_files_reports_zero_and_remains_eligible(tmp_path):
+    case = make_remote_repo(tmp_path)
+    worktree = add_worktree(case, tmp_path, "gc/no-ignored")
+
+    decision = classify_git_worktree(
+        worktree,
+        "gc/no-ignored",
+        case["repo"],
+    )
+
+    assert decision.verdict == REMOVE_ANCESTOR
+    assert decision.eligible is True
+    assert decision.ignored_count == 0
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected_reason"),
+    [
+        (b"unterminated", 0, "ignored_files_unparseable"),
+        (b"", 1, "ignored_files_failed"),
+    ],
+)
+def test_unverifiable_ignored_file_probe_fails_closed(
+    tmp_path,
+    monkeypatch,
+    stdout,
+    returncode,
+    expected_reason,
+):
+    import api.worktree_gc_git as gc_git
+
+    case = make_remote_repo(tmp_path)
+    worktree = add_worktree(case, tmp_path, "gc/ignored-uncertain")
+    real_run_git = gc_git._run_git
+
+    def corrupt_ignored_probe(args, cwd, *, timeout=gc_git.GIT_TIMEOUT):
+        if args == [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ]:
+            return subprocess.CompletedProcess(
+                ["git", *args],
+                returncode,
+                stdout=stdout,
+                stderr=b"private detail",
+            )
+        return real_run_git(args, cwd, timeout=timeout)
+
+    monkeypatch.setattr(gc_git, "_run_git", corrupt_ignored_probe)
+
+    decision = classify_git_worktree(
+        worktree,
+        "gc/ignored-uncertain",
+        case["repo"],
+    )
+
+    assert decision.verdict == KEEP_UNCERTAIN
+    assert decision.eligible is False
+    assert decision.ignored_count is None
+    assert decision.reasons == (expected_reason,)
+    assert "private detail" not in repr(decision)
+
+
+def test_ignored_file_probe_timeout_fails_closed(tmp_path, monkeypatch):
+    import api.worktree_gc_git as gc_git
+
+    case = make_remote_repo(tmp_path)
+    worktree = add_worktree(case, tmp_path, "gc/ignored-timeout")
+    real_run_git = gc_git._run_git
+
+    def timeout_ignored_probe(args, cwd, *, timeout=gc_git.GIT_TIMEOUT):
+        if args == [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ]:
+            raise gc_git._GitInvocationError("git_timeout")
+        return real_run_git(args, cwd, timeout=timeout)
+
+    monkeypatch.setattr(gc_git, "_run_git", timeout_ignored_probe)
+
+    decision = classify_git_worktree(
+        worktree,
+        "gc/ignored-timeout",
+        case["repo"],
+    )
+
+    assert decision.verdict == KEEP_UNCERTAIN
+    assert decision.ignored_count is None
+    assert decision.reasons == ("git_timeout",)
+
+
+def test_ignored_file_probe_output_limit_fails_closed(tmp_path, monkeypatch):
+    import api.worktree_gc_git as gc_git
+
+    case = make_remote_repo(tmp_path)
+    worktree = add_worktree(case, tmp_path, "gc/ignored-output-limit")
+    real_run_git = gc_git._run_git
+
+    def oversized_ignored_probe(args, cwd, *, timeout=gc_git.GIT_TIMEOUT):
+        if args == list(gc_git._IGNORED_FILES_ARGS):
+            return subprocess.CompletedProcess(
+                ["git", *args],
+                0,
+                stdout=b"x" * (gc_git.IGNORED_OUTPUT_LIMIT + 1),
+                stderr=b"",
+            )
+        return real_run_git(args, cwd, timeout=timeout)
+
+    monkeypatch.setattr(gc_git, "_run_git", oversized_ignored_probe)
+
+    decision = classify_git_worktree(
+        worktree,
+        "gc/ignored-output-limit",
+        case["repo"],
+    )
+
+    assert decision.verdict == KEEP_UNCERTAIN
+    assert decision.ignored_count is None
+    assert decision.reasons == ("ignored_files_unparseable",)
 
 
 def test_path_branch_mismatch_fails_closed(tmp_path):
@@ -258,7 +423,7 @@ def test_missing_path_still_listed_is_stale_metadata_audit_only(tmp_path):
         case["repo"],
     )
 
-    assert decision.verdict == PRUNE_STALE_METADATA
+    assert decision.verdict == KEEP_STALE_METADATA
     assert decision.eligible is False
     assert decision.exists is False
     assert decision.listed is True
@@ -363,53 +528,3 @@ def test_status_timeout_fails_closed(tmp_path, monkeypatch):
     assert decision.eligible is False
     assert decision.dirty is None
     assert "git_timeout" in decision.reasons
-
-
-def test_refresh_target_ref_restores_deleted_remote_tracking_ref(tmp_path):
-    case = make_remote_repo(tmp_path)
-    repo = case["repo"]
-    assert isinstance(repo, Path)
-    _git(repo, "update-ref", "-d", "refs/remotes/origin/master")
-    assert _git(
-        repo,
-        "show-ref",
-        "--verify",
-        "refs/remotes/origin/master",
-        check=False,
-    ).returncode != 0
-
-    refreshed, error = refresh_target_ref(repo)
-
-    assert refreshed is True
-    assert error is None
-    assert _git(
-        repo,
-        "show-ref",
-        "--verify",
-        "refs/remotes/origin/master",
-        check=False,
-    ).returncode == 0
-
-
-def test_refresh_target_ref_rejects_unknown_remote(tmp_path):
-    case = make_remote_repo(tmp_path)
-
-    refreshed, error = refresh_target_ref(case["repo"], remote="missing")
-
-    assert refreshed is False
-    assert error == "remote_missing"
-
-
-def test_refresh_target_ref_rejects_missing_repo_before_running_git(monkeypatch):
-    import api.worktree_gc_git as gc_git
-
-    monkeypatch.setattr(
-        gc_git.subprocess,
-        "run",
-        lambda *args, **kwargs: pytest.fail("missing repo_root must not run git"),
-    )
-
-    refreshed, error = refresh_target_ref(None)
-
-    assert refreshed is False
-    assert error == "repo_root_input_invalid"

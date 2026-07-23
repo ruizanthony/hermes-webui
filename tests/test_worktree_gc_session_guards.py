@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from api import worktree_gc_inventory as inventory
 from api.worktree_gc_inventory import (
     HealthProbe,
     ProcessScan,
@@ -34,23 +33,11 @@ class FakeGitDecision:
 
 
 class FakeGitBackend:
-    def __init__(self, refresh_result=(True, None)):
-        self.refresh_result = refresh_result
-        self.refresh_calls = []
+    def __init__(self):
         self.classify_calls = []
-        self.events = []
-
-    def refresh_target_ref(self, repo_root):
-        canonical_repo = str(Path(repo_root).resolve())
-        self.refresh_calls.append(canonical_repo)
-        self.events.append(("refresh", canonical_repo))
-        if isinstance(self.refresh_result, BaseException):
-            raise self.refresh_result
-        return self.refresh_result
 
     def classify_git_worktree(self, path, branch, repo_root, *, target_ref):
         self.classify_calls.append((path, branch, repo_root, target_ref))
-        self.events.append(("classify", path))
         return FakeGitDecision(path, branch, repo_root, target_ref)
 
 
@@ -67,6 +54,7 @@ def _write_session(
         "session_id": session_id,
         "profile": "default",
         "archived": True,
+        "workspace": str(worktree),
         "updated_at": NOW.timestamp() - 30 * 86400,
         "worktree_path": str(worktree),
         "worktree_branch": f"hermes/{session_id}",
@@ -93,10 +81,31 @@ def _empty_process_scan():
     return ProcessScan(available=True, complete=True, process_cwds=())
 
 
-def _rewrite_session(path: Path, **overrides) -> None:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def _write_workspace_session(
+    state_dir: Path,
+    session_id: str,
+    workspace: Path,
+    **overrides,
+) -> Path:
+    sessions = state_dir / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "session_id": session_id,
+        "profile": "default",
+        "archived": True,
+        "workspace": str(workspace),
+        "updated_at": NOW.timestamp() - 30 * 86400,
+        "active_stream_id": None,
+        "pending_user_message": None,
+        "pending_attachments": [],
+        "pending_started_at": None,
+        "messages": [{"role": "user", "content": "private derived content"}],
+        "title": "private derived title",
+    }
     payload.update(overrides)
+    path = sessions / f"{session_id}.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def _audit(state_dir, repo, backend, **kwargs):
@@ -111,23 +120,6 @@ def _audit(state_dir, repo, backend, **kwargs):
         health_url="http://127.0.0.1:8787/health",
         health_probe=_safe_health,
         process_scan=process_scan,
-        now=NOW,
-        **kwargs,
-    )
-
-
-def _revalidate(state_dir, repo, audited_candidate, **kwargs):
-    health_probe = kwargs.pop("health_probe", _safe_health)
-    process_scan_fn = kwargs.pop("process_scan_fn", _empty_process_scan)
-    return inventory.revalidate_managed_worktree_candidate(
-        audited_candidate=audited_candidate,
-        state_dir=state_dir,
-        profile="default",
-        repo_filter=repo,
-        min_age_days=7,
-        health_url="http://127.0.0.1:8787/health",
-        health_probe=health_probe,
-        process_scan_fn=process_scan_fn,
         now=NOW,
         **kwargs,
     )
@@ -312,7 +304,9 @@ def test_health_activity_or_failure_blocks_all_git_classification(
     )
 
     assert backend.classify_calls == []
-    assert report["collection_allowed"] is False
+    assert report["mode"] == "dry-run"
+    assert report["collection_requested"] is False
+    assert report["has_blocking_anomalies"] is True
     assert report["candidates"][0]["verdict"] in {"KEEP_ACTIVE", "KEEP_UNCERTAIN"}
 
 
@@ -338,7 +332,7 @@ def test_incomplete_process_scan_blocks_git_classification(tmp_path):
     )
 
     assert backend.classify_calls == []
-    assert report["collection_allowed"] is False
+    assert report["has_blocking_anomalies"] is True
     assert report["candidates"][0]["verdict"] == "KEEP_UNCERTAIN"
     assert "process_scan_incomplete" in report["candidates"][0]["reasons"]
 
@@ -359,7 +353,7 @@ def test_unreadable_sidecar_blocks_collection_without_exposing_contents(tmp_path
     report = _audit(state_dir, repo, backend)
 
     assert backend.classify_calls == []
-    assert report["collection_allowed"] is False
+    assert report["has_blocking_anomalies"] is True
     assert report["session_scan"]["errors"] == 1
     assert "must-not-leak" not in json.dumps(report)
 
@@ -481,9 +475,190 @@ def test_complete_old_inactive_session_reaches_git_backend(tmp_path):
             "origin/master",
         )
     ]
-    assert report["collection_allowed"] is True
+    assert report["mode"] == "dry-run"
+    assert report["collection_requested"] is False
+    assert "collection_allowed" not in report
     assert report["candidates"][0]["eligible"] is True
     assert report["candidates"][0]["verdict"] == "REMOVE_ANCESTOR"
+
+
+def test_non_archived_fork_without_worktree_fields_blocks_shared_workspace(
+    tmp_path,
+):
+    state_dir = tmp_path / "state"
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    _write_session(state_dir, "managed", worktree, repo)
+    _write_workspace_session(
+        state_dir,
+        "fork",
+        worktree,
+        archived=False,
+    )
+    backend = FakeGitBackend()
+
+    report = _audit(state_dir, repo, backend)
+
+    assert backend.classify_calls == []
+    assert report["candidates"][0]["verdict"] == "KEEP_NOT_ARCHIVED"
+    assert report["candidates"][0]["session_ids"] == ["fork", "managed"]
+    serialized = json.dumps(report)
+    assert "private derived content" not in serialized
+    assert "private derived title" not in serialized
+
+
+def test_recent_archived_duplicate_without_worktree_fields_blocks(tmp_path):
+    state_dir = tmp_path / "state"
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    _write_session(state_dir, "managed", worktree, repo)
+    _write_workspace_session(
+        state_dir,
+        "duplicate",
+        worktree,
+        updated_at=NOW.timestamp() - 2 * 86400,
+    )
+    backend = FakeGitBackend()
+
+    report = _audit(state_dir, repo, backend)
+
+    assert backend.classify_calls == []
+    assert report["candidates"][0]["verdict"] == "KEEP_RECENT"
+    assert report["candidates"][0]["session_ids"] == ["duplicate", "managed"]
+    assert "linked_session_younger_than_min_age" in report["candidates"][0]["reasons"]
+
+
+def test_workspace_prefix_lookalike_does_not_block(tmp_path):
+    state_dir = tmp_path / "state"
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    lookalike = tmp_path / "worktree-copy"
+    repo.mkdir()
+    worktree.mkdir()
+    lookalike.mkdir()
+    _write_session(state_dir, "managed", worktree, repo)
+    _write_workspace_session(
+        state_dir,
+        "lookalike",
+        lookalike,
+        archived=False,
+        active_stream_id="active",
+    )
+    backend = FakeGitBackend()
+
+    report = _audit(state_dir, repo, backend)
+
+    assert len(backend.classify_calls) == 1
+    assert report["candidates"][0]["verdict"] == "REMOVE_ANCESTOR"
+    assert report["candidates"][0]["session_ids"] == ["managed"]
+
+
+def test_descendant_workspace_blocks(tmp_path):
+    state_dir = tmp_path / "state"
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    descendant = worktree / "nested" / "project"
+    repo.mkdir()
+    descendant.mkdir(parents=True)
+    _write_session(state_dir, "managed", worktree, repo)
+    _write_workspace_session(
+        state_dir,
+        "descendant",
+        descendant,
+        archived=False,
+    )
+    backend = FakeGitBackend()
+
+    report = _audit(state_dir, repo, backend)
+
+    assert backend.classify_calls == []
+    assert report["candidates"][0]["verdict"] == "KEEP_NOT_ARCHIVED"
+    assert report["candidates"][0]["session_ids"] == ["descendant", "managed"]
+
+
+def test_different_profile_shared_workspace_does_not_block(tmp_path):
+    state_dir = tmp_path / "state"
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    _write_session(state_dir, "managed", worktree, repo)
+    _write_workspace_session(
+        state_dir,
+        "other-profile",
+        worktree,
+        profile="other",
+        archived=False,
+        active_stream_id="active",
+    )
+    backend = FakeGitBackend()
+
+    report = _audit(state_dir, repo, backend)
+
+    assert len(backend.classify_calls) == 1
+    assert report["candidates"][0]["verdict"] == "REMOVE_ANCESTOR"
+    assert report["candidates"][0]["session_ids"] == ["managed"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"active_stream_id": "stream"},
+        {"pending_user_message": "queued"},
+        {"pending_attachments": [{"name": "private.txt"}]},
+        {"pending_started_at": NOW.timestamp()},
+    ],
+)
+def test_linked_workspace_activity_blocks(tmp_path, overrides):
+    state_dir = tmp_path / "state"
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    _write_session(state_dir, "managed", worktree, repo)
+    _write_workspace_session(
+        state_dir,
+        "active-derived",
+        worktree,
+        **overrides,
+    )
+    backend = FakeGitBackend()
+
+    report = _audit(state_dir, repo, backend)
+
+    assert backend.classify_calls == []
+    assert report["candidates"][0]["verdict"] == "KEEP_ACTIVE"
+    assert report["candidates"][0]["session_ids"] == [
+        "active-derived",
+        "managed",
+    ]
+    assert "private.txt" not in json.dumps(report)
+
+
+def test_linked_workspace_invalid_date_is_uncertain(tmp_path):
+    state_dir = tmp_path / "state"
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    _write_session(state_dir, "managed", worktree, repo)
+    _write_workspace_session(
+        state_dir,
+        "invalid-date",
+        worktree,
+        updated_at="not-a-date",
+    )
+    backend = FakeGitBackend()
+
+    report = _audit(state_dir, repo, backend)
+
+    assert backend.classify_calls == []
+    assert report["candidates"][0]["verdict"] == "KEEP_UNCERTAIN"
+    assert "linked_session_invalid_or_missing_age" in report["candidates"][0]["reasons"]
 
 
 def test_creation_lock_pid_alone_does_not_count_as_activity(tmp_path):
@@ -505,224 +680,3 @@ def test_creation_lock_pid_alone_does_not_count_as_activity(tmp_path):
 
     assert len(backend.classify_calls) == 1
     assert report["candidates"][0]["verdict"] == "REMOVE_ANCESTOR"
-
-
-def test_target_ref_is_refreshed_once_before_multiple_classifications(tmp_path):
-    state_dir = tmp_path / "state"
-    repo = tmp_path / "repo"
-    worktrees = tmp_path / "worktrees"
-    repo.mkdir()
-    worktrees.mkdir()
-    _write_session(state_dir, "candidate-a", worktrees / "candidate-a", repo)
-    _write_session(state_dir, "candidate-b", worktrees / "candidate-b", repo)
-    backend = FakeGitBackend()
-
-    report = _audit(state_dir, repo, backend)
-
-    assert backend.refresh_calls == [str(repo.resolve())]
-    assert backend.events[0] == ("refresh", str(repo.resolve()))
-    assert [event[0] for event in backend.events[1:]] == [
-        "classify",
-        "classify",
-    ]
-    assert report["counts"]["eligible"] == 2
-
-
-class _BackendWithoutRefresh:
-    def __init__(self):
-        self.classify_calls = []
-
-    def classify_git_worktree(self, path, branch, repo_root, *, target_ref):
-        self.classify_calls.append((path, branch, repo_root, target_ref))
-        return FakeGitDecision(path, branch, repo_root, target_ref)
-
-
-@pytest.mark.parametrize(
-    "backend",
-    [
-        FakeGitBackend(refresh_result=(False, "fetch failed: private stderr")),
-        FakeGitBackend(
-            refresh_result=RuntimeError("fetch failed: private stderr")
-        ),
-        _BackendWithoutRefresh(),
-        FakeGitBackend(refresh_result={"ok": True}),
-        FakeGitBackend(refresh_result=(True, "unexpected detail")),
-    ],
-    ids=[
-        "reported-failure",
-        "exception",
-        "method-absent",
-        "invalid-shape",
-        "invalid-success-detail",
-    ],
-)
-def test_target_refresh_failure_is_global_sanitized_and_fail_closed(
-    tmp_path,
-    backend,
-):
-    state_dir = tmp_path / "state"
-    repo = tmp_path / "repo"
-    worktree = tmp_path / "worktree"
-    repo.mkdir()
-    worktree.mkdir()
-    _write_session(state_dir, "refresh-guarded", worktree, repo)
-
-    report = _audit(state_dir, repo, backend)
-
-    assert report["collection_allowed"] is False
-    assert report["global_reasons"] == ["target_refresh_failed"]
-    assert report["counts"]["eligible"] == 0
-    assert all(not candidate["eligible"] for candidate in report["candidates"])
-    assert backend.classify_calls == []
-    assert "private stderr" not in json.dumps(report)
-
-
-def test_revalidation_refuses_session_unarchived_after_audit(tmp_path):
-    state_dir = tmp_path / "state"
-    repo = tmp_path / "repo"
-    worktree = tmp_path / "worktree"
-    repo.mkdir()
-    worktree.mkdir()
-    sidecar = _write_session(state_dir, "unarchived", worktree, repo)
-    report = _audit(state_dir, repo, FakeGitBackend())
-    _rewrite_session(sidecar, archived=False)
-
-    result = _revalidate(state_dir, repo, report["candidates"][0])
-
-    assert result.allowed is False
-    assert result.global_guard is False
-    assert result.reason == "candidate_runtime_guard"
-    assert result.candidate_reasons == ("session_not_archived",)
-
-
-@pytest.mark.parametrize(
-    ("overrides", "expected_reason"),
-    [
-        ({"active_stream_id": "new-stream"}, "active_stream"),
-        ({"pending_user_message": "new pending text"}, "pending_user_message"),
-        (
-            {"pending_attachments": [{"name": "private.txt"}]},
-            "pending_attachments",
-        ),
-        ({"pending_started_at": NOW.timestamp()}, "pending_started_at"),
-    ],
-)
-def test_revalidation_refuses_pending_or_stream_appearing_after_audit(
-    tmp_path,
-    overrides,
-    expected_reason,
-):
-    state_dir = tmp_path / "state"
-    repo = tmp_path / "repo"
-    worktree = tmp_path / "worktree"
-    repo.mkdir()
-    worktree.mkdir()
-    sidecar = _write_session(state_dir, "became-active", worktree, repo)
-    report = _audit(state_dir, repo, FakeGitBackend())
-    _rewrite_session(sidecar, **overrides)
-
-    result = _revalidate(state_dir, repo, report["candidates"][0])
-
-    assert result.allowed is False
-    assert result.global_guard is False
-    assert result.reason == "candidate_runtime_guard"
-    assert expected_reason in result.candidate_reasons
-
-
-def test_revalidation_refuses_candidate_that_became_too_recent_after_audit(
-    tmp_path,
-):
-    state_dir = tmp_path / "state"
-    repo = tmp_path / "repo"
-    worktree = tmp_path / "worktree"
-    repo.mkdir()
-    worktree.mkdir()
-    sidecar = _write_session(state_dir, "age-changed", worktree, repo)
-    report = _audit(state_dir, repo, FakeGitBackend())
-    _rewrite_session(
-        sidecar,
-        worktree_created_at=NOW.timestamp() - 86400,
-    )
-
-    result = _revalidate(state_dir, repo, report["candidates"][0])
-
-    assert result.allowed is False
-    assert result.global_guard is False
-    assert result.reason == "candidate_runtime_guard"
-    assert result.candidate_reasons == ("younger_than_min_age",)
-
-
-@pytest.mark.parametrize(
-    "health",
-    [
-        HealthProbe(False, None, "private connection detail"),
-        HealthProbe(True, 1),
-    ],
-    ids=["unreachable", "active-run"],
-)
-def test_revalidation_makes_health_regression_a_global_guard(
-    tmp_path,
-    health,
-):
-    state_dir = tmp_path / "state"
-    repo = tmp_path / "repo"
-    worktree = tmp_path / "worktree"
-    repo.mkdir()
-    worktree.mkdir()
-    _write_session(state_dir, "health-changed", worktree, repo)
-    report = _audit(state_dir, repo, FakeGitBackend())
-
-    result = _revalidate(
-        state_dir,
-        repo,
-        report["candidates"][0],
-        health_probe=lambda _url: health,
-    )
-
-    assert result.allowed is False
-    assert result.global_guard is True
-    assert result.reason == "global_runtime_guard"
-    assert result.global_reasons in {
-        ("health_unavailable",),
-        ("active_runs",),
-    }
-    assert "private connection detail" not in repr(result)
-
-
-@pytest.mark.parametrize("changed_field", ["branch", "repo", "path", "session_ids"])
-def test_revalidation_refuses_candidate_identity_changed_after_audit(
-    tmp_path,
-    changed_field,
-):
-    state_dir = tmp_path / "state"
-    repo = tmp_path / "repo"
-    other_repo = tmp_path / "other-repo"
-    worktree = tmp_path / "worktree"
-    other_worktree = tmp_path / "other-worktree"
-    repo.mkdir()
-    other_repo.mkdir()
-    worktree.mkdir()
-    other_worktree.mkdir()
-    sidecar = _write_session(state_dir, "identity", worktree, repo)
-    report = _audit(state_dir, repo, FakeGitBackend())
-    if changed_field == "branch":
-        _rewrite_session(sidecar, worktree_branch="hermes/changed")
-    elif changed_field == "repo":
-        _rewrite_session(sidecar, worktree_repo_root=str(other_repo))
-    elif changed_field == "path":
-        _rewrite_session(sidecar, worktree_path=str(other_worktree))
-    else:
-        _write_session(
-            state_dir,
-            "identity-duplicate",
-            worktree,
-            repo,
-            worktree_branch="hermes/identity",
-        )
-
-    result = _revalidate(state_dir, repo, report["candidates"][0])
-
-    assert result.allowed is False
-    assert result.global_guard is False
-    assert result.reason == "candidate_runtime_guard"
-    assert result.candidate_reasons == ("candidate_identity_changed",)

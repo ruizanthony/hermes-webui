@@ -1,17 +1,10 @@
 import errno
-import json
 import os
 from pathlib import Path
 
 import pytest
 
-from api import worktree_gc_inventory as inventory
-from api.worktree_gc_inventory import (
-    HealthProbe,
-    ProcessCwd,
-    ProcessScan,
-    scan_process_cwds,
-)
+from api.worktree_gc_inventory import scan_process_cwds
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -25,7 +18,9 @@ def _proc_cwd(proc_root: Path, pid: int, cwd: Path) -> None:
     os.symlink(cwd, pid_dir / "cwd")
 
 
-def test_process_scan_blocks_exact_and_descendant_cwds_but_not_prefix_lookalike(tmp_path):
+def test_process_scan_blocks_exact_and_descendant_cwds_but_not_prefix_lookalike(
+    tmp_path,
+):
     proc_root = tmp_path / "proc"
     worktree = tmp_path / "worktrees" / "feature"
     child = worktree / "nested"
@@ -95,105 +90,3 @@ def test_unreadable_pid_cwd_makes_scan_incomplete(tmp_path, monkeypatch):
     assert scan.available is True
     assert scan.complete is False
     assert scan.unreadable_count == 1
-
-
-def _write_archived_session(
-    state_dir: Path,
-    repo: Path,
-    worktree: Path,
-) -> dict:
-    sessions = state_dir / "sessions"
-    sessions.mkdir(parents=True)
-    payload = {
-        "session_id": "process-race",
-        "profile": "default",
-        "archived": True,
-        "updated_at": 1_700_000_000,
-        "worktree_path": str(worktree),
-        "worktree_branch": "hermes/process-race",
-        "worktree_repo_root": str(repo),
-        "worktree_created_at": 1_700_000_000,
-        "active_stream_id": None,
-        "pending_user_message": None,
-        "pending_attachments": [],
-        "pending_started_at": None,
-    }
-    (sessions / "process-race.json").write_text(
-        json.dumps(payload),
-        encoding="utf-8",
-    )
-    return {
-        "session_id": "process-race",
-        "session_ids": ["process-race"],
-        "profile": "default",
-        "worktree_path": str(worktree.resolve()),
-        "worktree_branch": "hermes/process-race",
-        "worktree_repo_root": str(repo.resolve()),
-        "worktree_created_at": 1_700_000_000.0,
-        "age_days": 900.0,
-        "age_source": "worktree_created_at",
-        "verdict": "REMOVE_ANCESTOR",
-        "eligible": True,
-        "reasons": ["branch_is_ancestor"],
-    }
-
-
-def test_revalidation_refuses_process_cwd_appearing_after_audit(tmp_path):
-    state_dir = tmp_path / "state"
-    repo = tmp_path / "repo"
-    worktree = tmp_path / "worktree"
-    repo.mkdir()
-    worktree.mkdir()
-    audited = _write_archived_session(state_dir, repo, worktree)
-
-    result = inventory.revalidate_managed_worktree_candidate(
-        audited_candidate=audited,
-        state_dir=state_dir,
-        profile="default",
-        repo_filter=repo,
-        min_age_days=7,
-        health_url="http://127.0.0.1:8787/health",
-        health_probe=lambda _url: HealthProbe(True, 0),
-        process_scan_fn=lambda: ProcessScan(
-            available=True,
-            complete=True,
-            process_cwds=(ProcessCwd(999, str(worktree)),),
-        ),
-        now=1_780_000_000,
-    )
-
-    assert result.allowed is False
-    assert result.global_guard is False
-    assert result.reason == "candidate_runtime_guard"
-    assert result.candidate_reasons == ("process_cwd_in_worktree",)
-
-
-def test_revalidation_makes_incomplete_process_scan_a_global_guard(tmp_path):
-    state_dir = tmp_path / "state"
-    repo = tmp_path / "repo"
-    worktree = tmp_path / "worktree"
-    repo.mkdir()
-    worktree.mkdir()
-    audited = _write_archived_session(state_dir, repo, worktree)
-
-    result = inventory.revalidate_managed_worktree_candidate(
-        audited_candidate=audited,
-        state_dir=state_dir,
-        profile="default",
-        repo_filter=repo,
-        min_age_days=7,
-        health_url="http://127.0.0.1:8787/health",
-        health_probe=lambda _url: HealthProbe(True, 0),
-        process_scan_fn=lambda: ProcessScan(
-            available=True,
-            complete=False,
-            process_cwds=(),
-            unreadable_count=1,
-        ),
-        now=1_780_000_000,
-    )
-
-    assert result.allowed is False
-    assert result.global_guard is True
-    assert result.reason == "global_runtime_guard"
-    assert result.global_reasons == ("process_scan_incomplete",)
