@@ -10,7 +10,6 @@ from api.worktree_gc_inventory import (
     HealthProbe,
     ProcessScan,
     audit_managed_worktrees,
-    revalidate_managed_worktree_candidate,
 )
 from scripts import worktree_gc as cli
 from tests.test_worktree_gc_git_classification import (
@@ -25,14 +24,6 @@ def _audit_without_host_activity(**kwargs):
         **kwargs,
         health_probe=lambda _url: HealthProbe(True, 0),
         process_scan=ProcessScan(True, True, ()),
-    )
-
-
-def _revalidate_without_host_activity(**kwargs):
-    return revalidate_managed_worktree_candidate(
-        **kwargs,
-        health_probe=lambda _url: HealthProbe(True, 0),
-        process_scan_fn=lambda: ProcessScan(True, True, ()),
     )
 
 
@@ -53,6 +44,7 @@ def _write_archived_sidecar(
                 "session_id": session_id,
                 "profile": "default",
                 "archived": True,
+                "workspace": str(worktree),
                 "worktree_path": str(worktree),
                 "worktree_branch": branch,
                 "worktree_repo_root": str(repo),
@@ -68,12 +60,31 @@ def _write_archived_sidecar(
     )
 
 
-def test_real_git_backend_dry_run_then_collects_archived_ancestor(tmp_path):
+def _branch_exists(repo: Path, branch: str) -> bool:
+    return (
+        _git(
+            repo,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def test_real_git_audit_never_mutates_eligible_or_ignored_worktree(tmp_path):
     case = make_remote_repo(tmp_path)
     repo = case["repo"]
     assert isinstance(repo, Path)
+    (repo / ".gitignore").write_text("/.env\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore local environment")
+    _git(repo, "push", "origin", "master")
+
     branch = "gc/integration-ancestor"
-    worktree = add_worktree(case, tmp_path, branch)
+    worktree = add_worktree(case, tmp_path, branch, start="origin/master")
     state_dir = tmp_path / "state"
     report_path = tmp_path / "reports" / "worktree-gc.json"
     _write_archived_sidecar(
@@ -83,7 +94,6 @@ def test_real_git_backend_dry_run_then_collects_archived_ancestor(tmp_path):
         branch=branch,
         repo=repo,
     )
-
     common_args = [
         "--repo",
         str(repo),
@@ -95,63 +105,44 @@ def test_real_git_backend_dry_run_then_collects_archived_ancestor(tmp_path):
         str(report_path),
         "--min-age-days",
         "7",
+        "--json",
     ]
 
-    dry_run_stdout = io.StringIO()
-    dry_run_rc = cli.main(
-        [*common_args, "--dry-run", "--json"],
+    eligible_stdout = io.StringIO()
+    eligible_rc = cli.main(
+        common_args,
         git_backend=git_backend,
         audit_fn=_audit_without_host_activity,
-        revalidate_fn=_revalidate_without_host_activity,
-        stdout=dry_run_stdout,
+        stdout=eligible_stdout,
     )
-    dry_run_report = json.loads(dry_run_stdout.getvalue())
+    eligible_report = json.loads(eligible_stdout.getvalue())
 
-    assert dry_run_rc == 0
-    assert dry_run_report["mode"] == "dry-run"
-    assert dry_run_report["collection_allowed"] is True
-    assert dry_run_report["counts"]["eligible"] == 1
-    assert dry_run_report["candidates"][0]["verdict"] == "REMOVE_ANCESTOR"
+    assert eligible_rc == 0
+    assert eligible_report["mode"] == "dry-run"
+    assert eligible_report["collection_requested"] is False
+    assert "collection" not in eligible_report
+    assert eligible_report["counts"]["eligible"] == 1
+    assert eligible_report["candidates"][0]["verdict"] == "REMOVE_ANCESTOR"
     assert worktree.is_dir()
-    assert _git(
-        repo,
-        "show-ref",
-        "--verify",
-        "--quiet",
-        f"refs/heads/{branch}",
-        check=False,
-    ).returncode == 0
+    assert _branch_exists(repo, branch)
 
-    collect_stdout = io.StringIO()
-    collect_rc = cli.main(
-        [*common_args, "--collect", "--json"],
+    (worktree / ".env").write_text("PRIVATE=must-not-be-read\n", encoding="utf-8")
+    ignored_stdout = io.StringIO()
+    ignored_rc = cli.main(
+        common_args,
         git_backend=git_backend,
         audit_fn=_audit_without_host_activity,
-        revalidate_fn=_revalidate_without_host_activity,
-        stdout=collect_stdout,
+        stdout=ignored_stdout,
     )
-    collect_report = json.loads(collect_stdout.getvalue())
+    ignored_report = json.loads(ignored_stdout.getvalue())
     persisted_report = json.loads(report_path.read_text(encoding="utf-8"))
 
-    assert collect_rc == 0
-    assert collect_report == persisted_report
-    assert collect_report["collection"] == {
-        "attempted": 1,
-        "collected": 1,
-        "failed": 0,
-        "skipped": 0,
-    }
-    assert collect_report["candidates"][0]["collection"]["status"] == "collected"
-    result = collect_report["candidates"][0]["collection"]["result"]
-    assert result["removed_worktree"] is True
-    assert result["branch_deleted"] is True
-    assert result["branch_kept"] is False
-    assert not worktree.exists()
-    assert _git(
-        repo,
-        "show-ref",
-        "--verify",
-        "--quiet",
-        f"refs/heads/{branch}",
-        check=False,
-    ).returncode != 0
+    assert ignored_rc == 2
+    assert ignored_report == persisted_report
+    assert ignored_report["mode"] == "dry-run"
+    assert ignored_report["collection_requested"] is False
+    assert ignored_report["candidates"][0]["verdict"] == "KEEP_IGNORED_FILES"
+    assert ignored_report["candidates"][0]["git"]["ignored_count"] == 1
+    assert "must-not-be-read" not in json.dumps(ignored_report)
+    assert worktree.is_dir()
+    assert _branch_exists(repo, branch)

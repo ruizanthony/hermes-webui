@@ -26,6 +26,7 @@ _GIT_REPORT_FIELDS = (
     "listed",
     "dirty",
     "untracked_count",
+    "ignored_count",
     "ancestor_of_target",
     "cherry_unique_count",
     "reasons",
@@ -74,15 +75,6 @@ class HealthProbe:
 
 
 @dataclass(frozen=True)
-class CandidateRevalidation:
-    allowed: bool
-    global_guard: bool
-    reason: str | None
-    global_reasons: tuple[str, ...] = ()
-    candidate_reasons: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
 class ManagedWorktreeCandidate:
     session_id: str
     session_ids: tuple[str, ...]
@@ -97,6 +89,8 @@ class ManagedWorktreeCandidate:
     has_pending_user_message: bool
     has_pending_attachments: bool
     has_pending_started_at: bool
+    linked_session_latest_updated_at: float | None = None
+    linked_session_age_uncertain: bool = False
     uncertainty_reasons: tuple[str, ...] = ()
 
 
@@ -120,8 +114,21 @@ class WorktreeGcDecision:
 @dataclass(frozen=True)
 class _SessionScan:
     candidates: tuple[ManagedWorktreeCandidate, ...]
+    workspace_sessions: tuple[_WorkspaceSession, ...]
     sidecars_scanned: int
     errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _WorkspaceSession:
+    session_id: str
+    workspace: str
+    updated_at: float | None
+    archived: bool
+    has_active_stream: bool
+    has_pending_user_message: bool
+    has_pending_attachments: bool
+    has_pending_started_at: bool
 
 
 def _canonical_path(value: str | os.PathLike[str] | None) -> Path | None:
@@ -347,6 +354,36 @@ def _candidate_from_payload(
     )
 
 
+def _workspace_session_from_payload(
+    payload: dict[str, Any],
+    path: Path,
+    *,
+    profile: str,
+) -> tuple[_WorkspaceSession | None, str | None]:
+    stored_profile = payload["profile"] if "profile" in payload else "default"
+    if stored_profile != profile:
+        return None, None
+    raw_workspace = payload.get("workspace")
+    if raw_workspace is None or raw_workspace == "":
+        return None, None
+    workspace = _canonical_absolute_path(raw_workspace)
+    if workspace is None:
+        return None, "session_workspace_invalid"
+    return (
+        _WorkspaceSession(
+            session_id=_safe_session_id(payload, path),
+            workspace=str(workspace),
+            updated_at=_timestamp(payload.get("updated_at")),
+            archived=payload.get("archived") is True,
+            has_active_stream=bool(payload.get("active_stream_id")),
+            has_pending_user_message=bool(payload.get("pending_user_message")),
+            has_pending_attachments=bool(payload.get("pending_attachments")),
+            has_pending_started_at=payload.get("pending_started_at") is not None,
+        ),
+        None,
+    )
+
+
 def _candidate_conflict_key(candidate: ManagedWorktreeCandidate) -> tuple[Any, ...]:
     return (
         candidate.profile,
@@ -436,6 +473,65 @@ def _deduplicate_candidates(
     return tuple(deduplicated)
 
 
+def _attach_workspace_sessions(
+    candidates: tuple[ManagedWorktreeCandidate, ...],
+    workspace_sessions: list[_WorkspaceSession],
+) -> tuple[ManagedWorktreeCandidate, ...]:
+    result: list[ManagedWorktreeCandidate] = []
+    for candidate in candidates:
+        candidate_path = _canonical_absolute_path(candidate.worktree_path)
+        if candidate_path is None:
+            result.append(candidate)
+            continue
+        linked = [
+            session
+            for session in workspace_sessions
+            if _path_is_within(Path(session.workspace), candidate_path)
+        ]
+        if not linked:
+            result.append(candidate)
+            continue
+        valid_updates = [
+            session.updated_at
+            for session in linked
+            if session.updated_at is not None
+        ]
+        result.append(
+            replace(
+                candidate,
+                session_ids=tuple(
+                    sorted(
+                        set(candidate.session_ids)
+                        | {session.session_id for session in linked}
+                    )
+                ),
+                archived=candidate.archived
+                and all(session.archived for session in linked),
+                has_active_stream=candidate.has_active_stream
+                or any(session.has_active_stream for session in linked),
+                has_pending_user_message=candidate.has_pending_user_message
+                or any(
+                    session.has_pending_user_message for session in linked
+                ),
+                has_pending_attachments=candidate.has_pending_attachments
+                or any(
+                    session.has_pending_attachments for session in linked
+                ),
+                has_pending_started_at=candidate.has_pending_started_at
+                or any(
+                    session.has_pending_started_at for session in linked
+                ),
+                linked_session_latest_updated_at=(
+                    max(valid_updates) if valid_updates else None
+                ),
+                linked_session_age_uncertain=any(
+                    session.updated_at is None for session in linked
+                ),
+            )
+        )
+    return tuple(result)
+
+
 def _scan_managed_worktree_sessions(
     state_dir: str | Path,
     *,
@@ -451,11 +547,17 @@ def _scan_managed_worktree_sessions(
     try:
         paths = sorted(sessions_dir.iterdir(), key=lambda path: path.name)
     except FileNotFoundError:
-        return _SessionScan((), 0, ())
+        return _SessionScan((), (), 0, ())
     except OSError as exc:
-        return _SessionScan((), 0, (f"session_directory_{type(exc).__name__}",))
+        return _SessionScan(
+            (),
+            (),
+            0,
+            (f"session_directory_{type(exc).__name__}",),
+        )
 
     candidates: list[ManagedWorktreeCandidate] = []
+    workspace_sessions: list[_WorkspaceSession] = []
     errors: list[str] = []
     scanned = 0
     for path in paths:
@@ -476,6 +578,15 @@ def _scan_managed_worktree_sessions(
         if not isinstance(payload, dict):
             errors.append("session_sidecar_invalid_payload")
             continue
+        workspace_session, workspace_error = _workspace_session_from_payload(
+            payload,
+            path,
+            profile=profile,
+        )
+        if workspace_error:
+            errors.append(workspace_error)
+        if workspace_session is not None:
+            workspace_sessions.append(workspace_session)
         candidate = _candidate_from_payload(payload, path, profile=profile)
         if candidate is None:
             continue
@@ -491,8 +602,13 @@ def _scan_managed_worktree_sessions(
             if candidate.worktree_repo_root is None
             or Path(candidate.worktree_repo_root) == canonical_filter
         )
+    deduplicated = _attach_workspace_sessions(
+        deduplicated,
+        workspace_sessions,
+    )
     return _SessionScan(
         deduplicated,
+        tuple(workspace_sessions),
         scanned,
         tuple(errors),
     )
@@ -553,159 +669,6 @@ def _now_timestamp(now: datetime | float | int | None) -> float:
     return parsed
 
 
-def revalidate_managed_worktree_candidate(
-    *,
-    audited_candidate: dict[str, Any],
-    state_dir: str | Path,
-    profile: str,
-    repo_filter: str | Path,
-    min_age_days: int,
-    health_url: str,
-    now: datetime | float | int | None = None,
-    health_probe: Callable[[str], HealthProbe] = probe_webui_health,
-    process_scan_fn: Callable[[], ProcessScan] = scan_process_cwds,
-) -> CandidateRevalidation:
-    """Recheck session and runtime guards immediately before one Git mutation."""
-    if (
-        isinstance(min_age_days, bool)
-        or not isinstance(min_age_days, int)
-        or min_age_days < 1
-    ):
-        raise ValueError("min_age_days must be at least 1")
-    canonical_repo = _canonical_repo_filter(repo_filter)
-    if canonical_repo is None:
-        raise ValueError("repo_filter must be a valid, non-root path")
-
-    session_scan = _scan_managed_worktree_sessions(
-        state_dir,
-        profile=profile,
-        repo_filter=canonical_repo,
-    )
-    try:
-        health = health_probe(health_url)
-    except Exception:
-        health = None
-    try:
-        process_snapshot = process_scan_fn()
-    except Exception:
-        process_snapshot = None
-
-    global_reasons: list[str] = []
-    if session_scan.errors:
-        global_reasons.append("session_scan_incomplete")
-    if (
-        not isinstance(process_snapshot, ProcessScan)
-        or process_snapshot.available is not True
-        or process_snapshot.complete is not True
-    ):
-        global_reasons.append("process_scan_incomplete")
-    if (
-        not isinstance(health, HealthProbe)
-        or health.reachable is not True
-        or isinstance(health.active_runs, bool)
-        or not isinstance(health.active_runs, int)
-        or health.active_runs < 0
-    ):
-        global_reasons.append("health_unavailable")
-    elif health.active_runs > 0:
-        global_reasons.append("active_runs")
-    if global_reasons:
-        return CandidateRevalidation(
-            allowed=False,
-            global_guard=True,
-            reason="global_runtime_guard",
-            global_reasons=tuple(dict.fromkeys(global_reasons)),
-        )
-
-    if not isinstance(audited_candidate, dict):
-        audited_candidate = {}
-    audited_path = _canonical_absolute_path(
-        audited_candidate.get("worktree_path")
-    )
-    audited_repo = _canonical_absolute_path(
-        audited_candidate.get("worktree_repo_root")
-    )
-    audited_branch = _valid_branch(audited_candidate.get("worktree_branch"))
-    raw_session_ids = audited_candidate.get("session_ids")
-    if not isinstance(raw_session_ids, (list, tuple)) or not all(
-        isinstance(session_id, str) and session_id
-        for session_id in raw_session_ids
-    ):
-        audited_session_ids: frozenset[str] = frozenset()
-    else:
-        audited_session_ids = frozenset(raw_session_ids)
-
-    current = next(
-        (
-            candidate
-            for candidate in session_scan.candidates
-            if audited_path is not None
-            and candidate.worktree_path == str(audited_path)
-        ),
-        None,
-    )
-    if (
-        current is None
-        or audited_path is None
-        or audited_repo != canonical_repo
-        or audited_branch is None
-        or not audited_session_ids
-        or audited_candidate.get("profile") != profile
-        or current.worktree_path != str(audited_path)
-        or current.worktree_repo_root != str(audited_repo)
-        or current.worktree_branch != audited_branch
-        or frozenset(current.session_ids) != audited_session_ids
-    ):
-        return CandidateRevalidation(
-            allowed=False,
-            global_guard=False,
-            reason="candidate_runtime_guard",
-            candidate_reasons=("candidate_identity_changed",),
-        )
-
-    candidate_reasons = list(current.uncertainty_reasons)
-    if not current.archived:
-        candidate_reasons.append("session_not_archived")
-
-    created_at = _timestamp(current.worktree_created_at)
-    if current.worktree_created_at is None:
-        created_at = _timestamp(current.updated_at)
-    if created_at is None:
-        candidate_reasons.append("invalid_or_missing_age")
-    else:
-        age_days = max(
-            0.0,
-            (_now_timestamp(now) - created_at) / _DAY_SECONDS,
-        )
-        if age_days < min_age_days:
-            candidate_reasons.append("younger_than_min_age")
-
-    if current.has_active_stream:
-        candidate_reasons.append("active_stream")
-    if current.has_pending_user_message:
-        candidate_reasons.append("pending_user_message")
-    if current.has_pending_attachments:
-        candidate_reasons.append("pending_attachments")
-    if current.has_pending_started_at:
-        candidate_reasons.append("pending_started_at")
-    assert process_snapshot is not None
-    if process_snapshot.blocking_process_count(audited_path):
-        candidate_reasons.append("process_cwd_in_worktree")
-
-    if candidate_reasons:
-        return CandidateRevalidation(
-            allowed=False,
-            global_guard=False,
-            reason="candidate_runtime_guard",
-            candidate_reasons=tuple(dict.fromkeys(candidate_reasons)),
-        )
-    return CandidateRevalidation(
-        allowed=True,
-        global_guard=False,
-        reason=None,
-    )
-
-
 def _git_decision_report(decision: Any) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for field in _GIT_REPORT_FIELDS:
@@ -750,7 +713,6 @@ def audit_managed_worktrees(
     now: datetime | float | int | None = None,
     health_probe: Callable[[str], HealthProbe] = probe_webui_health,
     process_scan: ProcessScan | None = None,
-    decision_sink: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Audit managed worktrees and call Git classification only after all guards."""
     if (
@@ -773,16 +735,6 @@ def audit_managed_worktrees(
     )
     process_snapshot = process_scan or scan_process_cwds()
     health = health_probe(health_url)
-    try:
-        refresh_result = git_backend.refresh_target_ref(canonical_repo)
-    except Exception:
-        refresh_result = None
-    target_ref_fresh = (
-        isinstance(refresh_result, tuple)
-        and len(refresh_result) == 2
-        and refresh_result[0] is True
-        and refresh_result[1] is None
-    )
 
     global_reasons: list[str] = []
     if session_scan.errors:
@@ -793,9 +745,6 @@ def audit_managed_worktrees(
         global_reasons.append("health_unavailable")
     elif health.active_runs > 0:
         global_reasons.append("active_runs")
-    if not target_ref_fresh:
-        global_reasons.append("target_refresh_failed")
-    collection_allowed = not global_reasons
 
     decisions: list[WorktreeGcDecision] = []
     for candidate in session_scan.candidates:
@@ -849,8 +798,24 @@ def audit_managed_worktrees(
             uncertain_reasons.append("health_unavailable")
         if "active_runs" in global_reasons:
             active_reasons.append("active_runs")
-        if "target_refresh_failed" in global_reasons:
-            uncertain_reasons.append("target_refresh_failed")
+
+        if candidate.linked_session_age_uncertain:
+            uncertain_reasons.append(
+                "linked_session_invalid_or_missing_age"
+            )
+        elif candidate.linked_session_latest_updated_at is not None:
+            linked_age_days = max(
+                0.0,
+                (
+                    now_timestamp
+                    - candidate.linked_session_latest_updated_at
+                )
+                / _DAY_SECONDS,
+            )
+            if linked_age_days < min_age_days:
+                keep_reasons.append(
+                    "linked_session_younger_than_min_age"
+                )
 
         reasons = tuple(
             dict.fromkeys(uncertain_reasons + active_reasons + keep_reasons)
@@ -906,6 +871,16 @@ def audit_managed_worktrees(
                 )
             )
             continue
+        if "linked_session_younger_than_min_age" in keep_reasons:
+            decisions.append(
+                WorktreeGcDecision(
+                    **common,
+                    verdict="KEEP_RECENT",
+                    eligible=False,
+                    reasons=reasons,
+                )
+            )
+            continue
 
         try:
             git_decision = git_backend.classify_git_worktree(
@@ -916,7 +891,7 @@ def audit_managed_worktrees(
             )
             git_report = _git_decision_report(git_decision)
             verdict = str(git_report.get("verdict") or "KEEP_UNCERTAIN")
-            eligible = bool(git_report.get("eligible")) and collection_allowed
+            eligible = bool(git_report.get("eligible"))
             git_reasons = tuple(str(reason) for reason in git_report.get("reasons", ()))
             if not git_report.get("verdict"):
                 verdict = "KEEP_UNCERTAIN"
@@ -937,24 +912,8 @@ def audit_managed_worktrees(
                 git=git_report,
             )
         )
-        if (
-            eligible
-            and decision_sink is not None
-            and candidate.worktree_path is not None
-            and git_decision is not None
-        ):
-            decision_sink[candidate.worktree_path] = git_decision
-
-    blocking_verdicts = {
-        "KEEP_ACTIVE",
-        "KEEP_DIRTY",
-        "KEEP_UNIQUE_COMMITS",
-        "KEEP_UNCERTAIN",
-    }
     report_candidates = [_decision_report(decision) for decision in decisions]
-    blocking_count = sum(
-        1 for decision in decisions if decision.verdict in blocking_verdicts
-    )
+    blocking_count = sum(1 for decision in decisions if not decision.eligible)
     return {
         "schema_version": 1,
         "generated_at": datetime.fromtimestamp(
@@ -965,7 +924,8 @@ def audit_managed_worktrees(
         "repo": str(canonical_repo),
         "target_ref": target_ref,
         "min_age_days": min_age_days,
-        "collection_allowed": collection_allowed,
+        "mode": "dry-run",
+        "collection_requested": False,
         "global_reasons": global_reasons,
         "health": {
             "reachable": health.reachable,
@@ -1028,6 +988,15 @@ def write_report_atomic(report: dict[str, Any], path: str | Path) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, destination)
+        if os.name != "nt":
+            directory_descriptor = os.open(
+                destination.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
     except Exception:
         try:
             os.close(file_descriptor)
