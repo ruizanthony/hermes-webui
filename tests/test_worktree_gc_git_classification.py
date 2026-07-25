@@ -133,6 +133,41 @@ def test_patch_equivalent_commit_removes_only_worktree(tmp_path):
     assert decision.cherry_unique_count == 0
 
 
+def test_branch_with_merge_commit_fails_closed_before_cherry_equivalence(tmp_path):
+    case = make_remote_repo(tmp_path)
+    repo = case["repo"]
+    assert isinstance(repo, Path)
+    _commit(repo, "other.txt", "other target patch\n", "second target patch")
+    _git(repo, "push", "origin", "master")
+
+    worktree = add_worktree(case, tmp_path, "gc/merge-equivalent")
+    _commit(
+        worktree,
+        "shared.txt",
+        "same patch\n",
+        "equivalent first-parent patch",
+    )
+    side = add_worktree(case, tmp_path, "gc/merge-side")
+    _commit(
+        side,
+        "other.txt",
+        "other target patch\n",
+        "equivalent second-parent patch",
+    )
+    _git(worktree, "merge", "--no-ff", "gc/merge-side", "-m", "merge equivalent parents")
+
+    decision = classify_git_worktree(
+        worktree,
+        "gc/merge-equivalent",
+        repo,
+    )
+
+    assert decision.verdict == KEEP_UNCERTAIN
+    assert decision.eligible is False
+    assert decision.ancestor_of_target is False
+    assert decision.reasons == ("merge_commits_present",)
+
+
 def test_one_unique_cherry_commit_keeps_worktree_and_branch(tmp_path):
     case = make_remote_repo(tmp_path)
     worktree = add_worktree(case, tmp_path, "gc/unique")

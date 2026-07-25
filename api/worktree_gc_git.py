@@ -141,6 +141,11 @@ def _read_only_git_args(args: list[str]) -> bool:
         and command[:3] == ("show-ref", "--verify", "--quiet")
     ):
         return True
+    if (
+        len(command) == 4
+        and command[:3] == ("rev-list", "--merges", "--max-count=1")
+    ):
+        return True
     return len(command) == 3 and command[0] == "cherry"
 
 
@@ -610,6 +615,24 @@ def classify_git_worktree(
     if ancestor.returncode != 1:
         return result(KEEP_UNCERTAIN, "ancestor_check_failed")
     audit["ancestor_of_target"] = False
+
+    try:
+        merges = _run_git(
+            ["rev-list", "--merges", "--max-count=1", f"{target_name}..{branch_ref}"],
+            repo_path,
+        )
+    except _GitInvocationError as exc:
+        return result(KEEP_UNCERTAIN, exc.code)
+    if merges.returncode != 0:
+        return result(KEEP_UNCERTAIN, "merge_commit_check_failed")
+    merge_lines = [line for line in merges.stdout.splitlines() if line]
+    if len(merge_lines) > 1 or any(
+        not line or any(char not in b"0123456789abcdefABCDEF" for char in line)
+        for line in merge_lines
+    ):
+        return result(KEEP_UNCERTAIN, "merge_commit_check_unparseable")
+    if merge_lines:
+        return result(KEEP_UNCERTAIN, "merge_commits_present")
 
     try:
         cherry = _run_git(
