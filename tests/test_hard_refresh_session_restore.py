@@ -10,6 +10,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 SESSIONS_JS = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+BOOT_JS = (REPO_ROOT / "static" / "boot.js").read_text(encoding="utf-8")
 NODE = shutil.which("node")
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -72,3 +73,38 @@ console.log(JSON.stringify({{
         "launchAction": None,
         "keep": "1",
     }
+
+
+def test_stale_new_chat_action_does_not_override_explicit_session_url():
+    source = f"""
+const bootSrc = {BOOT_JS!r};
+function extractFunc(src, name) {{
+  const re = new RegExp('function\\\\s+' + name + '\\\\s*\\\\(');
+  const start = src.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = src.indexOf('{{', start);
+  let depth = 1; i++;
+  while (depth > 0 && i < src.length) {{
+    if (src[i] === '{{') depth++;
+    else if (src[i] === '}}') depth--;
+    i++;
+  }}
+  return src.slice(start, i);
+}}
+globalThis._shouldStartFreshPwaChat = (0, eval)(
+  '(' + extractFunc(bootSrc, '_shouldStartFreshPwaChat') + ')'
+);
+console.log(JSON.stringify({{
+  freshRootLaunch: _shouldStartFreshPwaChat('new-chat', null),
+  staleSessionLaunch: _shouldStartFreshPwaChat('new-chat', 'session-123'),
+  ordinarySessionLoad: _shouldStartFreshPwaChat(null, 'session-123'),
+}}));
+"""
+    payload = _run_node(source)
+
+    assert payload == {
+        "freshRootLaunch": True,
+        "staleSessionLaunch": False,
+        "ordinarySessionLoad": False,
+    }
+    assert "if(_shouldStartFreshPwaChat(pwaLaunchAction,urlSession)){" in BOOT_JS
