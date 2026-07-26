@@ -8,6 +8,7 @@ allowlist reaches synthesis (HTTP 200) and that an unlisted French locale
 import io
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -74,6 +75,14 @@ FRENCH_VOICES = [
     "fr-FR-RemyMultilingualNeural",
     "fr-FR-VivienneMultilingualNeural",
 ]
+
+
+def test_french_voices_appear_in_edge_settings_selector():
+    repo_root = Path(__file__).resolve().parents[1]
+    panels_js = (repo_root / "static" / "panels.js").read_text(encoding="utf-8")
+
+    for voice in FRENCH_VOICES:
+        assert voice in panels_js
 
 
 @pytest.mark.parametrize("voice", FRENCH_VOICES)
