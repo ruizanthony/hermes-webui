@@ -71,6 +71,8 @@ FRENCH_VOICES = [
     "fr-FR-DeniseNeural",
     "fr-FR-EloiseNeural",
     "fr-FR-HenriNeural",
+    "fr-FR-RemyMultilingualNeural",
+    "fr-FR-VivienneMultilingualNeural",
 ]
 
 
