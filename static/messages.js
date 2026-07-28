@@ -6098,6 +6098,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }catch(_){}
     });
 
+    source.addEventListener('iteration_rollover',e=>{
+      // A continuous /validation or /goal crossed a bounded internal budget
+      // segment. Keep this lightweight: the run is healthy and continues.
+      try{
+        const d=JSON.parse(e.data||'{}');
+        if((d.session_id||activeSid)!==activeSid) return;
+        const current=Math.max(2,Number(d.rollover||0)+1);
+        const total=Math.max(current,Number(d.max_rollovers||0)+1);
+        showToast(`Validation continues — segment ${current}/${total}`,4000);
+      }catch(_){}
+    });
+
     source.addEventListener('compressing',e=>{
       // Context auto-compression is starting. Surface the same calm running
       // compression card as manual /compress while the summarizer LLM call runs.

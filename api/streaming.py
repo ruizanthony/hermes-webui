@@ -1492,11 +1492,18 @@ def _continuous_iteration_policy(msg_text, cfg, *, goal_related=False) -> dict:
     """
     config = cfg if isinstance(cfg, dict) else {}
     agent_cfg = config.get('agent') if isinstance(config.get('agent'), dict) else {}
-    raw_base = agent_cfg.get('max_turns', config.get('max_turns', 500))
+    if 'max_turns' in agent_cfg:
+        raw_base = agent_cfg.get('max_turns')
+    elif 'max_turns' in config:
+        raw_base = config.get('max_turns')
+    else:
+        raw_base = None
     try:
-        base_limit = max(1, int(raw_base or 500))
+        base_limit = int(raw_base) if raw_base is not None else None
+        if base_limit is not None and base_limit <= 0:
+            base_limit = None
     except (TypeError, ValueError):
-        base_limit = 500
+        base_limit = None
 
     webui_cfg = config.get('webui') if isinstance(config.get('webui'), dict) else {}
     continuous_cfg = (
@@ -1504,26 +1511,34 @@ def _continuous_iteration_policy(msg_text, cfg, *, goal_related=False) -> dict:
         if isinstance(webui_cfg.get('continuous_turns'), dict)
         else {}
     )
-    enabled_by_config = continuous_cfg.get('enabled', True) is not False
-    command = str(msg_text or '').lstrip().split(None, 1)[0].lower()
-    workflow_enabled = bool(goal_related) or command == '/validation'
-    enabled = bool(enabled_by_config and workflow_enabled)
-
+    enabled_value = continuous_cfg.get('enabled', True)
+    if isinstance(enabled_value, str):
+        enabled_by_config = enabled_value.strip().lower() not in {
+            '', '0', 'false', 'no', 'off', 'none', 'null',
+        }
+    else:
+        enabled_by_config = bool(enabled_value)
+    message_tokens = str(msg_text or '').lstrip().split(None, 1)
+    command = message_tokens[0].lower() if message_tokens else ''
+    enabled = bool(
+        base_limit is not None
+        and enabled_by_config
+        and (goal_related or command == '/validation')
+    )
     try:
         threshold_ratio = float(continuous_cfg.get('threshold_ratio', 0.8))
     except (TypeError, ValueError):
         threshold_ratio = 0.8
     threshold_ratio = min(0.9, max(0.5, threshold_ratio))
-    rollover_at = max(1, int(base_limit * threshold_ratio))
-
     try:
         max_rollovers = int(continuous_cfg.get('max_rollovers', 3))
     except (TypeError, ValueError):
         max_rollovers = 3
     max_rollovers = min(3, max(0, max_rollovers))
+    rollover_at = max(1, int(base_limit * threshold_ratio)) if base_limit is not None else None
     effective_limit = (
-        rollover_at * (max_rollovers + 1)
-        if enabled
+        max(base_limit, rollover_at * (max_rollovers + 1))
+        if enabled and base_limit is not None and rollover_at is not None
         else base_limit
     )
     return {
@@ -1566,7 +1581,12 @@ def _tool_limit_budget_usage(result, policy) -> tuple[int | None, int | None, in
 
 
 def _iteration_rollover_for_step(api_call_count, policy) -> int | None:
-    """Return the 1-based rollover index when a new bounded segment starts."""
+    """Return the rollover before the next API call after a full segment.
+
+    Hermes Agent increments its 1-based ``api_call_count`` immediately before
+    invoking ``step_callback``.  A callback count of 401 therefore means 400
+    provider calls have completed, which is the first 400-call boundary.
+    """
     if not isinstance(policy, dict) or not policy.get('enabled'):
         return None
     try:
@@ -1636,7 +1656,7 @@ def _mark_latest_assistant_tool_limit_status(messages, *, result=None, policy=No
             continue
         msg['_terminal_state'] = 'tool_limit_reached'
         msg['_terminal_reason'] = 'max_iterations'
-        rows = []
+        rows = [{'label': 'State', 'value': 'Limit reached'}]
         if used is not None and limit is not None:
             rows.append({'label': 'Budget', 'value': f'{used}/{limit}'})
         rows.append({'label': 'Work preserved', 'value': 'Yes'})
@@ -1646,11 +1666,11 @@ def _mark_latest_assistant_tool_limit_status(messages, *, result=None, policy=No
                 'value': f"{rollovers}/{int(policy.get('max_rollovers') or 0)}",
             })
         rows.append({'label': 'Next step', 'value': 'Start a new turn to continue.'})
-        msg.setdefault('_statusCard', {
+        msg['_statusCard'] = {
             'title': 'Tool iteration limit reached',
             'subtitle': 'Stopped because the tool iteration limit was reached.',
             'rows': rows,
-        })
+        }
         return True
     return False
 
@@ -8875,29 +8895,39 @@ def _run_agent_streaming(
             if _continuous_iteration_policy_cfg['enabled']:
                 _max_iterations_cfg = _continuous_iteration_policy_cfg['effective_limit']
 
+            _emitted_continuous_rollovers = set()
+
             def _continuous_iteration_step(api_call_count, _prev_tools=None):
-                rollover = _iteration_rollover_for_step(
-                    api_call_count,
-                    _continuous_iteration_policy_cfg,
-                )
-                if rollover is None:
-                    return
-                logger.info(
-                    '[webui] Continuous workflow rollover %d/%d at API call %d for session %s',
-                    rollover,
-                    _continuous_iteration_policy_cfg['max_rollovers'],
-                    api_call_count,
-                    session_id,
-                )
-                put('iteration_rollover', {
-                    'session_id': session_id,
-                    'state': 'continuing',
-                    'rollover': rollover,
-                    'max_rollovers': _continuous_iteration_policy_cfg['max_rollovers'],
-                    'api_calls_completed': api_call_count - 1,
-                    'effective_limit': _continuous_iteration_policy_cfg['effective_limit'],
-                    'work_preserved': True,
-                })
+                try:
+                    rollover = _iteration_rollover_for_step(
+                        api_call_count,
+                        _continuous_iteration_policy_cfg,
+                    )
+                    if rollover is None or rollover in _emitted_continuous_rollovers:
+                        return
+                    _emitted_continuous_rollovers.add(rollover)
+                    logger.info(
+                        '[webui] Continuous workflow rollover %d/%d at API call %d for session %s',
+                        rollover,
+                        _continuous_iteration_policy_cfg['max_rollovers'],
+                        api_call_count,
+                        session_id,
+                    )
+                    put('iteration_rollover', {
+                        'session_id': session_id,
+                        'state': 'continuing',
+                        'rollover': rollover,
+                        'max_rollovers': _continuous_iteration_policy_cfg['max_rollovers'],
+                        'api_calls_completed': api_call_count - 1,
+                        'effective_limit': _continuous_iteration_policy_cfg['effective_limit'],
+                        'work_preserved': True,
+                    })
+                except Exception:
+                    logger.debug(
+                        '[webui] Failed to publish continuous workflow rollover for session %s',
+                        session_id,
+                        exc_info=True,
+                    )
 
             # CLI-parity max output cap: read config.yaml's max_tokens and pass
             # it to AIAgent when supported. Without this WebUI-created agents use
@@ -9094,8 +9124,7 @@ def _run_agent_streaming(
                         agent.tool_complete_callback = _agent_kwargs.get('tool_complete_callback')
                     if hasattr(agent, 'status_callback'):
                         agent.status_callback = _agent_kwargs.get('status_callback')
-                    if hasattr(agent, 'step_callback'):
-                        agent.step_callback = _agent_kwargs.get('step_callback')
+
                     if hasattr(agent, 'interim_assistant_callback'):
                         agent.interim_assistant_callback = _agent_kwargs.get('interim_assistant_callback')
                     if hasattr(agent, 'reasoning_callback'):
@@ -9119,6 +9148,8 @@ def _run_agent_streaming(
                             agent, _session_db
                         )
                         agent._session_db = _session_db
+                    if hasattr(agent, 'step_callback'):
+                        agent.step_callback = _agent_kwargs.get('step_callback')
                     if hasattr(agent, '_api_call_count'):
                         agent._api_call_count = 0
                     # Reset interrupt state from a prior cancel so the reused
