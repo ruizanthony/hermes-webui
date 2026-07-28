@@ -226,8 +226,9 @@ jobs:
           # who run the MCP integration install it themselves; CI installs
           # it so test coverage exists. If mcp install fails (Python 3.13
           # wheel not yet available, etc.), tests/test_mcp_server.py uses
-          # importorskip and the matrix stays green.
-          pip install mcp || echo "mcp install failed — test_mcp_server.py will importorskip"
+          # importorskip and the matrix stays green. Keep the v1 SDK until
+          # mcp_server.py is migrated away from its Server decorator API.
+          pip install "mcp<2" || echo "mcp install failed — test_mcp_server.py will importorskip"
 
       - name: Get Playwright version
         if: needs.changes.outputs.docs_only != 'true'
