@@ -1481,7 +1481,13 @@ def _agent_result_tool_limit_reached(result) -> bool:
     return False
 
 
-def _continuous_iteration_policy(msg_text, cfg, *, goal_related=False) -> dict:
+def _continuous_iteration_policy(
+    msg_text,
+    cfg,
+    *,
+    goal_related=False,
+    active_goal=False,
+) -> dict:
     """Resolve a bounded larger budget for explicitly continuous workflows.
 
     Ordinary chat keeps the configured ``agent.max_turns`` limit.  Only
@@ -1506,12 +1512,14 @@ def _continuous_iteration_policy(msg_text, cfg, *, goal_related=False) -> dict:
         base_limit = None
 
     webui_cfg = config.get('webui') if isinstance(config.get('webui'), dict) else {}
-    continuous_cfg = (
-        webui_cfg.get('continuous_turns')
-        if isinstance(webui_cfg.get('continuous_turns'), dict)
-        else {}
+    _missing = object()
+    continuous_value = webui_cfg.get('continuous_turns', _missing)
+    continuous_cfg = continuous_value if isinstance(continuous_value, dict) else {}
+    enabled_value = (
+        continuous_cfg.get('enabled', True)
+        if isinstance(continuous_value, dict) or continuous_value is _missing
+        else continuous_value
     )
-    enabled_value = continuous_cfg.get('enabled', True)
     if isinstance(enabled_value, str):
         enabled_by_config = enabled_value.strip().lower() not in {
             '', '0', 'false', 'no', 'off', 'none', 'null',
@@ -1523,7 +1531,7 @@ def _continuous_iteration_policy(msg_text, cfg, *, goal_related=False) -> dict:
     enabled = bool(
         base_limit is not None
         and enabled_by_config
-        and (goal_related or command == '/validation')
+        and ((goal_related and active_goal) or command == '/validation')
     )
     try:
         threshold_ratio = float(continuous_cfg.get('threshold_ratio', 0.8))
@@ -1535,7 +1543,11 @@ def _continuous_iteration_policy(msg_text, cfg, *, goal_related=False) -> dict:
     except (TypeError, ValueError):
         max_rollovers = 3
     max_rollovers = min(3, max(0, max_rollovers))
-    rollover_at = max(1, int(base_limit * threshold_ratio)) if base_limit is not None else None
+    rollover_at = (
+        max(1, int(base_limit * threshold_ratio + 0.5))
+        if base_limit is not None
+        else None
+    )
     effective_limit = (
         max(base_limit, rollover_at * (max_rollovers + 1))
         if enabled and base_limit is not None and rollover_at is not None
@@ -8887,11 +8899,26 @@ def _run_agent_streaming(
             except Exception:
                 _max_iterations_cfg = None
 
+            _continuous_goal_active = False
+            if goal_related:
+                try:
+                    from api.goals import has_active_goal as _has_active_goal
+                    _continuous_goal_active = bool(
+                        _has_active_goal(session_id, profile_home=_profile_home)
+                    )
+                except Exception:
+                    logger.debug(
+                        '[webui] Could not resolve active goal for continuous budget in session %s',
+                        session_id,
+                        exc_info=True,
+                    )
             _continuous_iteration_policy_cfg = _continuous_iteration_policy(
                 msg_text,
                 _cfg,
                 goal_related=goal_related,
+                active_goal=_continuous_goal_active,
             )
+            _base_max_iterations_cfg = _continuous_iteration_policy_cfg['base_limit']
             if _continuous_iteration_policy_cfg['enabled']:
                 _max_iterations_cfg = _continuous_iteration_policy_cfg['effective_limit']
 
@@ -9046,7 +9073,7 @@ def _run_agent_streaming(
                     _rt.get('command') or '',
                     _rt.get('args') or [],
                     bool(_credential_pool),
-                    _max_iterations_cfg or '',
+                    str(_base_max_iterations_cfg or ''),
                     _max_tokens_cfg or '',
                     _fallback_resolved or {},
                     sorted(_toolsets) if _toolsets else [],
@@ -9150,6 +9177,8 @@ def _run_agent_streaming(
                         agent._session_db = _session_db
                     if hasattr(agent, 'step_callback'):
                         agent.step_callback = _agent_kwargs.get('step_callback')
+                    if _max_iterations_cfg is not None and hasattr(agent, 'max_iterations'):
+                        agent.max_iterations = _max_iterations_cfg
                     if hasattr(agent, '_api_call_count'):
                         agent._api_call_count = 0
                     # Reset interrupt state from a prior cancel so the reused

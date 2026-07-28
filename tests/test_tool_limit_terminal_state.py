@@ -73,6 +73,7 @@ def _run_streaming_with_fake_agent(
                 agent_kwargs_out["max_iterations"] = max_iterations
                 agent_kwargs_out["step_callback"] = step_callback
             self.session_id = kwargs.get("session_id")
+            self.max_iterations = max_iterations
             self.step_callback = step_callback
             self.stream_delta_callback = kwargs.get("stream_delta_callback")
             self.context_compressor = None
@@ -102,6 +103,7 @@ def _run_streaming_with_fake_agent(
         m.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
         m.setattr(streaming, "resolve_model_provider", lambda *_args, **_kwargs: ("gpt-4o", "openai", None))
         m.setattr(streaming, "get_config", lambda *_args, **_kwargs: dict(config or {}))
+        m.setattr("api.config.get_config", lambda *_args, **_kwargs: dict(config or {}))
         m.setattr("api.config.get_config_for_profile_home", lambda *_args, **_kwargs: dict(config or {}))
         m.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
         m.setitem(sys.modules, "hermes_state", fake_hermes_state)
@@ -235,6 +237,32 @@ def test_continuous_iteration_policy_honors_disabled_values(enabled):
     assert policy["effective_limit"] == 500
 
 
+@pytest.mark.parametrize("value", [False, 0, "false", "no", None])
+def test_continuous_iteration_policy_honors_scalar_opt_out(value):
+    policy = streaming._continuous_iteration_policy(
+        "/validation",
+        {
+            "agent": {"max_turns": 500},
+            "webui": {"continuous_turns": value},
+        },
+        goal_related=False,
+    )
+    assert policy["enabled"] is False
+    assert policy["effective_limit"] == 500
+
+
+def test_continuous_iteration_policy_rounds_decimal_boundary_deterministically():
+    policy = streaming._continuous_iteration_policy(
+        "/validation",
+        {
+            "agent": {"max_turns": 100},
+            "webui": {"continuous_turns": {"threshold_ratio": 0.57}},
+        },
+        goal_related=False,
+    )
+    assert policy["rollover_at"] == 57
+
+
 def test_continuous_iteration_policy_supports_goal_turn_and_bounded_overrides():
     policy = streaming._continuous_iteration_policy(
         "Continue the approved work.",
@@ -248,12 +276,24 @@ def test_continuous_iteration_policy_supports_goal_turn_and_bounded_overrides():
             },
         },
         goal_related=True,
+        active_goal=True,
     )
 
     assert policy["enabled"] is True
     assert policy["rollover_at"] == 375
     assert policy["max_rollovers"] == 2
     assert policy["effective_limit"] == 1125
+
+
+def test_continuous_iteration_policy_does_not_trust_goal_related_without_active_goal():
+    policy = streaming._continuous_iteration_policy(
+        "Continue the previous work.",
+        {"agent": {"max_turns": 500}},
+        goal_related=True,
+        active_goal=False,
+    )
+    assert policy["enabled"] is False
+    assert policy["effective_limit"] == 500
 
 
 def test_iteration_rollover_boundaries_are_observable_and_bounded():
@@ -328,7 +368,7 @@ def test_stream_constructs_agent_with_normal_and_continuous_limits(tmp_path, mon
         monkeypatch,
         result,
         config={"agent": {"max_turns": 500}},
-        goal_related=True,
+        msg_text="/validation",
         agent_kwargs_out=captured,
     )
     assert captured["max_iterations"] == 1600
@@ -371,6 +411,36 @@ def test_cached_agent_refreshes_rollover_callback_for_new_stream(tmp_path, monke
     )
     rollovers = [payload for kind, payload in events if kind == "iteration_rollover"]
     assert [row["rollover"] for row in rollovers] == [1]
+
+
+def test_cached_agent_is_reused_when_budget_changes_between_turns(tmp_path, monkeypatch):
+    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
+
+    _run_streaming_with_fake_agent(
+        tmp_path,
+        monkeypatch,
+        {"final_response": "done", "messages": []},
+        config={"agent": {"max_turns": 500}},
+        msg_text="/validation",
+        stream_id="stream-validation",
+    )
+    with SESSION_AGENT_CACHE_LOCK:
+        first_agent = SESSION_AGENT_CACHE["tool_limit_session"][0]
+    assert first_agent.max_iterations == 1600
+
+    _run_streaming_with_fake_agent(
+        tmp_path,
+        monkeypatch,
+        {"final_response": "done", "messages": []},
+        config={"agent": {"max_turns": 500}},
+        msg_text="ordinary follow-up",
+        clear_agent_cache=False,
+        stream_id="stream-ordinary",
+    )
+    with SESSION_AGENT_CACHE_LOCK:
+        second_agent = SESSION_AGENT_CACHE["tool_limit_session"][0]
+    assert second_agent is first_agent
+    assert second_agent.max_iterations == 500
 
 
 def test_rollover_frontend_handler_is_registered():
