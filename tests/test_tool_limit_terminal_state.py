@@ -26,6 +26,7 @@ def _run_streaming_with_fake_agent(
     agent_kwargs_out=None,
     msg_text="Do the long task.",
     step_counts=None,
+    step_callback_style="positional",
     clear_agent_cache=True,
     stream_id="stream-tool-limit",
 ):
@@ -89,7 +90,10 @@ def _run_streaming_with_fake_agent(
         def run_conversation(self, *_args, **_kwargs):
             for count in step_counts or []:
                 if self.step_callback is not None:
-                    self.step_callback(count, [])
+                    if step_callback_style == "keyword":
+                        self.step_callback(api_call_count=count, prev_tools=[])
+                    else:
+                        self.step_callback(count, [])
             return agent_result
 
         def interrupt(self, _message):
@@ -204,6 +208,18 @@ def test_continuous_iteration_policy_requires_explicit_base_limit():
     )
     assert policy["enabled"] is False
     assert policy["effective_limit"] is None
+
+
+def test_continuous_iteration_policy_falls_back_to_root_limit_when_agent_value_is_null():
+    policy = streaming._continuous_iteration_policy(
+        "/validation",
+        {"agent": {"max_turns": None}, "max_turns": 500},
+        goal_related=False,
+    )
+
+    assert policy["enabled"] is True
+    assert policy["base_limit"] == 500
+    assert policy["effective_limit"] == 1600
 
 
 @pytest.mark.parametrize("max_rollovers", [0, 1, 2, 3, 99])
@@ -387,6 +403,21 @@ def test_validation_stream_emits_bounded_rollover_events(tmp_path, monkeypatch):
     rollovers = [payload for kind, payload in events if kind == "iteration_rollover"]
     assert [row["rollover"] for row in rollovers] == [1, 2, 3]
     assert [row["api_calls_completed"] for row in rollovers] == [400, 800, 1200]
+
+
+def test_validation_stream_accepts_keyword_step_callback_contract(tmp_path, monkeypatch):
+    events, _payload = _run_streaming_with_fake_agent(
+        tmp_path,
+        monkeypatch,
+        {"final_response": "done", "messages": []},
+        config={"agent": {"max_turns": 500}},
+        msg_text="/validation",
+        step_counts=[401],
+        step_callback_style="keyword",
+    )
+
+    rollovers = [payload for kind, payload in events if kind == "iteration_rollover"]
+    assert [row["rollover"] for row in rollovers] == [1]
 
 
 def test_cached_agent_refreshes_rollover_callback_for_new_stream(tmp_path, monkeypatch):

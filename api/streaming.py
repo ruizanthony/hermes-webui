@@ -1497,13 +1497,11 @@ def _continuous_iteration_policy(
     global anti-loop ceiling.
     """
     config = cfg if isinstance(cfg, dict) else {}
-    agent_cfg = config.get('agent') if isinstance(config.get('agent'), dict) else {}
-    if 'max_turns' in agent_cfg:
-        raw_base = agent_cfg.get('max_turns')
-    elif 'max_turns' in config:
+    agent_value = config.get('agent')
+    agent_cfg = agent_value if isinstance(agent_value, dict) else {}
+    raw_base = agent_cfg.get('max_turns')
+    if raw_base is None:
         raw_base = config.get('max_turns')
-    else:
-        raw_base = None
     try:
         base_limit = int(raw_base) if raw_base is not None else None
         if base_limit is not None and base_limit <= 0:
@@ -8924,8 +8922,13 @@ def _run_agent_streaming(
 
             _emitted_continuous_rollovers = set()
 
-            def _continuous_iteration_step(api_call_count, _prev_tools=None):
+            def _continuous_iteration_step(*args, **kwargs):
                 try:
+                    api_call_count = (
+                        args[0]
+                        if args
+                        else kwargs.get('api_call_count')
+                    )
                     rollover = _iteration_rollover_for_step(
                         api_call_count,
                         _continuous_iteration_policy_cfg,
