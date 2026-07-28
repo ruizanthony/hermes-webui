@@ -1481,6 +1481,106 @@ def _agent_result_tool_limit_reached(result) -> bool:
     return False
 
 
+def _continuous_iteration_policy(msg_text, cfg, *, goal_related=False) -> dict:
+    """Resolve a bounded larger budget for explicitly continuous workflows.
+
+    Ordinary chat keeps the configured ``agent.max_turns`` limit.  Only
+    ``/validation`` and turns already owned by an active ``/goal`` receive a
+    larger effective cap.  The cap is expressed as a small number of bounded
+    rollover segments so a long validation can continue without removing the
+    global anti-loop ceiling.
+    """
+    config = cfg if isinstance(cfg, dict) else {}
+    agent_cfg = config.get('agent') if isinstance(config.get('agent'), dict) else {}
+    raw_base = agent_cfg.get('max_turns', config.get('max_turns', 500))
+    try:
+        base_limit = max(1, int(raw_base or 500))
+    except (TypeError, ValueError):
+        base_limit = 500
+
+    webui_cfg = config.get('webui') if isinstance(config.get('webui'), dict) else {}
+    continuous_cfg = (
+        webui_cfg.get('continuous_turns')
+        if isinstance(webui_cfg.get('continuous_turns'), dict)
+        else {}
+    )
+    enabled_by_config = continuous_cfg.get('enabled', True) is not False
+    command = str(msg_text or '').lstrip().split(None, 1)[0].lower()
+    workflow_enabled = bool(goal_related) or command == '/validation'
+    enabled = bool(enabled_by_config and workflow_enabled)
+
+    try:
+        threshold_ratio = float(continuous_cfg.get('threshold_ratio', 0.8))
+    except (TypeError, ValueError):
+        threshold_ratio = 0.8
+    threshold_ratio = min(0.9, max(0.5, threshold_ratio))
+    rollover_at = max(1, int(base_limit * threshold_ratio))
+
+    try:
+        max_rollovers = int(continuous_cfg.get('max_rollovers', 3))
+    except (TypeError, ValueError):
+        max_rollovers = 3
+    max_rollovers = min(3, max(0, max_rollovers))
+    effective_limit = (
+        rollover_at * (max_rollovers + 1)
+        if enabled
+        else base_limit
+    )
+    return {
+        'enabled': enabled,
+        'base_limit': base_limit,
+        'rollover_at': rollover_at,
+        'max_rollovers': max_rollovers,
+        'effective_limit': effective_limit,
+    }
+
+
+def _tool_limit_budget_usage(result, policy) -> tuple[int | None, int | None, int]:
+    """Extract exact limit usage and the number of consumed rollover segments."""
+    used = None
+    limit = None
+    reason = str((result or {}).get('turn_exit_reason') or '') if isinstance(result, dict) else ''
+    match = re.search(r'max_iterations_reached\((\d+)\s*/\s*(\d+)\)', reason)
+    if match:
+        used, limit = int(match.group(1)), int(match.group(2))
+    elif isinstance(result, dict):
+        try:
+            used = int(result.get('api_calls'))
+        except (TypeError, ValueError):
+            used = None
+    if limit is None and isinstance(policy, dict):
+        try:
+            limit = int(policy.get('effective_limit'))
+        except (TypeError, ValueError):
+            limit = None
+
+    rollovers = 0
+    if isinstance(policy, dict) and policy.get('enabled') and used is not None:
+        try:
+            rollover_at = max(1, int(policy.get('rollover_at')))
+            max_rollovers = max(0, int(policy.get('max_rollovers')))
+            rollovers = min(max_rollovers, max(0, (max(1, used) - 1) // rollover_at))
+        except (TypeError, ValueError):
+            rollovers = 0
+    return used, limit, rollovers
+
+
+def _iteration_rollover_for_step(api_call_count, policy) -> int | None:
+    """Return the 1-based rollover index when a new bounded segment starts."""
+    if not isinstance(policy, dict) or not policy.get('enabled'):
+        return None
+    try:
+        count = int(api_call_count)
+        rollover_at = max(1, int(policy.get('rollover_at')))
+        max_rollovers = max(0, int(policy.get('max_rollovers')))
+    except (TypeError, ValueError):
+        return None
+    if count <= 1 or (count - 1) % rollover_at:
+        return None
+    rollover = (count - 1) // rollover_at
+    return rollover if 1 <= rollover <= max_rollovers else None
+
+
 def _maybe_inject_max_iteration_summary_fallback(messages, result) -> list:
     """Append the agent's graceful summary text as an assistant turn when one is missing.
 
@@ -1515,8 +1615,9 @@ def _maybe_inject_max_iteration_summary_fallback(messages, result) -> list:
     return out
 
 
-def _mark_latest_assistant_tool_limit_status(messages) -> bool:
+def _mark_latest_assistant_tool_limit_status(messages, *, result=None, policy=None) -> bool:
     """Annotate the latest usable assistant final answer as limit-stopped."""
+    used, limit, rollovers = _tool_limit_budget_usage(result, policy)
     for msg in reversed(list(messages or [])):
         if not isinstance(msg, dict):
             continue
@@ -1535,13 +1636,20 @@ def _mark_latest_assistant_tool_limit_status(messages) -> bool:
             continue
         msg['_terminal_state'] = 'tool_limit_reached'
         msg['_terminal_reason'] = 'max_iterations'
+        rows = []
+        if used is not None and limit is not None:
+            rows.append({'label': 'Budget', 'value': f'{used}/{limit}'})
+        rows.append({'label': 'Work preserved', 'value': 'Yes'})
+        if isinstance(policy, dict) and policy.get('enabled'):
+            rows.append({
+                'label': 'Rollovers',
+                'value': f"{rollovers}/{int(policy.get('max_rollovers') or 0)}",
+            })
+        rows.append({'label': 'Next step', 'value': 'Start a new turn to continue.'})
         msg.setdefault('_statusCard', {
             'title': 'Tool iteration limit reached',
             'subtitle': 'Stopped because the tool iteration limit was reached.',
-            'rows': [
-                {'label': 'State', 'value': 'Limit reached'},
-                {'label': 'Next step', 'value': 'Start a new turn to continue.'},
-            ],
+            'rows': rows,
         })
         return True
     return False
@@ -8759,6 +8867,38 @@ def _run_agent_streaming(
             except Exception:
                 _max_iterations_cfg = None
 
+            _continuous_iteration_policy_cfg = _continuous_iteration_policy(
+                msg_text,
+                _cfg,
+                goal_related=goal_related,
+            )
+            if _continuous_iteration_policy_cfg['enabled']:
+                _max_iterations_cfg = _continuous_iteration_policy_cfg['effective_limit']
+
+            def _continuous_iteration_step(api_call_count, _prev_tools=None):
+                rollover = _iteration_rollover_for_step(
+                    api_call_count,
+                    _continuous_iteration_policy_cfg,
+                )
+                if rollover is None:
+                    return
+                logger.info(
+                    '[webui] Continuous workflow rollover %d/%d at API call %d for session %s',
+                    rollover,
+                    _continuous_iteration_policy_cfg['max_rollovers'],
+                    api_call_count,
+                    session_id,
+                )
+                put('iteration_rollover', {
+                    'session_id': session_id,
+                    'state': 'continuing',
+                    'rollover': rollover,
+                    'max_rollovers': _continuous_iteration_policy_cfg['max_rollovers'],
+                    'api_calls_completed': api_call_count - 1,
+                    'effective_limit': _continuous_iteration_policy_cfg['effective_limit'],
+                    'work_preserved': True,
+                })
+
             # CLI-parity max output cap: read config.yaml's max_tokens and pass
             # it to AIAgent when supported. Without this WebUI-created agents use
             # provider-native output ceilings (e.g. Claude via OpenRouter can
@@ -8832,6 +8972,8 @@ def _run_agent_streaming(
                 _agent_kwargs['tool_complete_callback'] = on_tool_complete
             if 'status_callback' in _agent_params:
                 _agent_kwargs['status_callback'] = _agent_status_callback
+            if 'step_callback' in _agent_params:
+                _agent_kwargs['step_callback'] = _continuous_iteration_step
             if 'max_iterations' in _agent_params and _max_iterations_cfg is not None:
                 _agent_kwargs['max_iterations'] = _max_iterations_cfg
             if 'max_tokens' in _agent_params and _max_tokens_cfg is not None:
@@ -8952,6 +9094,8 @@ def _run_agent_streaming(
                         agent.tool_complete_callback = _agent_kwargs.get('tool_complete_callback')
                     if hasattr(agent, 'status_callback'):
                         agent.status_callback = _agent_kwargs.get('status_callback')
+                    if hasattr(agent, 'step_callback'):
+                        agent.step_callback = _agent_kwargs.get('step_callback')
                     if hasattr(agent, 'interim_assistant_callback'):
                         agent.interim_assistant_callback = _agent_kwargs.get('interim_assistant_callback')
                     if hasattr(agent, 'reasoning_callback'):
@@ -9649,7 +9793,11 @@ def _run_agent_streaming(
                 if _terminal_failure:
                     _assistant_added = False
                 elif _tool_limit_reached and not _session_lacks_final_assistant_answer(s.messages):
-                    _mark_latest_assistant_tool_limit_status(s.messages)
+                    _mark_latest_assistant_tool_limit_status(
+                        s.messages,
+                        result=result,
+                        policy=_continuous_iteration_policy_cfg,
+                    )
                 # _token_sent tracks whether on_token() was called (any streamed text)
                 if _terminal_failure or (not _assistant_added and not _token_sent):
                     if cancel_event.is_set():

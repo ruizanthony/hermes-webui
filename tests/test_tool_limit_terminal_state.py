@@ -19,9 +19,12 @@ def _run_streaming_with_fake_agent(
     *,
     prior_messages=None,
     prior_context_messages=None,
+    config=None,
+    goal_related=False,
+    agent_kwargs_out=None,
 ):
     session_dir = tmp_path / "sessions"
-    session_dir.mkdir()
+    session_dir.mkdir(parents=True)
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
     monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
@@ -58,8 +61,13 @@ def _run_streaming_with_fake_agent(
     streaming.STREAMS[stream_id] = event_queue
 
     class FakeAgent:
-        def __init__(self, **kwargs):
+        def __init__(self, max_iterations=None, step_callback=None, **kwargs):
+            if agent_kwargs_out is not None:
+                agent_kwargs_out.update(kwargs)
+                agent_kwargs_out["max_iterations"] = max_iterations
+                agent_kwargs_out["step_callback"] = step_callback
             self.session_id = kwargs.get("session_id")
+            self.step_callback = step_callback
             self.stream_delta_callback = kwargs.get("stream_delta_callback")
             self.context_compressor = None
             self.session_prompt_tokens = 0
@@ -84,7 +92,8 @@ def _run_streaming_with_fake_agent(
         m.setattr(streaming, "get_session", lambda _sid: session)
         m.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
         m.setattr(streaming, "resolve_model_provider", lambda *_args, **_kwargs: ("gpt-4o", "openai", None))
-        m.setattr("api.config.get_config", lambda *_args, **_kwargs: {})
+        m.setattr(streaming, "get_config", lambda *_args, **_kwargs: dict(config or {}))
+        m.setattr("api.config.get_config_for_profile_home", lambda *_args, **_kwargs: dict(config or {}))
         m.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
         m.setitem(sys.modules, "hermes_state", fake_hermes_state)
         streaming._run_agent_streaming(
@@ -93,6 +102,7 @@ def _run_streaming_with_fake_agent(
             model="gpt-4o",
             workspace=str(tmp_path),
             stream_id=stream_id,
+            goal_related=goal_related,
         )
 
     events = []
@@ -135,6 +145,132 @@ def test_tool_limit_detection_uses_explicit_boolean_grouping():
     streaming_py = (ROOT / "api" / "streaming.py").read_text(encoding="utf-8")
 
     assert "or ('tool-calling iterations' in haystack and 'maximum' in haystack)" in streaming_py
+
+
+def test_continuous_iteration_policy_expands_validation_budget_with_bounded_rollovers():
+    policy = streaming._continuous_iteration_policy(
+        "/validation",
+        {"agent": {"max_turns": 500}},
+        goal_related=False,
+    )
+
+    assert policy == {
+        "enabled": True,
+        "base_limit": 500,
+        "rollover_at": 400,
+        "max_rollovers": 3,
+        "effective_limit": 1600,
+    }
+
+
+def test_continuous_iteration_policy_stays_disabled_for_ordinary_chat():
+    policy = streaming._continuous_iteration_policy(
+        "Please inspect this small file.",
+        {"agent": {"max_turns": 500}},
+        goal_related=False,
+    )
+
+    assert policy["enabled"] is False
+    assert policy["effective_limit"] == 500
+
+
+def test_continuous_iteration_policy_supports_goal_turn_and_bounded_overrides():
+    policy = streaming._continuous_iteration_policy(
+        "Continue the approved work.",
+        {
+            "agent": {"max_turns": 500},
+            "webui": {
+                "continuous_turns": {
+                    "threshold_ratio": 0.75,
+                    "max_rollovers": 2,
+                }
+            },
+        },
+        goal_related=True,
+    )
+
+    assert policy["enabled"] is True
+    assert policy["rollover_at"] == 375
+    assert policy["max_rollovers"] == 2
+    assert policy["effective_limit"] == 1125
+
+
+def test_iteration_rollover_boundaries_are_observable_and_bounded():
+    policy = streaming._continuous_iteration_policy(
+        "/validation",
+        {"agent": {"max_turns": 500}},
+        goal_related=False,
+    )
+
+    assert streaming._iteration_rollover_for_step(400, policy) is None
+    assert streaming._iteration_rollover_for_step(401, policy) == 1
+    assert streaming._iteration_rollover_for_step(801, policy) == 2
+    assert streaming._iteration_rollover_for_step(1201, policy) == 3
+    assert streaming._iteration_rollover_for_step(1601, policy) is None
+
+
+def test_tool_limit_status_card_reports_exact_budget_and_preservation():
+    messages = [
+        {"role": "user", "content": "/validation"},
+        {"role": "assistant", "content": "Checkpoint preserved."},
+    ]
+    result = {
+        "turn_exit_reason": "max_iterations_reached(1600/1600)",
+        "api_calls": 1600,
+    }
+    policy = {
+        "enabled": True,
+        "base_limit": 500,
+        "rollover_at": 400,
+        "max_rollovers": 3,
+        "effective_limit": 1600,
+    }
+
+    assert streaming._mark_latest_assistant_tool_limit_status(
+        messages,
+        result=result,
+        policy=policy,
+    ) is True
+    rows = messages[-1]["_statusCard"]["rows"]
+    assert {row["label"]: row["value"] for row in rows} == {
+        "Budget": "1600/1600",
+        "Work preserved": "Yes",
+        "Rollovers": "3/3",
+        "Next step": "Start a new turn to continue.",
+    }
+
+
+def test_stream_constructs_agent_with_normal_and_continuous_limits(tmp_path, monkeypatch):
+    captured = {}
+    result = {
+        "turn_exit_reason": "text_response(stop)",
+        "final_response": "Validation complete.",
+        "messages": [
+            {"role": "user", "content": "Do the long task."},
+            {"role": "assistant", "content": "Validation complete."},
+        ],
+    }
+
+    _run_streaming_with_fake_agent(
+        tmp_path / "normal",
+        monkeypatch,
+        result,
+        config={"agent": {"max_turns": 500}},
+        agent_kwargs_out=captured,
+    )
+    assert captured["max_iterations"] == 500
+
+    captured.clear()
+    _run_streaming_with_fake_agent(
+        tmp_path / "continuous",
+        monkeypatch,
+        result,
+        config={"agent": {"max_turns": 500}},
+        goal_related=True,
+        agent_kwargs_out=captured,
+    )
+    assert captured["max_iterations"] == 1600
+    assert callable(captured["step_callback"])
 
 
 def test_historical_synthetic_summary_prompt_does_not_mark_normal_result_as_tool_limit():
