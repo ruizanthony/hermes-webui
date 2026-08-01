@@ -1292,6 +1292,14 @@ def _run_gateway_chat_streaming(
             user_msg["timestamp"] = float(
                 active_turn_identity.get("timestamp") or now
             )
+            # Gateway-run wake turns (api_server self-POST) carry no durable
+            # source: fall back to the content-shape backstop so the merged
+            # row still satisfies the hide/collapse contract. No-op when the
+            # active-turn materialization already stamped a durable source.
+            from api.process_event_utils import stamp_wakeup_source_if_untagged
+            stamp_wakeup_source_if_untagged(user_msg)
+            if attachments:
+                user_msg["attachments"] = list(attachments)
             assistant_msg = {"role": "assistant", "content": assistant_text, "timestamp": assistant_ts}
             saved_reasoning = STREAM_REASONING_TEXT.get(stream_id, "")
             if saved_reasoning:
