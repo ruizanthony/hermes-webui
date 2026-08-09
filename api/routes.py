@@ -21802,6 +21802,7 @@ def _start_run(
 
     if runtime_adapter_enabled() or runtime_adapter_runner_enabled():
         def _legacy_start_run(request: StartRunRequest) -> dict:
+            request_source = request.source or source
             return _start_chat_stream_for_session(
                 s,
                 msg=request.message,
@@ -21811,7 +21812,8 @@ def _start_run(
                 model_provider=request.provider or model_provider,
                 normalized_model=normalized_model,
                 diag=diag,
-                source=request.source or source,
+                goal_related=str(request_source).strip() == "process_wakeup",
+                source=request_source,
                 moa_config=moa_config,
                 external_runtime_owned=gateway_chat_enabled,
             )
@@ -21852,6 +21854,7 @@ def _start_run(
         model_provider=model_provider,
         normalized_model=normalized_model,
         diag=diag,
+        goal_related=str(source or "").strip() == "process_wakeup",
         source=source,
         moa_config=moa_config,
         external_runtime_owned=gateway_chat_enabled,
