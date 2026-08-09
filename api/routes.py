@@ -22847,12 +22847,13 @@ def _start_run(
                 model_provider=request.provider or model_provider,
                 normalized_model=normalized_model,
                 diag=diag,
-                goal_related=str(request_source).strip() == "process_wakeup",
+                goal_related=bool(
+                    goal_related or str(request_source).strip() == "process_wakeup"
+                ),
                 source=request_source,
                 moa_config=moa_config,
                 external_runtime_owned=gateway_chat_enabled,
                 regeneration=regeneration,
-                goal_related=goal_related,
             )
 
         def _legacy_adapter_factory():
@@ -22894,12 +22895,11 @@ def _start_run(
         model_provider=model_provider,
         normalized_model=normalized_model,
         diag=diag,
-        goal_related=str(source or "").strip() == "process_wakeup",
+        goal_related=bool(goal_related or str(source or "").strip() == "process_wakeup"),
         source=source,
         moa_config=moa_config,
         external_runtime_owned=gateway_chat_enabled,
         regeneration=regeneration,
-        goal_related=goal_related,
     )
 
 
