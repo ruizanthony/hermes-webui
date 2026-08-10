@@ -1400,6 +1400,12 @@ def _run_gateway_chat_streaming(
             from api.streaming import _active_turn_authority, _materialize_active_turn_user
 
             active_turn_identity = _active_turn_authority(s, stream_id, msg_text)
+            # ``_materialize_active_turn_user`` routes through the
+            # ``stamp_message_source`` choke point, which now falls back to the
+            # content-shape wakeup backstop when the resolved source is the
+            # default ``webui``. Gateway-run wake turns (api_server self-POST)
+            # therefore still get a durable ``_source='process_wakeup'`` stamp
+            # for the hide/collapse contract without a second call site here.
             user_msg = _materialize_active_turn_user(
                 active_turn_identity,
                 str(msg_text or ""),
