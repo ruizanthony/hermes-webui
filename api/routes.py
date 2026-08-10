@@ -23361,10 +23361,37 @@ def _start_run(
         runtime_adapter_runner_enabled,
     )
 
-    runner_owned = runtime_adapter_runner_enabled() and source != "goal_continuation"
-    if runtime_adapter_enabled() or runner_owned:
-        if regeneration is not None and runner_owned:
+    def _direct_start():
+        return _start_chat_stream_for_session(
+            s,
+            msg=msg,
+            attachments=attachments,
+            workspace=workspace,
+            model=model,
+            model_provider=model_provider,
+            normalized_model=normalized_model,
+            diag=diag,
+            source=source,
+            moa_config=moa_config,
+            external_runtime_owned=gateway_chat_enabled,
+            regeneration=regeneration,
+            goal_related=goal_related,
+            continuation_claim_id=continuation_claim_id,
+        )
+
+    # A runner-owned continuation must stay with the WebUI scheduler.  The
+    # legacy adapter remains valid when it is explicitly enabled.
+    if (
+        source == "goal_continuation"
+        and runtime_adapter_runner_enabled()
+        and not runtime_adapter_enabled()
+    ):
+        return _direct_start()
+
+    if runtime_adapter_enabled() or runtime_adapter_runner_enabled():
+        if regeneration is not None and runtime_adapter_runner_enabled():
             return {"error": "Regeneration is not supported by the runner backend.", "code": "unsupported_regeneration_backend", "_status": 409}
+
         def _legacy_start_run(request: StartRunRequest) -> dict:
             return _start_chat_stream_for_session(
                 s,
@@ -23413,22 +23440,7 @@ def _start_run(
             return {"error": str(exc), "_status": 501}
         return _chat_start_response_from_run_start(result)
 
-    return _start_chat_stream_for_session(
-        s,
-        msg=msg,
-        attachments=attachments,
-        workspace=workspace,
-        model=model,
-        model_provider=model_provider,
-        normalized_model=normalized_model,
-        diag=diag,
-        source=source,
-        moa_config=moa_config,
-        external_runtime_owned=gateway_chat_enabled,
-        regeneration=regeneration,
-        goal_related=goal_related,
-        continuation_claim_id=continuation_claim_id,
-    )
+    return _direct_start()
 
 
 def _process_wakeup_revalidation_provider(model, provider) -> str:
