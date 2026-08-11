@@ -4399,22 +4399,40 @@ def _is_generic_fallback_title(title: str) -> bool:
     return str(title or '').strip().lower() in {'conversation topic'}
 
 
-def _run_background_title_update(session_id: str, user_text: str, assistant_text: str, placeholder_title: str, put_event, agent=None):
-    """Generate and publish a better title after `done`, then end the stream."""
+def _run_background_title_update(
+    session_id: str,
+    user_text: str,
+    assistant_text: str,
+    placeholder_title: str,
+    put_event,
+    agent=None,
+    *,
+    relay_session_id: str | None = None,
+):
+    """Update durable child title state while closing the original relay stream."""
+    relay_sid = str(relay_session_id or session_id)
+    raw_put_event = put_event
+
+    def relay_put_event(event, payload):
+        if isinstance(payload, dict) and "session_id" in payload:
+            payload = dict(payload)
+            payload["session_id"] = relay_sid
+        raw_put_event(event, payload)
+
     try:
         try:
             s = get_session(session_id)
         except KeyError:
-            _put_title_status(put_event, session_id, 'skipped', 'missing_session')
+            _put_title_status(relay_put_event, session_id, 'skipped', 'missing_session')
             return
         # Allow self-heal when a previously generated title leaked thinking text.
         _invalid_existing = _looks_invalid_generated_title(s.title)
         if getattr(s, 'llm_title_generated', False) and not _invalid_existing:
-            _put_title_status(put_event, session_id, 'skipped', 'already_generated', str(s.title or ''))
+            _put_title_status(relay_put_event, session_id, 'skipped', 'already_generated', str(s.title or ''))
             return
         current = str(s.title or '').strip()
         if session_has_manual_title(s):
-            _put_title_status(put_event, session_id, 'skipped', 'manual_title', current)
+            _put_title_status(relay_put_event, session_id, 'skipped', 'manual_title', current)
             return
         still_auto = (
             current == placeholder_title
@@ -4423,13 +4441,13 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
             or _invalid_existing
         )
         if not still_auto:
-            _put_title_status(put_event, session_id, 'skipped', 'manual_title', current)
+            _put_title_status(relay_put_event, session_id, 'skipped', 'manual_title', current)
             return
         from api import profiles as profiles_api
 
         with profiles_api.profile_env_for_background_worker(s, "background title", logger_override=logger):
             if not _aux_title_generation_enabled():
-                _put_title_status(put_event, session_id, 'skipped', 'title_generation_disabled', current)
+                _put_title_status(relay_put_event, session_id, 'skipped', 'title_generation_disabled', current)
                 return
             aux_title_configured = _aux_title_configured()
             if agent and not aux_title_configured:
@@ -4472,7 +4490,7 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
                         or invalid_existing_now
                     )
                 if manual_title or not still_auto:
-                    _put_title_status(put_event, session_id, 'skipped', 'manual_title', effective_title)
+                    _put_title_status(relay_put_event, session_id, 'skipped', 'manual_title', effective_title)
                     return
                 if next_title != effective_title:
                     s.title = next_title
@@ -4484,14 +4502,14 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
 
         if wrote_title:
             if source == 'fallback':
-                _put_title_status(put_event, session_id, source, fallback_reason, effective_title, raw_preview)
+                _put_title_status(relay_put_event, session_id, source, fallback_reason, effective_title, raw_preview)
             else:
-                _put_title_status(put_event, session_id, source, llm_status, effective_title, raw_preview)
-            put_event('title', {'session_id': session_id, 'title': effective_title})
+                _put_title_status(relay_put_event, session_id, source, llm_status, effective_title, raw_preview)
+            relay_put_event('title', {'session_id': session_id, 'title': effective_title})
         else:
-            _put_title_status(put_event, session_id, 'skipped', source or 'unchanged', effective_title, raw_preview)
+            _put_title_status(relay_put_event, session_id, 'skipped', source or 'unchanged', effective_title, raw_preview)
     finally:
-        put_event('stream_end', {'session_id': session_id})
+        relay_put_event('stream_end', {'session_id': session_id})
 
 
 def _run_background_title_refresh(session_id: str, user_text: str, assistant_text: str, current_title: str, put_event, agent=None):
@@ -7957,6 +7975,12 @@ def _refresh_cached_agent_primary_runtime_snapshot(agent) -> None:
             rt['is_anthropic_oauth'] = getattr(agent, '_is_anthropic_oauth')
 
 
+def _goal_state_session_id(requested_session_id: str, session: object) -> str:
+    """Return the durable Goal owner after an in-turn compression rotation."""
+    current_session_id = str(getattr(session, 'session_id', '') or '').strip()
+    return current_session_id or str(requested_session_id or '').strip()
+
+
 def _goal_retry_event_has_observable_activity(event: str) -> bool:
     """Return whether an emitted local SSE event makes replay unsafe."""
     normalized = str(event or '').strip().lower()
@@ -7984,6 +8008,7 @@ def _run_agent_streaming(
     ephemeral=False,
     model_provider=None,
     goal_related=False,
+    goal_producer_kind=None,
     moa_config=None,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
@@ -11511,8 +11536,9 @@ def _run_agent_streaming(
             try:
                 from api.goals import evaluate_goal_after_turn, has_active_goal
 
+                _goal_session_id = _goal_state_session_id(session_id, s)
                 _goal_is_active = (
-                    has_active_goal(session_id, profile_home=_profile_home)
+                    has_active_goal(_goal_session_id, profile_home=_profile_home)
                     if goal_related
                     else False
                 )
@@ -11546,7 +11572,7 @@ def _run_agent_streaming(
                         'message_key': 'goal_evaluating_progress',
                     })
                     _goal_decision = evaluate_goal_after_turn(
-                        session_id,
+                        _goal_session_id,
                         _last_goal_response,
                         user_initiated=True,
                         profile_home=_profile_home,
@@ -11568,14 +11594,16 @@ def _run_agent_streaming(
                         from api.goal_continuations import schedule_goal_continuation
                         from api.goals import goal_state_snapshot
 
-                        _goal_state = goal_state_snapshot(session_id, profile_home=_profile_home)
+                        _goal_state = goal_state_snapshot(_goal_session_id, profile_home=_profile_home)
                         try:
                             _continuation_record = schedule_goal_continuation(
-                                session_id,
+                                _goal_session_id,
                                 continuation_prompt,
                                 source_stream_id=stream_id,
                                 profile_home=_profile_home,
                                 goal_turns_used=int(getattr(_goal_state, 'turns_used', 0) or 0),
+                                predecessor_session_id=session_id,
+                                producer_kind=goal_producer_kind,
                             )
                         except Exception as _schedule_exc:
                             logger.exception(
@@ -11595,20 +11623,21 @@ def _run_agent_streaming(
                             })
                             put('stream_end', {'session_id': session_id})
                             return
-                        # Retain the in-memory marker only for mixed-version tabs;
-                        # the server registry above is the execution authority.
-                        PENDING_GOAL_CONTINUATION.add(session_id)
-                        put('goal_continue', {
-                            'session_id': session_id,
-                            'continuation_prompt': continuation_prompt,
-                            'text': continuation_prompt,
-                            'message': _goal_message,
-                            'message_key': decision.get('message_key') or 'goal_continuing',
-                            'message_args': decision.get('message_args') or [],
-                            'decision': decision,
-                            'server_scheduled': True,
-                            'continuation_id': _continuation_record.get('continuation_id'),
-                        })
+                        if _continuation_record.get('status') == 'pending':
+                            # Retain the marker only for mixed-version tabs; a stale
+                            # retry that finds an admitted/terminal child emits nothing.
+                            PENDING_GOAL_CONTINUATION.add(_goal_session_id)
+                            put('goal_continue', {
+                                'session_id': session_id,
+                                'continuation_prompt': continuation_prompt,
+                                'text': continuation_prompt,
+                                'message': _goal_message,
+                                'message_key': decision.get('message_key') or 'goal_continuing',
+                                'message_args': decision.get('message_args') or [],
+                                'decision': decision,
+                                'server_scheduled': True,
+                                'continuation_id': _continuation_record.get('continuation_id'),
+                            })
                 elif goal_related:
                     from api.goal_continuations import complete_goal_continuation
 
@@ -11644,6 +11673,7 @@ def _run_agent_streaming(
                 threading.Thread(
                     target=_run_background_title_update,
                     args=(s.session_id, _u0, _a0, str(s.title or '').strip(), put, agent),
+                    kwargs={"relay_session_id": session_id},
                     daemon=True,
                 ).start()
             else:

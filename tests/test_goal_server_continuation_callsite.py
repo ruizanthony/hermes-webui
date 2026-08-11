@@ -1,6 +1,7 @@
 """Call-surface regressions for server-owned goal continuation delivery."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,3 +88,76 @@ def test_thread_start_failure_requeues_modern_and_legacy_goal_streams():
     block = routes[start : routes.index("raise", start) + len("raise")]
     assert "if goal_related:" in block
     assert "requeue_goal_continuation_after_no_response" in block
+
+
+def test_goal_state_session_id_tracks_the_compression_child():
+    from api.streaming import _goal_state_session_id
+
+    assert _goal_state_session_id(
+        "session-parent",
+        SimpleNamespace(session_id="session-child"),
+    ) == "session-child"
+    assert _goal_state_session_id(
+        "session-parent",
+        SimpleNamespace(session_id=""),
+    ) == "session-parent"
+
+
+def test_post_turn_goal_state_follows_compression_child_not_stream_parent():
+    source = (ROOT / "api/streaming.py").read_text()
+    start = source.index("# /goal parity:")
+    body = source[start : source.index("with _stream_writeback_stage", start)]
+
+    assert "_goal_session_id = _goal_state_session_id(session_id, s)" in body
+    assert "has_active_goal(_goal_session_id" in body
+    assert "evaluate_goal_after_turn(\n                        _goal_session_id" in body
+    assert "goal_state_snapshot(_goal_session_id" in body
+    assert "schedule_goal_continuation(\n                                _goal_session_id" in body
+    assert "predecessor_session_id=session_id" in body
+    assert "producer_kind=goal_producer_kind" in body
+    assert "if _continuation_record.get('status') == 'pending':" in body
+    assert "PENDING_GOAL_CONTINUATION.add(_goal_session_id)" in body
+    assert "complete_goal_continuation(session_id, stream_id)" in body
+    assert "'session_id': session_id" in body
+
+
+def test_route_passes_explicit_goal_producer_kind_to_stream_worker():
+    routes = (ROOT / "api" / "routes.py").read_text()
+    assert 'goal_producer_kind = "continuation"' in routes
+    assert 'goal_producer_kind = "initial_goal"' in routes
+    assert '"goal_producer_kind": goal_producer_kind' in routes
+
+
+def test_background_title_keeps_parent_relay_after_child_rotation(monkeypatch):
+    from api import streaming
+
+    source = (ROOT / "api" / "streaming.py").read_text()
+    caller = source[source.index("target=_run_background_title_update") - 200:source.index("target=_run_background_title_update") + 600]
+    assert '"relay_session_id": session_id' in caller
+
+    requested = []
+    events = []
+    session = SimpleNamespace(
+        session_id="session-child",
+        title="Stable title",
+        llm_title_generated=True,
+    )
+
+    def get_session(session_id):
+        requested.append(session_id)
+        return session
+
+    monkeypatch.setattr(streaming, "get_session", get_session)
+    streaming._run_background_title_update(
+        session_id="session-child",
+        user_text="user",
+        assistant_text="assistant",
+        placeholder_title="placeholder",
+        put_event=lambda event, payload: events.append((event, payload)),
+        relay_session_id="session-parent",
+    )
+
+    assert requested == ["session-child"]
+    assert events
+    assert events[-1] == ("stream_end", {"session_id": "session-parent"})
+    assert all(payload.get("session_id") == "session-parent" for _event, payload in events)
