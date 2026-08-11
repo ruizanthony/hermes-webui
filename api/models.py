@@ -9596,7 +9596,7 @@ def _normalize_wakeup_rows_for_display(messages):
     for msg in messages:
         if isinstance(msg, dict) and msg.get("role") == "user":
             stamp_wakeup_source_if_untagged(msg)
-            if msg.get("_source") == "process_wakeup":
+            if msg.get("_source") in {"process_wakeup", "async_delegation"}:
                 key = wakeup_event_key(msg.get("content"))
                 if key is not None:
                     if key in seen_keys:

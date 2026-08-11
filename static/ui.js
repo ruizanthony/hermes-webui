@@ -615,9 +615,48 @@ function _cancelMessageVirtualizedRender(){
     _messageVirtualScrollRaf=0;
   }
 }
+function _isInternalTransportMessage(m){
+  if(!m||typeof m!=='object') return false;
+  return m._display_kind==='internal_event'
+    || m._user_originated===false
+    || m._source==='process_wakeup'
+    || m._source==='async_delegation';
+}
+function _assistantFollowsInternalTransport(messages, rawIdx){
+  const rows=Array.isArray(messages)?messages:[];
+  for(let i=Number(rawIdx)-1;i>=0;i--){
+    const candidate=rows[i];
+    if(!candidate||candidate.role==='tool') continue;
+    if(candidate.role==='user') return _isInternalTransportMessage(candidate);
+  }
+  return false;
+}
+function _hasLaterRenderableAssistant(messages, rawIdx){
+  const rows=Array.isArray(messages)?messages:[];
+  for(let i=Number(rawIdx)+1;i<rows.length;i++){
+    const candidate=rows[i];
+    if(candidate&&candidate.role==='user'&&!_isInternalTransportMessage(candidate)) return false;
+    if(candidate&&candidate.role==='assistant'&&_messageIsRenderable(candidate)) return true;
+  }
+  return false;
+}
+function _projectInternalProgressContent(messages, rawIdx, content){
+  const text=String(content||'').trim();
+  if(!text||!_assistantFollowsInternalTransport(messages, rawIdx)) return content;
+  if(!_hasLaterRenderableAssistant(messages, rawIdx)) return content;
+  let summary=text
+    .replace(/^\s*#\s*CONCLUSION\s*\n\s*---\s*\n?/i,'')
+    .replace(/^\s*>?\s*🟢\s*Réponse\s*\/\s*recommandation\s*:\s*/i,'')
+    .split(/\n\s*\n/,1)[0]
+    .replace(/\s+/g,' ')
+    .trim();
+  if(!summary) summary='Étape interne terminée';
+  if(summary.length>240) summary=summary.slice(0,237).trimEnd()+'…';
+  return `**Progression** — ${summary}`;
+}
 function _messageIsRenderable(m){
   if(!m||!m.role||m.role==='tool') return false;
-  if(m._source === 'process_wakeup') return !!(msgContent(m)||m.attachments?.length);
+  if(_isInternalTransportMessage(m)) return false;
   if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) return false;
   if(_isRecoveryControlMessage(m)) return false;
   const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
@@ -627,12 +666,82 @@ function _messageIsRenderable(m){
   const hasAssistantVisibleAnchor=hasTc||hasTu||hasPartialTc||_messageHasReasoningPayload(m)||_assistantMessageHasVisibleContent(m);
   return !!(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasReasoningAnchor||hasAssistantVisibleAnchor)));
 }
+const SILENT_TURN_SENTINEL='[[SILENT]]';
+function _isSilentSentinelContent(text){
+  return String(text==null?'':text).trim()===SILENT_TURN_SENTINEL;
+}
+// Silent-turn contract: an assistant message whose entire trimmed content is
+// the sentinel is the agent acknowledging a background wakeup without speaking
+// to the user — it must not render. When a turn opened by a process_wakeup
+// user row ENDS with the sentinel, the whole turn collapses: the wakeup row
+// itself plus every assistant message of the turn, including tool-carrying
+// ones (role 'tool' rows are already non-renderable). Hidden rows remain true
+// turn boundaries via _hasHiddenProcessWakeupBoundaryBefore. Render-only:
+// persisted session data is never mutated.
+function _computeSilentTurnHiddenIdxs(messages){
+  const hidden=new Set();
+  const msgs=Array.isArray(messages)?messages:[];
+  let turnStart=-1;
+  let turnAssistantIdxs=[];
+  const closeTurn=()=>{
+    if(turnStart===-1) return;
+    const lastIdx=turnAssistantIdxs.length?turnAssistantIdxs[turnAssistantIdxs.length-1]:-1;
+    const last=lastIdx>=0?msgs[lastIdx]:null;
+    if(last&&_isSilentSentinelContent(msgContent(last))){
+      hidden.add(turnStart);
+      for(const i of turnAssistantIdxs) hidden.add(i);
+    }
+    turnStart=-1;
+    turnAssistantIdxs=[];
+  };
+  for(let i=0;i<msgs.length;i++){
+    const m=msgs[i];
+    if(!m||typeof m!=='object') continue;
+    if(m.role==='user'){
+      closeTurn();
+      if(m._source==='process_wakeup'){ turnStart=i; turnAssistantIdxs=[]; }
+      continue;
+    }
+    if(m.role==='assistant'){
+      if(_isSilentSentinelContent(msgContent(m))) hidden.add(i);
+      if(turnStart!==-1) turnAssistantIdxs.push(i);
+    }
+  }
+  closeTurn();
+  return hidden;
+}
+// Live-stream suppression: while the accumulated assistant text is a prefix of
+// the sentinel (or exactly the sentinel), the live turn carries nothing the
+// user should see, so the token handler hides the live bubble before the final
+// persisted filter takes over. Exact-equality stays hidden so the completed
+// sentinel never flashes at stream end.
+function _isSilentSentinelStreamPrefix(text){
+  const trimmed=String(text==null?'':text).trim();
+  return !!trimmed&&SILENT_TURN_SENTINEL.startsWith(trimmed);
+}
+function _syncSilentLiveTurnSuppression(accumulatedText){
+  const turn=typeof $==='function'?$('liveAssistantTurn'):null;
+  if(!turn) return;
+  if(_isSilentSentinelStreamPrefix(accumulatedText)) turn.setAttribute('data-silent-pending','1');
+  else turn.removeAttribute('data-silent-pending');
+}
+function _hasHiddenProcessWakeupBoundaryBefore(rawIdx){
+  const hiddenSilent=_computeSilentTurnHiddenIdxs(S.messages);
+  for(let idx=Number(rawIdx)-1;idx>=0;idx--){
+    if(hiddenSilent.has(idx)) return true;
+    const previous=(S.messages||[])[idx];
+    if(previous&&previous._source==='process_wakeup'&&window._showBackgroundWakeups===false) return true;
+    if(_messageIsRenderable(previous)) return false;
+  }
+  return false;
+}
 function _getVisibleMessagesWithIdx(){
   if(!_visWithIdxCache || _visWithIdxCacheLen !== S.messages.length || _visWithIdxCacheSrc !== S.messages){
+    const hiddenSilent=_computeSilentTurnHiddenIdxs(S.messages);
     const rebuilt=[];
     let rawIdx=0;
     for(const m of (S.messages||[])){
-      if(_messageIsRenderable(m)) rebuilt.push({m,rawIdx});
+      if(!hiddenSilent.has(rawIdx)&&_messageIsRenderable(m)) rebuilt.push({m,rawIdx});
       rawIdx++;
     }
     _visWithIdxCache=rebuilt;
@@ -4998,6 +5107,8 @@ function _reasoningEffortContext(){
 
 function _reasoningEffortQuery(){
   const params=new URLSearchParams(_reasoningEffortContext());
+  const session=S&&S.session;
+  if(session&&session.session_id) params.set('session_id',session.session_id);
   const qs=params.toString();
   return qs?('?'+qs):'';
 }
@@ -5224,13 +5335,16 @@ document.addEventListener('click',function(e){
     // silently ignore the Default click and leave the toggle one-way off-only.
     // (#6219 round-3)
     if(opt){
-      const payload=Object.assign({effort:effort},_reasoningEffortContext());
-      api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
+      const session=S&&S.session;
+      const request=session&&session.session_id
+        ?api('/api/session/update',{method:'POST',body:JSON.stringify({session_id:session.session_id,workspace:session.workspace,reasoning_effort:effort})})
+        :api('/api/reasoning',{method:'POST',body:JSON.stringify(Object.assign({effort:effort},_reasoningEffortContext()))});
+      request
         .then(function(st){
-          // For Default (effort=''), the returned reasoning_effort is '' (clear)
-          // — display 'Default' rather than an empty toast.
-          const display=(st&&st.reasoning_effort)||effort||'Default';
-          _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{});
+          if(session) session.reasoning_effort=effort||null;
+          const display=effort||'Auto';
+          if(!effort) fetchReasoningChip();
+          else _applyReasoningChip(effort, st||{});
           showToast('🧠 Reasoning effort set to '+display);
         })
         .catch(function(){showToast('🧠 Failed to set effort');});
@@ -9397,6 +9511,19 @@ function restoreLiveTurnHtmlForSession(sid){
   if(typeof _rehydrateTransparentStreamDom==='function') _rehydrateTransparentStreamDom(restored);
   if(typeof normalizeLiveActivityGroupPlacement==='function') normalizeLiveActivityGroupPlacement(restored);
   if(typeof _dedupeLiveProcessedWorklogAnchors==='function') _dedupeLiveProcessedWorklogAnchors(restored);
+  // Silent-turn suppression must also cover restored live turns: an inflight
+  // snapshot whose accumulated assistant text is the [[SILENT]] sentinel (or a
+  // streaming prefix of it) is re-injected into the DOM here, bypassing both
+  // the persisted-message filter (_computeSilentTurnHiddenIdxs) and the
+  // per-token streaming hook that sets data-silent-pending. Without this, a
+  // wakeup turn observed through session sync (api_server) re-displays the
+  // sentinel on every live-turn restore until the turn fully settles.
+  if(typeof _syncSilentLiveTurnSuppression==='function'){
+    const _restoredSilentText=Array.from(restored.querySelectorAll('[data-live-assistant="1"]'))
+      .map(seg=>{const body=seg.querySelector('.msg-body')||seg;return String(body.textContent||'');})
+      .join('');
+    if(_restoredSilentText) _syncSilentLiveTurnSuppression(_restoredSilentText);
+  }
   const liveGroup=restored.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
   if(liveGroup&&typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(liveGroup);
   if(typeof placeLiveToolCardsHost==='function') placeLiveToolCardsHost();
@@ -10977,6 +11104,7 @@ function _assistantTurnFinalVisibleContentMap(visWithIdx){
   };
   for(const entry of visWithIdx||[]){
     const m=entry&&entry.m;
+    if(m&&m.role==='assistant'&&_hasHiddenProcessWakeupBoundaryBefore(entry.rawIdx)) flush();
     if(m&&m.role==='assistant'){
       runIdxs.push(entry.rawIdx);
       const visible=_assistantVisibleContentForReasoningCompare(m);
@@ -10999,6 +11127,7 @@ function _assistantTurnVisibleContentMap(visWithIdx){
   };
   for(const entry of visWithIdx||[]){
     const m=entry&&entry.m;
+    if(m&&m.role==='assistant'&&_hasHiddenProcessWakeupBoundaryBefore(entry.rawIdx)) flush();
     if(m&&m.role==='assistant'){
       runIdxs.push(entry.rawIdx);
       const visible=_assistantVisibleContentForReasoningCompare(m);
@@ -11189,15 +11318,15 @@ function chatActivityMode(){
   return window._transparentStream ? 'transparent_stream' : 'compact_worklog';
 }
 // transparent_live_compact_settled resolves per render path: activity streams
-// transparently while the turn runs, then settled history collapses into the
-// Compact Worklog ("Trace: N tools") once the turn completes or is reloaded.
+// transparently while the turn runs, then settled history keeps assistant prose
+// (including interim comments) while removing tool and reasoning activity.
 function chatActivityLiveMode(){
   const mode=chatActivityMode();
   return mode==='transparent_live_compact_settled'?'transparent_stream':mode;
 }
 function chatActivitySettledMode(){
   const mode=chatActivityMode();
-  return mode==='transparent_live_compact_settled'?'compact_worklog':mode;
+  return mode==='transparent_live_compact_settled'?'transparent_stream':mode;
 }
 function isTransparentLiveMode(){
   return chatActivityLiveMode()==='transparent_stream';
@@ -11215,6 +11344,7 @@ if(typeof window!=='undefined'){
   window.chatActivityMode=chatActivityMode;
   window.chatActivityLiveMode=chatActivityLiveMode;
   window.chatActivitySettledMode=chatActivitySettledMode;
+
   window.isTransparentLiveMode=isTransparentLiveMode;
   window.isTransparentStream=isTransparentStream;
   window.isFinalAnswerOnlyMode=isFinalAnswerOnlyMode;
@@ -12588,6 +12718,7 @@ function _appendWorklogStep(group, anchor, cards, thinkingText, opts){
 function _anchorSceneRowsForRendering(scene, opts){
   const rows=Array.isArray(scene&&scene.activity_rows)?scene.activity_rows:[];
   const settled=!!(opts&&opts.settled);
+  const proseOnly=settled&&typeof window!=='undefined'&&window._chatActivityDisplayMode==='transparent_live_compact_settled';
   const live=!settled;
   const out=[];
   const byKey=new Map();
@@ -12607,6 +12738,7 @@ function _anchorSceneRowsForRendering(scene, opts){
   };
   for(const row of rows){
     if(!row||typeof row!=='object') continue;
+    if(proseOnly&&(row.role==='tool'||row.role==='thinking')) continue;
     if(row.role==='terminal'&&row.source_event_type==='done') continue;
     if(_anchorSceneIsSettledSuccessfulCompression(row,settled)) continue;
     const text=String(row.text||'').trim();
@@ -14261,7 +14393,10 @@ function placeLiveRunStatusHost(){
   return _moveLiveRunStatusToTurnEnd(el);
 }
 function showLiveRunStatus(sid,opts){
-  if(typeof isCompactWorklogMode==='function'&&isCompactWorklogMode()){
+  // Pure compact mode owns the live status inside its worklog.  The hybrid
+  // transparent-live/compact-settled mode must keep this footer visible while
+  // streaming so run_meta can surface the effective model + reasoning effort.
+  if(typeof chatActivityMode==='function'&&chatActivityMode()==='compact_worklog'){
     _liveRunStatusSessionId=sid;
     _liveRunStatusTokens=opts&&opts.tokens||null;
     const el=$('liveRunStatus');
@@ -14307,7 +14442,7 @@ function _syncLiveRunStatusAfterRender(){
   if(!sid||!S.activeStreamId||!S.busy) return;
   const timer=_liveRunStatusTimers[sid];
   const startedAt=(timer&&timer.startedAt)||((S.session&&S.session.pending_started_at)||Date.now()/1000);
-  if(typeof isCompactWorklogMode==='function'&&isCompactWorklogMode()){
+  if(typeof chatActivityMode==='function'&&chatActivityMode()==='compact_worklog'){
     const el=$('liveRunStatus');
     if(el){el.hidden=true;el.innerHTML='';}
     return;
@@ -16340,9 +16475,9 @@ function renderMessages(options){
     _wireMessageWindowLoadEarlierButton();
   }
   let lastUserRawIdx=-1;
-  for(let i=visWithIdx.length-1;i>=0;i--){
-    if(visWithIdx[i].m&&visWithIdx[i].m.role==='user'){
-      lastUserRawIdx=visWithIdx[i].rawIdx;
+  for(let rawIdx=S.messages.length-1;rawIdx>=0;rawIdx--){
+    if(S.messages[rawIdx]&&S.messages[rawIdx].role==='user'){
+      lastUserRawIdx=rawIdx;
       break;
     }
   }
@@ -16382,6 +16517,7 @@ function renderMessages(options){
   const renderableRawIdxs=new Set(visWithIdx.map(e=>e.rawIdx));
   for(const entry of visWithIdx){
     const role=entry&&entry.m&&entry.m.role;
+    if(role==='assistant'&&_hasHiddenProcessWakeupBoundaryBefore(entry.rawIdx)) lastQuestionRawIdx=-1;
     if(role==='user') lastQuestionRawIdx=entry.rawIdx;
     else if(role==='assistant'&&renderedRawIdxs.has(entry.rawIdx)) questionRawIdxByAssistantRawIdx.set(entry.rawIdx,lastQuestionRawIdx);
   }
@@ -16406,6 +16542,7 @@ function renderMessages(options){
     };
     for(const entry of renderVisWithIdx){
       const em=entry&&entry.m; const role=em&&em.role;
+      if(role==='assistant'&&_hasHiddenProcessWakeupBoundaryBefore(entry.rawIdx)) _flush();
       if(role==='assistant'){
         _run.push(entry.rawIdx);
         // Visible prose = content with any leading <think>…</think> /channel-thought
@@ -16549,7 +16686,9 @@ function renderMessages(options){
       }
     }
     const isProcessWakeup=m&&m._source==='process_wakeup';
+    if(_hasHiddenProcessWakeupBoundaryBefore(rawIdx)) currentAssistantTurn=null;
     const isUser=m.role==='user';
+    if(!isUser&&typeof _projectInternalProgressContent==='function') content=_projectInternalProgressContent(S.messages, rawIdx, content);
     if(!isUser&&_isMarkerOnlyAssistantCompressionMessage(m)){
       content='**Error:** No response received after context compression. Please retry.';
     }
@@ -16563,9 +16702,12 @@ function renderMessages(options){
       const turnVisibleContents=assistantTurnVisibleContentByRawIdx.get(rawIdx)||[];
       thinkingText=_worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, displayContent, turnFinalVisibleContent, turnVisibleContents);
     }
-    const isLastAssistant=!isUser&&vi===renderVisWithIdx.length-1;
+    const isLastAssistant=!isUser&&vi===renderVisWithIdx.length-1&&rawIdx>lastUserRawIdx;
     const nextRendered=renderVisWithIdx[vi+1];
-    const isTurnFinalAssistant=!isUser&&(!nextRendered||!nextRendered.m||nextRendered.m.role!=='assistant');
+    const isTurnFinalAssistant=!isUser&&(
+      !nextRendered||!nextRendered.m||nextRendered.m.role!=='assistant'||
+      _hasHiddenProcessWakeupBoundaryBefore(nextRendered.rawIdx)
+    );
     let filesHtml='';
     if(m.attachments&&m.attachments.length){
       // Static regression tests intentionally look for msg-media-img/msg-file-badge near this branch.
@@ -16590,9 +16732,10 @@ function renderMessages(options){
     if(recoveryHtml) bodyHtml += recoveryHtml;
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
+    const followsInternalTransport=!isUser&&typeof _assistantFollowsInternalTransport==='function'&&_assistantFollowsInternalTransport(S.messages,rawIdx);
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
-    const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
+    const retryBtn = isLastAssistant&&!followsInternalTransport ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
     const readOnlySession=typeof _isReadOnlySession==='function'
       ? _isReadOnlySession(S.session)
@@ -17257,7 +17400,7 @@ function renderMessages(options){
       if(Number.isFinite(burstA)&&Number.isFinite(burstB)&&burstA!==burstB) return burstA-burstB;
       return a.aIdx-b.aIdx;
     });
-    if(!isTransparentStream()){
+    if(isCompactWorklogMode()){
       for(const entry of activityOrder){
         const {aIdx,segmentSeq,burstId,cards,thinkingIdx,includeAnchorReason}=entry;
         if(aIdx<assistantIdxs[0]) continue;
@@ -17304,7 +17447,7 @@ function renderMessages(options){
       activityByTurn.forEach(state=>{
         _syncToolCallGroupSummary(state.group);
       });
-    }else{
+    }else if(isTransparentStream()&&chatActivityMode()!=='transparent_live_compact_settled'){
       // ── transparent_stream path: individual expandable event rows ──
       const transparentInsertCursors=new Map();
       // Per-turn dedup of echoed thinking text — mirrors the compact-worklog
@@ -18897,12 +19040,16 @@ async function regenerateResponse(btn) {
   const row = btn.closest('[data-msg-idx]');
   if(!row) return;
   const assistantIdx = parseInt(row.dataset.msgIdx, 10);
+  if(_assistantFollowsInternalTransport(S.messages,assistantIdx)) return;
   const absoluteKeepCount = _oldestIdx + assistantIdx;
   const initialSid = S.session.session_id;
   let lastUserText = '';
   for(let i = assistantIdx - 1; i >= 0; i--) {
     const m = S.messages[i];
-    if(m && m.role === 'user') { lastUserText = msgContent(m); break; }
+    if(m && m.role === 'user' && !_isInternalTransportMessage(m)) {
+      lastUserText = msgContent(m);
+      break;
+    }
   }
   if(!lastUserText) return;
   if(typeof _ensureAllMessagesLoaded==='function'){

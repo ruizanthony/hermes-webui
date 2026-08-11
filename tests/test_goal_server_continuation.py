@@ -864,6 +864,13 @@ def test_profile_goal_manager_accepts_current_five_field_judge_result(monkeypatc
         last_verdict=None,
         last_reason=None,
         paused_reason=None,
+        waiting_on_session=None,
+        waiting_on_pid=None,
+        waiting_until=0.0,
+        waiting_reason=None,
+        waiting_since=0.0,
+        consecutive_parse_failures=0,
+        consecutive_transport_failures=0,
     )
     manager = object.__new__(goals._ProfileGoalManager)
     manager.session_id = "session-a"
