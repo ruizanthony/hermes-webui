@@ -17072,9 +17072,10 @@ function renderMessages(options){
     if(recoveryHtml) bodyHtml += recoveryHtml;
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
+    const followsInternalTransport=!isUser&&_assistantFollowsInternalTransport(S.messages,rawIdx);
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
-    const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
+    const retryBtn = isLastAssistant&&!followsInternalTransport ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
     const readOnlySession=typeof _isReadOnlySession==='function'
       ? _isReadOnlySession(S.session)
@@ -19372,12 +19373,15 @@ async function regenerateResponse(btn) {
   if(!S.session || S.busy) return;
   const row=btn&&btn.closest&&btn.closest('[data-msg-idx]');
   if(!row)return;
-  const clickedAbsoluteIndex=_oldestIdx+parseInt(row.dataset.msgIdx,10);
+  const assistantIdx=parseInt(row.dataset.msgIdx,10);
+  if(!Number.isInteger(assistantIdx)||_assistantFollowsInternalTransport(S.messages,assistantIdx))return;
+  const clickedAbsoluteIndex=_oldestIdx+assistantIdx;
   const initialSid = S.session.session_id;
   if(typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
   }
   if(!S.session || S.session.session_id !== initialSid) return;
+  if(_assistantFollowsInternalTransport(S.messages,clickedAbsoluteIndex))return;
   if(!S.session.regeneration_revision){ setStatus(t('regen_failed')); return; }
   let latestAssistantIndex=-1;
   for(let i=S.messages.length-1;i>=0;i--){
