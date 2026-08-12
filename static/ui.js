@@ -16716,6 +16716,7 @@ function renderMessages(options){
       requestAnimationFrame(()=>_postProcessWithAnchorSuppression(inner));
       if(typeof _initMediaPlaybackObserver==='function') _initMediaPlaybackObserver();
       if(typeof loadTodos==='function'&&document.getElementById('panelTodos')&&document.getElementById('panelTodos').classList.contains('active')){loadTodos();}
+      if(typeof loadContextBrief==='function'&&document.getElementById('panelContext')&&document.getElementById('panelContext').classList.contains('active')){loadContextBrief();}
       return;
     }
   }
@@ -16873,6 +16874,7 @@ function renderMessages(options){
       : (typeof t==='function'?t('load_older_messages'):'Load earlier messages');
     inner.appendChild(indicator);
     _wireMessageWindowLoadEarlierButton();
+    if(typeof _contextBriefBannerNode==='function') inner.appendChild(_contextBriefBannerNode());
   }
   let lastUserRawIdx=-1;
   for(let rawIdx=S.messages.length-1;rawIdx>=0;rawIdx--){
@@ -18283,6 +18285,10 @@ function renderMessages(options){
   // Refresh todo panel if it's currently open
   if(typeof loadTodos==='function' && document.getElementById('panelTodos') && document.getElementById('panelTodos').classList.contains('active')){
     loadTodos();
+  }
+  // Refresh context brief panel if it's currently open
+  if(typeof loadContextBrief==='function' && document.getElementById('panelContext') && document.getElementById('panelContext').classList.contains('active')){
+    loadContextBrief();
   }
   // Apply persisted playback speed after media nodes are rendered.
   if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(inner);
