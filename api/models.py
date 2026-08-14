@@ -188,6 +188,7 @@ def _safe_replace(src: Path, dst: Path) -> None:
 _INDEX_WRITE_LOCK = threading.RLock()
 _SESSION_SAVE_AUTHORITIES_LOCK = threading.Lock()
 _SESSION_SAVE_AUTHORITIES: "weakref.WeakValueDictionary[str, threading.RLock]" = weakref.WeakValueDictionary()
+_INLINE_REPLAY_REPAIR_MAX_BYTES = 128 * 1024 * 1024
 _SESSION_INDEX_REBUILD_LOCK = threading.Lock()
 _SESSION_INDEX_REBUILD_THREAD = None
 _SESSION_INDEX_REBUILD_THREAD_TARGET: tuple[Path, Path] | None = None
@@ -1721,6 +1722,7 @@ class Session:
                 SidecarRevision.absent(self.session_id)
             )
         }
+        self._replay_repair_deferred = False
 
     @property
     def path(self):
@@ -1800,6 +1802,10 @@ class Session:
             )
         next_sidecar_generation = current_revision.generation + 1
         # ── #1558 P0 guard ──────────────────────────────────────────────
+        if getattr(self, '_replay_repair_deferred', False):
+            raise RuntimeError(
+                f"Session {self.session_id!r} requires offline replay repair before saving"
+            )
         if touch_updated_at:
             self.updated_at = time.time()
         # Freeze every persisted/indexed field, not only messages.  The sidecar
@@ -2117,6 +2123,39 @@ class Session:
             session._sidecar_revisions[sid] = _sidecar_revision_record(
                 post_read_revision
             )
+        inline_repair = p.stat().st_size <= _INLINE_REPLAY_REPAIR_MAX_BYTES
+        # #5854: snapshot the stat signature BEFORE reading so a legacy-facts
+        # cache write is only committed if the file didn't change under us
+        # during the parse (TOCTOU guard against an atomic replace mid-read).
+        _pre_read_sig = _sidecar_stat_signature(p)
+        data = json.loads(p.read_text(encoding='utf-8'))
+        if inline_repair:
+            data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(
+                data.get('messages')
+            )
+        else:
+            _collapsed_partials = False
+        session = cls(**data)
+        session._replay_repair_deferred = not inline_repair
+        if _collapsed_partials:
+            try:
+                # Self-heal bloated sessions on first full load without touching
+                # recency/index ordering; save() creates a .bak because this
+                # intentionally shrinks the transcript (#2592).
+                session.save(touch_updated_at=False, skip_index=True)
+            except Exception:
+                logger.debug("Failed to persist collapsed duplicate partials for %s", sid, exc_info=True)
+        else:
+            # #5854: for a LEGACY sidecar (no modern anchor_scene_index key), the
+            # cheap metadata-prefix read cannot recover message_count/scenes when
+            # scenes serialize before them, so cache the authoritative facts we
+            # just parsed. This keeps the metadata-only path and the eviction
+            # check from full-parsing this unchanged file again on every poll.
+            # Keyed by stat signature, so any edit invalidates it; the next
+            # save() rewrites the modern layout and the fallback stops firing.
+            # expected_sig guards against an atomic replace during the read.
+            # (When _collapsed_partials fired, save() above already rewrote the
+            # modern layout, so no legacy caching is needed.)
             if 'anchor_scene_index' not in data:
                 try:
                     _legacy_sidecar_facts_put(
