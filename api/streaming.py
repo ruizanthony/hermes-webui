@@ -67,8 +67,12 @@ from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
 from api.models import (
     _collapse_duplicate_incomplete_message_ids,
+    _durable_empty_assistant_replay_key,
+    _incomplete_reasoning_message_id,
+    _is_admissible_empty_text_content,
     _is_empty_partial_activity_message,
-    _strict_incomplete_message_id_key,
+    _message_has_structured_replay_fields,
+    _partial_message_signature as _durable_partial_message_signature,
     _evict_sessions_over_cap,
     clear_process_wakeup_pause,
     get_state_db_session_messages,
@@ -5888,7 +5892,7 @@ def _message_identity(msg):
             role == 'assistant'
             and str(msg.get('finish_reason') or '').lower() == 'incomplete'
         ):
-            typed_id_key = _strict_incomplete_message_id_key(msg.get('id'))
+            typed_id_key = _incomplete_reasoning_message_id(msg)
             if typed_id_key is not None:
                 return (
                     role,
@@ -5896,15 +5900,18 @@ def _message_identity(msg):
                     '',
                     '__incomplete_message_id__' + repr(typed_id_key),
                 )
+            return None
         # Canonical incomplete identity must win over the legacy partial arm:
         # persistence keys `_partial + incomplete` rows by typed message id too.
         if msg.get('_partial'):
-            reasoning_key = " ".join(str(msg.get('reasoning') or '').split())[:200]
+            partial_digest = _durable_partial_message_signature(msg)
+            if partial_digest is None:
+                return None
             return (
                 role,
                 '',  # empty text
                 '',  # no tool_call_id
-                '__partial__' + reasoning_key,
+                '__partial__' + partial_digest.hex(),
             )
         return None
     return (
@@ -5927,6 +5934,11 @@ def _messages_have_prefix(messages, prefix, *, key_fn=None):
 
 def _message_replay_key(msg):
     """Return a stable comparison key for replay/overlap de-duplication."""
+    durable_empty_key = _durable_empty_assistant_replay_key(msg)
+    if durable_empty_key is not None:
+        return ('durable_empty', durable_empty_key)
+    if _message_has_structured_replay_fields(msg):
+        return None
     identity = _message_identity(msg)
     # ``api_content`` is a provider-facing replay sidecar.  It must participate
     # in context/replay overlap identity or two same-visible turns can collapse
@@ -5944,6 +5956,11 @@ def _message_replay_key(msg):
             return (*identity, sidecar)
         return identity
     if not isinstance(msg, dict):
+        return None
+    if (
+        str(msg.get('role') or '') == 'assistant'
+        and not _is_admissible_empty_text_content(msg.get('content'))
+    ):
         return None
     key = (
         str(msg.get('role') or ''),
