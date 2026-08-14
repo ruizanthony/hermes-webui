@@ -121,6 +121,11 @@ and 5; it does not mark every run-state boundary implemented.
 8. **Every mutation names its layer.** A PR touching streaming, recovery,
    context reconstruction, compression, replay, or sidebar metadata should state
    which layer it changes and what regression proves the invariant still holds.
+9. **Sidecar writes are generation-fenced.** A writer may replace a session JSON
+   sidecar only while the exact durable revision it observed is still current.
+   First creation must be create-only, SID rotation must start from an absent
+   revision for the new ID, recovery must invalidate stale in-memory aliases, and
+   a shrinking write must not proceed unless its richest backup is durable.
 
 ## Review Checklist
 
@@ -139,6 +144,8 @@ context reconstruction, or session metadata:
 - Can this change move a session in the sidebar without meaningful user or
   assistant activity?
 - Can automatic compression or recovery text become visible active-turn content?
+- Can a stale save, repair, recovery, or metadata patch replace a newer sidecar?
+  If the write shrinks history, is backup publication fail-closed and monotone?
 - What test or manual evidence proves the invariant?
 
 ## Existing Issue Map
