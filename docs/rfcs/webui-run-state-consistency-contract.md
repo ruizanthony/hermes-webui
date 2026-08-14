@@ -123,9 +123,15 @@ and 5; it does not mark every run-state boundary implemented.
    which layer it changes and what regression proves the invariant still holds.
 9. **Sidecar writes are generation-fenced.** A writer may replace a session JSON
    sidecar only while the exact durable revision it observed is still current.
-   First creation must be create-only, SID rotation must start from an absent
-   revision for the new ID, recovery must invalidate stale in-memory aliases, and
-   a shrinking write must not proceed unless its richest backup is durable.
+   First creation must be create-only even on filesystems without hard-link
+   support, and SID rotation must start from an absent revision for the new ID.
+   A raw metadata patch may advance only aliases that owned the exact pre-write
+   revision; stale aliases are invalidated and reloaded instead. Recovery must
+   recheck durable deletes under the SID authority, validate the embedded SID,
+   and invalidate stale in-memory aliases. A shrinking write must not proceed
+   unless its richest backup is durable: row count alone does not prove
+   dominance, incomparable snapshots fail closed, and backup retirement requires
+   matching receipts for both the backup and the committed live generation.
 
 ## Review Checklist
 
@@ -145,7 +151,11 @@ context reconstruction, or session metadata:
   assistant activity?
 - Can automatic compression or recovery text become visible active-turn content?
 - Can a stale save, repair, recovery, or metadata patch replace a newer sidecar?
-  If the write shrinks history, is backup publication fail-closed and monotone?
+  Does recovery revalidate delete tombstones and state-db ownership while holding
+  the same SID authority used for publication?
+- If the write shrinks history, is backup publication fail-closed and monotone by
+  semantic row coverage rather than count? Does cleanup prove both backup and
+  live-generation ownership before unlinking?
 - What test or manual evidence proves the invariant?
 
 ## Existing Issue Map
