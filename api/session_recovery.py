@@ -1230,21 +1230,84 @@ def repair_safe_session_recovery(session_dir: Path, state_db_path: Path | None =
     }
 
 
+def _archived_session_ids_from_index(session_dir: Path) -> set[str] | None:
+    """Return explicitly archived SIDs, or ``None`` when the index is unusable.
+
+    The index is an optimization hint, never the sole recovery authority.  A
+    missing or malformed index therefore fails open to the historical full
+    scan, while a valid index lets startup defer cold archived transcripts.
+    """
+    try:
+        rows = json.loads((session_dir / '_index.json').read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(rows, list):
+        return None
+    archived_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict) or row.get('archived') is not True:
+            continue
+        session_id = row.get('session_id')
+        if isinstance(session_id, str) and session_id:
+            archived_ids.add(session_id)
+    return archived_ids
+
+
+def _recovery_candidate_exceeds_size(path: Path, max_candidate_bytes: int | None) -> bool:
+    """Return True when either side of a recovery pair exceeds the boot budget."""
+    if not isinstance(max_candidate_bytes, int) or max_candidate_bytes <= 0:
+        return False
+    for candidate in (path, path.with_suffix('.json.bak')):
+        try:
+            if candidate.exists() and candidate.stat().st_size > max_candidate_bytes:
+                return True
+        except OSError:
+            # Let normal recovery report unreadable files instead of silently
+            # classifying an unknown size as oversized.
+            return False
+    return False
+
+
 def recover_all_sessions_on_startup(
     session_dir: Path,
     rebuild_index: bool = False,
     state_db_path: Path | None = None,
+    *,
+    include_archived: bool = True,
+    max_candidate_bytes: int | None = None,
 ) -> dict:
     """Scan session_dir for shrunken/orphaned sessions and restore from .bak.
 
-    Returns {"scanned": N, "restored": M, "orphaned_backups": K, "details": [...]}.
+    ``include_archived=False`` uses the compact WebUI index as a fail-open
+    optimization hint. ``max_candidate_bytes`` keeps oversized repair work out
+    of the latency-sensitive boot path; those candidates remain untouched for
+    the bounded offline compactor or an explicit repair.
     """
     if not session_dir.exists():
-        return {"scanned": 0, "restored": 0, "orphaned_backups": 0, "details": []}
+        return {
+            "scanned": 0,
+            "restored": 0,
+            "orphaned_backups": 0,
+            "skipped_archived": 0,
+            "deferred_oversized": 0,
+            "details": [],
+        }
     restored = 0
     details: list[dict] = []
     live_paths = [path for path in sorted(session_dir.glob('*.json')) if not path.name.startswith('_')]
     orphan_paths = _orphaned_backup_live_paths(session_dir, state_db_path=state_db_path)
+    skipped_archived = 0
+    if not include_archived:
+        archived_ids = _archived_session_ids_from_index(session_dir)
+        if archived_ids is not None:
+            original_live_count = len(live_paths)
+            original_orphan_count = len(orphan_paths)
+            live_paths = [path for path in live_paths if path.stem not in archived_ids]
+            orphan_paths = [path for path in orphan_paths if path.stem not in archived_ids]
+            skipped_archived = (
+                original_live_count - len(live_paths)
+                + original_orphan_count - len(orphan_paths)
+            )
     # Only sessions with a backup can be restored through this startup path.
     # Older code called recover_session() for every live sidecar, and
     # inspect_session_recovery_status() read the complete JSON file before even
@@ -1254,7 +1317,14 @@ def recover_all_sessions_on_startup(
     # expensive reads to actual recovery candidates.
     recovery_paths = [path for path in live_paths if path.with_suffix('.json.bak').exists()]
     scanned = len(live_paths) + len(orphan_paths)
-    for path in [*recovery_paths, *orphan_paths]:
+    candidates = [*recovery_paths, *orphan_paths]
+    deferred_oversized = sum(
+        1 for path in candidates
+        if _recovery_candidate_exceeds_size(path, max_candidate_bytes)
+    )
+    for path in candidates:
+        if _recovery_candidate_exceeds_size(path, max_candidate_bytes):
+            continue
         try:
             result = recover_session(path, state_db_path=state_db_path)
         except Exception as exc:
@@ -1284,6 +1354,8 @@ def recover_all_sessions_on_startup(
         "scanned": scanned,
         "restored": restored,
         "orphaned_backups": len(orphan_paths),
+        "skipped_archived": skipped_archived,
+        "deferred_oversized": deferred_oversized,
         "details": details,
     }
 
