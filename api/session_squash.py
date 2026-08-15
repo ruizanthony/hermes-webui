@@ -351,6 +351,220 @@ def _generate_summary(session, sid: str, provided: str | None) -> tuple[str, str
 
 # ── apply ────────────────────────────────────────────────────────────────
 
+def _estimate_messages_tokens(messages) -> int:
+    """Best-effort token estimate for a list of model-facing messages.
+
+    Uses the agent's rough estimator when importable (same bucket math the
+    preflight estimate uses), with a char-based fallback so the gauge reset
+    never fails in WebUI-only environments.
+    """
+    try:
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        estimate = estimate_messages_tokens_rough(messages)
+        if isinstance(estimate, int) and estimate > 0:
+            return estimate
+    except Exception:
+        pass
+    total = 0
+    for row in messages or []:
+        if not isinstance(row, dict):
+            continue
+        content = row.get("content")
+        if isinstance(content, str):
+            total += len(content) // 4
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total += len(str(part.get("text") or part.get("content") or "")) // 4
+    return max(1, total)
+
+
+def _estimate_summary_tokens(summary: str) -> int:
+    """Best-effort token estimate for the single post-squash summary message.
+
+    Used to reset the gauge-facing ``last_prompt_tokens`` so the context
+    indicator stops advertising the stale pre-squash prompt size (the
+    2026-08-15 incident showed 79,814 tokens / 29% while the backend
+    preflight evaluated the reconstructed request at ~212K / 78%).
+    """
+    return _estimate_messages_tokens([{"role": "assistant", "content": summary}])
+
+
+def is_verified_manual_squash_state(session) -> bool:
+    """Return True when the session object carries a verified manual-squash state.
+
+    The durable, squash-specific marker is ``_squash_summary`` on the first
+    transcript message: only a squash (in-process job or skill script) sets it,
+    and it survives post-squash turns (the summary stays the first message).
+
+    Guards kept from the manual-squash contract: a manual anchor mode, a
+    positive truncation boundary (the squash barriers exist), and no fork
+    parent (manual squash detaches the display lineage).
+    """
+    try:
+        if str(getattr(session, "compression_anchor_mode", None) or "") != "manual":
+            return False
+        boundary = float(getattr(session, "truncation_boundary", None))
+    except (TypeError, ValueError):
+        return False
+    if boundary <= 0:
+        return False
+    if getattr(session, "parent_session_id", None) not in (None, ""):
+        return False
+    messages = getattr(session, "messages", None) or []
+    first = messages[0] if messages and isinstance(messages[0], dict) else None
+    return first is not None and first.get("_squash_summary") is True
+
+
+def _message_timestamp_float(row) -> float | None:
+    if not isinstance(row, dict):
+        return None
+    for key in ("_ts", "timestamp"):
+        try:
+            parsed = float(row.get(key))
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
+def repair_reinjected_pre_squash_context(session) -> bool:
+    """Prune pre-squash rows re-injected into ``context_messages``.
+
+    Sessions squashed before the state.db lineage detach existed could run a
+    turn whose rebuilt agent re-injected the archived lineage (2026-08-15
+    incident: 90 pre-squash rows persisted back into ``context_messages``).
+    Those rows carry timestamps strictly BEFORE the squash boundary; nothing
+    legitimately older than the boundary can exist in a squashed session, so
+    they are provably foreign and removed. Rows without a usable timestamp
+    are kept — only provably pre-squash content is dropped.
+
+    Returns True when at least one row was removed and the sidecar saved.
+    Caller must hold the session's agent lock. Fail-open on any error.
+    """
+    if not is_verified_manual_squash_state(session):
+        return False
+    try:
+        boundary = float(getattr(session, "truncation_boundary", None))
+    except (TypeError, ValueError):
+        return False
+    context_messages = getattr(session, "context_messages", None)
+    if not isinstance(context_messages, list) or not context_messages:
+        return False
+    kept = []
+    removed = 0
+    for row in context_messages:
+        row_ts = _message_timestamp_float(row)
+        if row_ts is not None and row_ts < boundary:
+            removed += 1
+            continue
+        kept.append(row)
+    if removed == 0:
+        return False
+    session.context_messages = kept
+    session.last_prompt_tokens = _estimate_messages_tokens(kept)
+    session.post_compression_context_tokens_estimate = None
+    try:
+        session.save()
+        logger.info(
+            "squash repair: removed %d re-injected pre-squash rows from "
+            "context_messages for %s",
+            removed,
+            getattr(session, "session_id", None),
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "squash repair: failed to persist pruned context_messages for %s",
+            getattr(session, "session_id", None),
+            exc_info=True,
+        )
+        return False
+
+
+def detach_state_db_compression_lineage(
+    session_id: str,
+    *,
+    state_db_path=None,
+    profile=None,
+) -> bool:
+    """Reopen a compression-rotated state.db row after a verified squash.
+
+    The agent's turn-start recovery (hermes-agent
+    ``recover_rotated_compression_session``) reads the state.db ``sessions``
+    row for the WebUI session id; when that row still carries
+    ``end_reason='compression'`` it follows the continuation chain to the
+    live tip and REPLACES the squashed conversation history with the archived
+    lineage — re-injecting exactly the transcript the squash removed.
+
+    A manual squash already detaches the sidecar lineage (parent_session_id,
+    watermark/boundary barriers); this reopens the durable state.db row so the
+    agent treats the squashed session as a standalone root again. Reopening is
+    safe: the continuation children keep their own rows and messages; only the
+    parent's ended/end_reason markers are cleared, and the children keep their
+    ``parent_session_id`` for display stitching by other surfaces.
+
+    Fail-open by design: any error (missing state.db, locked DB, absent
+    hermes_state) returns False and the squash result stands — the sidecar
+    barriers remain the second line of defense. Returns True only when the row
+    was compression-rotated AND is verified reopened.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    if state_db_path is None:
+        try:
+            from api.models import _agent_state_db_path
+
+            state_db_path = _agent_state_db_path(profile=profile)
+        except Exception:
+            logger.debug("squash detach: state.db path resolution failed for %s", sid, exc_info=True)
+            return False
+    if state_db_path is None:
+        return False
+    path = Path(state_db_path)
+    if not path.exists():
+        return False
+    try:
+        from hermes_state import SessionDB
+    except Exception:
+        logger.debug("squash detach: hermes_state unavailable for %s", sid)
+        return False
+    db = None
+    try:
+        db = SessionDB(db_path=path)
+        row = db.get_session(sid)
+        if not isinstance(row, dict):
+            return False
+        if row.get("ended_at") is None or str(row.get("end_reason") or "") != "compression":
+            return False
+        db.reopen_session(sid)
+        check = db.get_session(sid)
+        reopened = (
+            isinstance(check, dict)
+            and check.get("ended_at") is None
+            and not check.get("end_reason")
+        )
+        if reopened:
+            logger.info(
+                "squash: detached compression lineage in state.db for %s "
+                "(prevented archived-history re-injection)",
+                sid,
+            )
+        return reopened
+    except Exception:
+        logger.warning("squash detach: state.db lineage detach failed for %s", sid, exc_info=True)
+        return False
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
 def _busy_fields(session) -> dict:
     busy = {}
     for field in ("active_stream_id", "pending_user_message", "pending_started_at", "pending_turn_id"):
@@ -433,6 +647,15 @@ def _apply_squash(
     session.compaction_generation = uuid.uuid4().hex
     session.truncation_watermark = now
     session.truncation_boundary = now
+    # Reset the gauge-facing context counters: after a squash the only
+    # model-facing content is the summary itself. Billing/consumption counters
+    # (input_tokens, output_tokens, cache_*, estimated_cost) are preserved —
+    # they are the session's usage history, not a live-context measurement.
+    # Without this reset the context indicator kept advertising the stale
+    # pre-squash prompt size while the backend preflight evaluated the
+    # rebuilt request on a completely different basis (2026-08-15 incident).
+    session.last_prompt_tokens = _estimate_summary_tokens(summary)
+    session.post_compression_context_tokens_estimate = None
     session.updated_at = now
     session.save()
 
@@ -465,6 +688,9 @@ def _apply_squash(
         )
         and persisted.get("active_stream_id") is None
         and persisted.get("pending_user_message") is None
+        and persisted.get("post_compression_context_tokens_estimate") is None
+        and isinstance(persisted.get("last_prompt_tokens"), int)
+        and persisted.get("last_prompt_tokens") > 0
     )
     if not ok:
         _rollback_failed_squash(session, archive_path, session_path, original_sha)
@@ -479,7 +705,11 @@ def _apply_squash(
 
     return {
         "before": {"message_count": before_count, "bytes": before_bytes},
-        "after": {"message_count": 1, "bytes": session_path.stat().st_size},
+        "after": {
+            "message_count": 1,
+            "bytes": session_path.stat().st_size,
+            "last_prompt_tokens_estimate": session.last_prompt_tokens,
+        },
         "original_sha256": original_sha,
         "archive_path": str(archive_path),
         "manifest_path": str(manifest_path),
@@ -721,6 +951,16 @@ def _run_squash_job(job: dict, provided_summary: str | None) -> None:
             _evict_session_agent(sid)
         except Exception:
             logger.warning("squash: agent eviction failed for %s", sid, exc_info=True)
+        # Detach the durable state.db compression lineage so the agent's
+        # turn-start recovery (recover_rotated_compression_session) cannot
+        # re-inject the archived history on the next turn. Fail-open: the
+        # sidecar watermark/boundary barriers remain the second line.
+        try:
+            detach_state_db_compression_lineage(
+                sid, profile=getattr(session, "profile", None)
+            )
+        except Exception:
+            logger.warning("squash: state.db lineage detach failed for %s", sid, exc_info=True)
         try:
             _publish_session_list_changed(
                 "session_squash",

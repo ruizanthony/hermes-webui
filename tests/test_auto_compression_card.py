@@ -450,8 +450,12 @@ def test_agent_status_callback_emits_compressing_and_warning_events():
 
     # compressing events only via the narrowed helper (no broad substring matcher)
     assert "put('compressing'" in block
-    assert "'session_id': session_id" in block
-    assert "'message': 'Compressing context'" in block
+    # The payload is built by the authoritative builder (covered behaviorally in
+    # tests/test_squash_context_coherence.py): it carries session_id, the fixed
+    # 'Compressing context' message, and the compressor's own usage values so
+    # the gauge matches the preflight decision (2026-08-15 incident).
+    assert "_compression_start_event_payload(session_id, agent)" in block
+    assert '"message": "Compressing context"' in src
     assert "_is_agent_compression_start_status(_kind, _message)" in block
     assert "or 'compressing' in _lower" not in block
     assert "or 'preflight compression' in _lower" not in block
