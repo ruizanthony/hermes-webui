@@ -1,4 +1,5 @@
 import copy
+import contextlib
 import json
 from types import SimpleNamespace
 
@@ -258,6 +259,27 @@ def test_exact_prefix_mode_requires_identical_nonempty_attachments():
     )
 
 
+def test_authoritative_prefix_rejects_different_durable_ids():
+    from api.streaming import _result_has_authoritative_full_history_prefix
+
+    previous = [{"role": "user", "content": "old prompt", "id": "old-user"}]
+    result = [
+        {"role": "user", "content": "old prompt", "id": "different-user"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+
+    assert not _result_has_authoritative_full_history_prefix(
+        result,
+        previous,
+        {
+            "text": "current prompt",
+            "current_turn_user_idx": len(previous),
+            "turn_id": "turn:durable-id-control",
+        },
+        "current prompt",
+    )
+
+
 def _settle_structured_result(previous, result):
     from api.streaming import _settle_result_messages
 
@@ -286,6 +308,60 @@ def _settle_structured_result(previous, result):
         },
     )
     return session
+
+
+def test_settle_legacy_double_exact_history_replay_is_idempotent():
+    from api.streaming import _settle_result_messages
+
+    previous = [
+        {"role": "user", "content": "old prompt"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    prompt = "continue the active turn"
+    result = [
+        *copy.deepcopy(previous),
+        *copy.deepcopy(previous),
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "new answer"},
+    ]
+    session = SimpleNamespace(
+        session_id="strict-legacy-double-replay",
+        messages=copy.deepcopy(previous),
+        context_messages=copy.deepcopy(previous),
+        truncation_watermark=None,
+    )
+
+    _settle_result_messages(
+        session,
+        copy.deepcopy(previous),
+        copy.deepcopy(previous),
+        result,
+        prompt,
+        "webui",
+        {
+            "token": None,
+            "text": prompt,
+            "timestamp": None,
+            "source": "webui",
+            "attachments": [],
+            "current_turn_user_idx": None,
+            "turn_id": "",
+        },
+    )
+
+    for projection in (session.messages, session.context_messages):
+        assert [row.get("role") for row in projection] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert [row.get("content") for row in projection] == [
+            "old prompt",
+            "old answer",
+            prompt,
+            "new answer",
+        ]
 
 
 def test_settle_preserves_exact_structured_assistant_delta():
@@ -320,6 +396,302 @@ def test_settle_strips_exact_structured_prefix_from_full_history():
             "assistant",
         ]
         assert projection[-1]["content"] == "new answer"
+
+
+def test_settle_strips_exact_structured_history_with_out_of_band_current_user():
+    previous = [
+        {"role": "user", "content": "old prompt", "id": "old-user"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "old answer", "annotations": ["durable"]}
+            ],
+            "id": "old-assistant",
+            "reasoning": "durable reasoning",
+            "api_content": "durable provider payload",
+        },
+    ]
+    answer = {"role": "assistant", "content": "new answer", "id": "new-assistant"}
+
+    session = _settle_structured_result(previous, [*copy.deepcopy(previous), answer])
+
+    for projection in (session.messages, session.context_messages):
+        assert len(projection) == 4
+        assert projection[:2] == previous
+        assert [row.get("role") for row in projection] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert projection[2]["content"] == "continue the active turn"
+        assert projection[3] == answer
+
+
+def test_settle_preserves_idless_exact_prefix_authority_after_id_assignment():
+    previous = [
+        {"role": "user", "content": "old prompt"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "old answer", "annotations": ["durable"]}
+            ],
+            "reasoning": "durable reasoning",
+        },
+    ]
+    answer = {"role": "assistant", "content": "new answer"}
+
+    session = _settle_structured_result(previous, [*copy.deepcopy(previous), answer])
+
+    for projection in (session.messages, session.context_messages):
+        assert [row.get("role") for row in projection] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert [row.get("content") for row in projection].count("old prompt") == 1
+        assert sum(
+            isinstance(row.get("content"), list)
+            and row["content"][0].get("text") == "old answer"
+            for row in projection
+        ) == 1
+        assert projection[-1]["content"] == "new answer"
+        assert type(projection[-1].get("id")) is int
+
+
+def test_settle_preserves_payload_distinct_rejected_history_prefix():
+    previous = [
+        {"role": "user", "content": "old prompt", "id": "old-user"},
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "id": "old-assistant",
+            "reasoning": "old reasoning",
+            "model": "old-model",
+            "request_id": "old-request",
+        },
+    ]
+    distinct_history = {
+        "role": "assistant",
+        "content": "same answer",
+        "id": "distinct-assistant",
+        "reasoning": "distinct reasoning",
+        "model": "distinct-model",
+        "request_id": "distinct-request",
+    }
+    final = {
+        "role": "assistant",
+        "content": "final answer",
+        "id": "final-assistant",
+    }
+
+    session = _settle_structured_result(
+        previous,
+        [copy.deepcopy(previous[0]), distinct_history, final],
+    )
+
+    for projection in (session.messages, session.context_messages):
+        assert [row.get("role") for row in projection] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "assistant",
+        ]
+        assert [
+            row.get("id")
+            for row in projection
+            if row.get("role") == "assistant"
+        ] == ["old-assistant", "distinct-assistant", "final-assistant"]
+        assert projection[1] == previous[1]
+        assert projection[2]["content"] == "continue the active turn"
+        assert projection[2]["_active_turn_token"] == (
+            "stream:strict-structured-prefix"
+        )
+        assert type(projection[2].get("id")) is int
+        assert projection[3] == distinct_history
+    assert session.messages[2]["id"] == session.context_messages[2]["id"]
+
+
+def test_sync_chat_uses_strict_turn_provenance_for_rejected_history_prefix(
+    monkeypatch,
+    tmp_path,
+):
+    """The synchronous route must not re-enable visible-only prefix deletion."""
+    from api import config, routes
+
+    previous = [
+        {"role": "user", "content": "old prompt", "id": "old-user"},
+        {
+            "role": "assistant",
+            "content": "same answer",
+            "id": "old-assistant",
+            "reasoning": "old reasoning",
+            "model": "old-model",
+            "request_id": "old-request",
+        },
+    ]
+    distinct_history = {
+        "role": "assistant",
+        "content": "same answer",
+        "id": "distinct-assistant",
+        "reasoning": "distinct reasoning",
+        "model": "distinct-model",
+        "request_id": "distinct-request",
+    }
+    prompt = "continue the active turn"
+    final = {
+        "role": "assistant",
+        "content": "final answer",
+        "id": "final-assistant",
+    }
+    result = {
+        "messages": [
+            copy.deepcopy(previous[0]),
+            copy.deepcopy(distinct_history),
+            {"role": "user", "content": prompt},
+            copy.deepcopy(final),
+        ],
+        "current_turn_user_idx": len(previous),
+        "turn_id": "turn:sync-strict-prefix",
+        "final_response": "final answer",
+        "completed": True,
+    }
+
+    class _Session:
+        session_id = "sync-strict-prefix"
+        workspace = str(tmp_path)
+        model = "test-model"
+        model_provider = "test-provider"
+        profile = "default"
+        pending_user_source = "webui"
+        title = "Already titled"
+        input_tokens = 0
+        output_tokens = 0
+        estimated_cost = 0.0
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        truncation_watermark = None
+        messages = copy.deepcopy(previous)
+        context_messages = copy.deepcopy(previous)
+
+        def save(self):
+            return None
+
+        def compact(self):
+            return {
+                "session_id": self.session_id,
+                "title": self.title,
+                "message_count": len(self.messages),
+            }
+
+    class _Agent:
+        def __init__(self, **_kwargs):
+            self._persist_user_message_idx = len(previous)
+            self._current_turn_id = "turn:sync-strict-prefix"
+
+        def run_conversation(self, **_kwargs):
+            return copy.deepcopy(result)
+
+    session = _Session()
+    monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **_kwargs: None)
+    monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda _sid: False)
+    monkeypatch.setattr(routes, "get_session", lambda _sid: session)
+    monkeypatch.setattr(routes, "resolve_trusted_workspace", lambda value: value)
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda _sid: contextlib.nullcontext())
+    monkeypatch.setattr(routes, "_read_profile_model_config", lambda *_args: (None, None, {}))
+    monkeypatch.setattr(
+        routes,
+        "_resolve_compatible_session_model_state",
+        lambda *_args, **_kwargs: ("test-model", "test-provider"),
+    )
+    monkeypatch.setattr(routes, "require_ai_agent_class", lambda: _Agent)
+    monkeypatch.setattr(routes, "_resolve_cli_toolsets", lambda: [])
+    monkeypatch.setattr(routes, "get_config", lambda: {})
+    monkeypatch.setattr(routes, "load_settings", lambda: {})
+    monkeypatch.setattr(routes, "title_from", lambda _messages, fallback: fallback)
+    monkeypatch.setattr(routes, "public_session_projection", lambda payload: payload)
+    monkeypatch.setattr(routes, "j", lambda _handler, payload, status=200: payload)
+    monkeypatch.setattr(
+        config,
+        "resolve_model_provider",
+        lambda _model: ("test-model", "test-provider", None),
+    )
+
+    routes._handle_chat_sync(
+        object(),
+        {
+            "session_id": session.session_id,
+            "message": prompt,
+            "workspace": str(tmp_path),
+        },
+    )
+
+    for projection in (session.messages, session.context_messages):
+        assert [row.get("role") for row in projection] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "assistant",
+        ]
+        assert [
+            row.get("id")
+            for row in projection
+            if row.get("role") == "assistant"
+        ] == ["old-assistant", "distinct-assistant", "final-assistant"]
+        assert projection[2]["content"] == prompt
+        assert type(projection[2].get("id")) is int
+        assert projection[3] == distinct_history
+    assert session.messages[2]["id"] == session.context_messages[2]["id"]
+
+
+def test_display_backfill_preserves_payload_distinct_same_visible_assistant():
+    from api.streaming import _merge_display_messages_after_agent_result
+
+    user = {"role": "user", "content": "old prompt", "id": "old-user"}
+    visible = {
+        "role": "assistant",
+        "content": "same answer",
+        "id": "assistant-a",
+        "reasoning": "first reasoning",
+    }
+    context_only = {
+        "role": "assistant",
+        "content": "same answer",
+        "id": "assistant-b",
+        "reasoning": "second reasoning",
+    }
+    current = {"role": "user", "content": "next prompt", "id": "current-user"}
+    final = {"role": "assistant", "content": "done", "id": "assistant-final"}
+    previous_display = [user, visible]
+    previous_context = [user, visible, context_only]
+
+    merged = _merge_display_messages_after_agent_result(
+        copy.deepcopy(previous_display),
+        copy.deepcopy(previous_context),
+        copy.deepcopy(previous_context + [current, final]),
+        "next prompt",
+        verification_nudge_provenance={
+            "active_turn_identity": {
+                "token": "stream:backfill",
+                "text": "next prompt",
+                "current_turn_user_idx": len(previous_context),
+                "turn_id": "turn:backfill",
+            }
+        },
+    )
+
+    assert [row.get("id") for row in merged] == [
+        "old-user",
+        "assistant-a",
+        "assistant-b",
+        "current-user",
+        "assistant-final",
+    ]
+    assert merged[1] == visible
+    assert merged[2] == context_only
 
 
 def test_display_merge_collapses_only_exact_durable_empty_replay():
@@ -401,6 +773,14 @@ def test_display_merge_collapses_only_exact_durable_empty_replay():
         (
             {"role": "assistant", "content": "same", "reasoning": "alpha"},
             {"role": "assistant", "content": "same", "reasoning": "beta"},
+        ),
+        (
+            {"role": "assistant", "content": "same", "model": "model-a"},
+            {"role": "assistant", "content": "same", "model": "model-b"},
+        ),
+        (
+            {"role": "assistant", "content": "same", "request_id": "request-a"},
+            {"role": "assistant", "content": "same", "request_id": "request-b"},
         ),
         (
             {
@@ -520,6 +900,37 @@ def test_settle_collapses_idless_exact_assistant_before_stable_id_assignment():
         assert len(assistants) == 1
         assert assistants[0]["content"] == "same"
         assert type(assistants[0].get("id")) is int
+
+
+def test_settle_preserves_idless_repeated_answer_across_current_turn_boundary():
+    previous = [
+        {"role": "user", "content": "Say it once."},
+        {"role": "assistant", "content": "same"},
+    ]
+    result = [*copy.deepcopy(previous), {"role": "assistant", "content": "same"}]
+
+    session = _settle_structured_result(previous, result)
+
+    for projection in (session.messages, session.context_messages):
+        assert [row.get("role") for row in projection] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert [
+            row.get("content")
+            for row in projection
+            if row.get("role") == "assistant"
+        ] == ["same", "same"]
+        assistant_ids = [
+            row.get("id")
+            for row in projection
+            if row.get("role") == "assistant"
+        ]
+        assert type(assistant_ids[-1]) is int
+        if assistant_ids[0] is not None:
+            assert assistant_ids[0] != assistant_ids[-1]
 
 
 @pytest.mark.parametrize(
