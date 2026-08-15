@@ -9,14 +9,43 @@ both checks before claiming or starting work.
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
 from collections.abc import Iterator
+from contextlib import contextmanager
+import threading
 
 logger = logging.getLogger(__name__)
 
 
 class WebUIMaintenanceInProgress(RuntimeError):
     """Raised when a new autonomous WebUI turn must remain deferred."""
+
+
+class WebUITurnLeaseHandoff:
+    """Idempotently transfer an admitted shared lease to a worker thread."""
+
+    def __init__(self, release_callback):
+        self._release_callback = release_callback
+        self._lock = threading.Lock()
+        self._transferred = False
+        self._released = False
+
+    @property
+    def transferred(self) -> bool:
+        with self._lock:
+            return self._transferred
+
+    def transfer_to_worker(self) -> None:
+        with self._lock:
+            if self._released:
+                raise RuntimeError("maintenance lease was already released")
+            self._transferred = True
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._release_callback()
 
 
 def external_drain_requested() -> bool:
@@ -34,8 +63,8 @@ def external_drain_requested() -> bool:
 
 
 @contextmanager
-def webui_server_turn_admission() -> Iterator[None]:
-    """Hold one shared lease from pre-claim check through turn admission."""
+def webui_server_turn_admission() -> Iterator[WebUITurnLeaseHandoff]:
+    """Hold or transfer one shared lease across the admitted worker's lifetime."""
     if external_drain_requested():
         raise WebUIMaintenanceInProgress("Gateway drain is active")
 
@@ -46,15 +75,29 @@ def webui_server_turn_admission() -> Iterator[None]:
         )
     except ImportError:
         # Older Agent installations have no matching exclusive updater lease.
-        yield
+        handoff = WebUITurnLeaseHandoff(lambda: None)
+        try:
+            yield handoff
+        finally:
+            if not handoff.transferred:
+                handoff.release()
         return
 
+    lease_context = cli_tui_turn_lease("webui")
     try:
-        with cli_tui_turn_lease("webui"):
-            # Recheck after acquiring the lease so the decision and action use
-            # the same protected admission window.
-            if external_drain_requested():
-                raise WebUIMaintenanceInProgress("Gateway drain is active")
-            yield
+        lease_context.__enter__()
     except MaintenanceInProgress as exc:
         raise WebUIMaintenanceInProgress(str(exc)) from exc
+
+    handoff = WebUITurnLeaseHandoff(
+        lambda: lease_context.__exit__(None, None, None)
+    )
+    try:
+        # Recheck after acquiring the lease so the decision and action use
+        # the same protected admission window.
+        if external_drain_requested():
+            raise WebUIMaintenanceInProgress("Gateway drain is active")
+        yield handoff
+    finally:
+        if not handoff.transferred:
+            handoff.release()

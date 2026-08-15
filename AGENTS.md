@@ -83,9 +83,11 @@ these signals.
 Autonomous in-process turns (Goal continuations, process wakeups, delegation
 completions, and sibling workers) must enter through `start_session_turn` and
 therefore `api.maintenance_gate.webui_server_turn_admission`. The gate couples
-the Gateway drain marker with the Agent shared maintenance lease. A rejected
-turn returns retryable HTTP status `409`; durable producers must release or
-retain their claim and must not acknowledge, discard, or consume a retry.
+the Gateway drain marker with the Agent shared maintenance lease and transfers
+that lease to the worker until its real completion. A successful `202` must not
+create an unleased gap before worker execution. A rejected turn returns
+retryable HTTP status `409`; durable producers must release or retain their
+claim and must not acknowledge, discard, or consume a retry.
 Goal continuations additionally acquire the same gate before claiming an
 intent so maintenance cannot create claim churn. Never bypass this chokepoint
 for a new autonomous turn source.
