@@ -66,9 +66,15 @@ from api.todo_state import attach_todo_state, emit_todo_state
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
 from api.models import (
-    _collapse_duplicate_incomplete_message_ids,
+    _STRUCTURED_REPLAY_FIELDS,
+    _canonical_message_digest,
+    _collapse_replayed_assistant_rows,
+    _durable_empty_assistant_replay_key,
+    _incomplete_reasoning_message_id,
+    _is_admissible_empty_text_content,
     _is_empty_partial_activity_message,
-    _strict_incomplete_message_id_key,
+    _message_has_structured_replay_fields,
+    _partial_message_signature as _durable_partial_message_signature,
     _evict_sessions_over_cap,
     clear_process_wakeup_pause,
     get_state_db_session_messages,
@@ -1545,46 +1551,92 @@ def _active_turn_authority(session, stream_id, msg_text):
 
 
 def _coerce_current_turn_user_idx(value):
-    if isinstance(value, bool) or value is None:
+    if type(value) is not int or value < 0:
         return None
-    try:
-        idx = int(value)
-    except (TypeError, ValueError):
-        return None
-    return idx if idx >= 0 else None
+    return value
+
+
+def _coerce_current_turn_id(value):
+    if type(value) is not str:
+        return ''
+    return value.strip()
 
 
 def _resolve_active_turn_authority(identity, *, result=None, agent=None):
     if not isinstance(identity, dict):
         return identity
     resolved = dict(identity)
+    resolved['current_turn_user_idx'] = None
+    resolved['turn_id'] = ''
     if isinstance(result, dict):
         _result_idx = _coerce_current_turn_user_idx(result.get('current_turn_user_idx'))
-        if _result_idx is not None:
+        _result_turn_id = _coerce_current_turn_id(result.get('turn_id'))
+        if _result_idx is not None and _result_turn_id:
             resolved['current_turn_user_idx'] = _result_idx
-        _result_turn_id = str(result.get('turn_id') or '').strip()
-        if _result_turn_id:
             resolved['turn_id'] = _result_turn_id
+            return resolved
     if agent is not None:
-        if resolved.get('current_turn_user_idx') is None:
-            _agent_idx = _coerce_current_turn_user_idx(
-                getattr(agent, '_persist_user_message_idx', None)
-            )
-            if _agent_idx is not None:
-                resolved['current_turn_user_idx'] = _agent_idx
-        if not resolved.get('turn_id'):
-            _agent_turn_id = str(getattr(agent, '_current_turn_id', '') or '').strip()
-            if _agent_turn_id:
-                resolved['turn_id'] = _agent_turn_id
+        _agent_idx = _coerce_current_turn_user_idx(
+            getattr(agent, '_persist_user_message_idx', None)
+        )
+        _agent_turn_id = _coerce_current_turn_id(
+            getattr(agent, '_current_turn_id', '')
+        )
+        if _agent_idx is not None and _agent_turn_id:
+            resolved['current_turn_user_idx'] = _agent_idx
+            resolved['turn_id'] = _agent_turn_id
     return resolved
 
 
 def _active_turn_boundary_is_valid(identity):
     if not isinstance(identity, dict):
         return False
-    if not str(identity.get('turn_id') or '').strip():
+    turn_id = identity.get('turn_id')
+    if type(turn_id) is not str or not turn_id.strip():
         return False
-    return isinstance(identity.get('current_turn_user_idx'), int)
+    current_turn_user_idx = identity.get('current_turn_user_idx')
+    return type(current_turn_user_idx) is int and current_turn_user_idx >= 0
+
+
+def _result_has_authoritative_full_history_prefix(
+    result_messages,
+    previous_context,
+    identity,
+    msg_text,
+):
+    """Prove that an exact result prefix is history, not a lookalike delta."""
+    if not _active_turn_boundary_is_valid(identity):
+        return False
+    result_messages = list(result_messages or [])
+    previous_context = list(previous_context or [])
+    current_turn_user_idx = identity['current_turn_user_idx']
+    if current_turn_user_idx < 0 or current_turn_user_idx > len(previous_context):
+        return False
+    if current_turn_user_idx >= len(result_messages):
+        return False
+    current_turn = result_messages[current_turn_user_idx]
+    expected_text = identity.get('text') if identity.get('text') is not None else msg_text
+    if (
+        type(current_turn) is not dict
+        or current_turn.get('role') != 'user'
+        or _normalize_user_text(current_turn.get('content'))
+        != _normalize_user_text(expected_text)
+    ):
+        return False
+    if current_turn_user_idx < len(previous_context):
+        previous_current_turn = previous_context[current_turn_user_idx]
+        if (
+            type(previous_current_turn) is not dict
+            or previous_current_turn.get('role') != 'user'
+            or _normalize_user_text(previous_current_turn.get('content'))
+            != _normalize_user_text(expected_text)
+        ):
+            return False
+    return _messages_have_prefix(
+        result_messages,
+        previous_context,
+        allow_exact_payload=True,
+    )
 
 
 def _active_turn_token_matches(message, identity):
@@ -1648,7 +1700,14 @@ def _owner_projection_current_turn_row(messages, identity):
     return None
 
 
-def _find_active_turn_checkpoint_index(result_messages, previous_context, identity, msg_text):
+def _find_active_turn_checkpoint_index(
+    result_messages,
+    previous_context,
+    identity,
+    msg_text,
+    *,
+    allow_exact_prefix=False,
+):
     result_messages = list(result_messages or [])
     if not isinstance(identity, dict):
         return None
@@ -1662,7 +1721,11 @@ def _find_active_turn_checkpoint_index(result_messages, previous_context, identi
     candidates = []
     current_turn_user_idx = identity['current_turn_user_idx']
     previous_context = list(previous_context or [])
-    if _messages_have_prefix(result_messages, previous_context):
+    if _messages_have_prefix(
+        result_messages,
+        previous_context,
+        allow_exact_payload=allow_exact_prefix,
+    ):
         candidates.append(current_turn_user_idx)
     else:
         offset = current_turn_user_idx - len(previous_context)
@@ -1704,7 +1767,15 @@ def _materialize_active_turn_user(identity, msg_text, source):
     return message
 
 
-def _settle_current_turn_boundary(previous_context, result_messages, identity, msg_text, source):
+def _settle_current_turn_boundary(
+    previous_context,
+    result_messages,
+    identity,
+    msg_text,
+    source,
+    *,
+    allow_exact_prefix=False,
+):
     """Insert the pending turn before assistant/tool output when it is absent."""
     result_messages = list(result_messages or [])
     if not result_messages or not isinstance(identity, dict):
@@ -1714,12 +1785,17 @@ def _settle_current_turn_boundary(previous_context, result_messages, identity, m
         previous_context,
         identity,
         msg_text,
+        allow_exact_prefix=allow_exact_prefix,
     )
     if _checkpoint_idx is not None:
         _mark_active_turn_checkpoint(result_messages[_checkpoint_idx], identity)
         return result_messages
     previous_context = list(previous_context or [])
-    if _messages_have_prefix(result_messages, previous_context):
+    if _messages_have_prefix(
+        result_messages,
+        previous_context,
+        allow_exact_payload=allow_exact_prefix,
+    ):
         insert_at = len(previous_context)
     elif _active_turn_boundary_is_valid(identity):
         insert_at = identity['current_turn_user_idx'] - len(previous_context)
@@ -1831,6 +1907,14 @@ def _settle_result_messages(
     source,
     active_turn_identity,
 ):
+    result_has_authoritative_full_history_prefix = (
+        _result_has_authoritative_full_history_prefix(
+            result_messages,
+            previous_context_messages,
+            active_turn_identity,
+            msg_text,
+        )
+    )
     (
         result_messages,
         next_context_messages,
@@ -1841,6 +1925,14 @@ def _settle_result_messages(
         active_turn_identity,
     )
     if result_messages:
+        # Classify exact adjacent replays before generated stable IDs make two
+        # source-identical assistant rows artificially distinct. The shallow
+        # metadata-restoration projection shares the kept row dict, so the one
+        # minted ID remains identical in display and provider context.
+        result_messages, _ = _collapse_replayed_assistant_rows(result_messages)
+        next_context_messages, _ = _collapse_replayed_assistant_rows(
+            next_context_messages
+        )
         _assign_stable_message_ids(
             result_messages,
             previous_messages,
@@ -1857,6 +1949,7 @@ def _settle_result_messages(
             active_turn_identity,
             msg_text,
             source,
+            allow_exact_prefix=True,
         )
     session.context_messages = (
         _deduplicate_context_messages(next_context_messages)
@@ -1870,6 +1963,7 @@ def _settle_result_messages(
             active_turn_identity,
             msg_text,
             source,
+            allow_exact_prefix=True,
         )
     previous_display_for_writeback, session.context_messages = _align_current_turn_display(
         previous_messages,
@@ -1883,6 +1977,9 @@ def _settle_result_messages(
         msg_text,
         source=source,
         verification_nudge_provenance=verification_nudge_provenance,
+        result_has_authoritative_full_history_prefix=(
+            result_has_authoritative_full_history_prefix
+        ),
     )
     _annotate_media_snapshots_for_settled_messages(session.messages)
     _compact_session_image_parts_for_persistence(session)
@@ -5415,7 +5512,7 @@ def _api_safe_message_positions(messages):
 
 
 def _deduplicate_context_messages(messages):
-    """Remove duplicate messages from context by identity, keeping first occurrence.
+    """Remove only replay-safe duplicates from provider-facing context.
 
     Prevents the agent from seeing the same message twice in conversation_history
     when result_messages contain duplicates that weren't caught by display-merge.
@@ -5443,6 +5540,12 @@ def _deduplicate_context_messages(messages):
             deduped.append(msg)
             continue
         if _is_compressed_context_tool_result_summary_message(msg) and not msg.get('tool_call_id'):
+            deduped.append(msg)
+            continue
+        if type(msg) is dict and msg.get('role') == 'assistant':
+            # Assistant payloads are provider-owned. Preserve them here and run
+            # the same exact replay pipeline used by display and persistence
+            # after user/marker normalization has established adjacency.
             deduped.append(msg)
             continue
         # Context ownership is provider-facing: two rows with identical visible
@@ -5475,6 +5578,7 @@ def _deduplicate_context_messages(messages):
         if key is not None:
             seen.add(key)
         deduped.append(msg)
+    deduped, _ = _collapse_replayed_assistant_rows(deduped)
     return deduped
 
 
@@ -5825,7 +5929,7 @@ def _message_identity(msg):
             role == 'assistant'
             and str(msg.get('finish_reason') or '').lower() == 'incomplete'
         ):
-            typed_id_key = _strict_incomplete_message_id_key(msg.get('id'))
+            typed_id_key = _incomplete_reasoning_message_id(msg)
             if typed_id_key is not None:
                 return (
                     role,
@@ -5833,15 +5937,18 @@ def _message_identity(msg):
                     '',
                     '__incomplete_message_id__' + repr(typed_id_key),
                 )
+            return None
         # Canonical incomplete identity must win over the legacy partial arm:
         # persistence keys `_partial + incomplete` rows by typed message id too.
         if msg.get('_partial'):
-            reasoning_key = " ".join(str(msg.get('reasoning') or '').split())[:200]
+            partial_digest = _durable_partial_message_signature(msg)
+            if partial_digest is None:
+                return None
             return (
                 role,
                 '',  # empty text
                 '',  # no tool_call_id
-                '__partial__' + reasoning_key,
+                '__partial__' + partial_digest.hex(),
             )
         return None
     return (
@@ -5852,18 +5959,104 @@ def _message_identity(msg):
     )
 
 
-def _messages_have_prefix(messages, prefix, *, key_fn=None):
+def _comparison_keys_equal(left, right):
+    """Return True only when both comparison keys are conclusive and equal."""
+    return left is not None and right is not None and left == right
+
+
+def _message_content_has_nontext_parts(content) -> bool:
+    """Return True when visible-text identity would discard content structure."""
+    if type(content) is not list:
+        return type(content) not in (str, type(None))
+    for part in content:
+        if type(part) is not dict:
+            return True
+        part_type = part.get('type')
+        if type(part_type) is not str:
+            return True
+        if part_type.lower() not in ('', 'text', 'input_text', 'output_text'):
+            return True
+    return False
+
+
+def _structured_replay_value_is_nonempty(value) -> bool:
+    """Classify empty JSON containers without invoking foreign equality hooks."""
+    if value is None:
+        return False
+    if type(value) in (str, list, dict):
+        return bool(value)
+    return True
+
+
+def _message_requires_exact_prefix_payload(message) -> bool:
+    """Return True when coarse visible identity is destructive for a prefix."""
+    if type(message) is not dict:
+        return True
+    if type(message.get('content', '')) not in (str, type(None)):
+        return True
+    return bool(
+        any(
+            _structured_replay_value_is_nonempty(message.get(field))
+            for field in _STRUCTURED_REPLAY_FIELDS
+        )
+        or _structured_replay_value_is_nonempty(message.get('api_content'))
+    )
+
+
+def _messages_have_prefix(
+    messages,
+    prefix,
+    *,
+    key_fn=None,
+    allow_exact_payload=False,
+):
+    strict_keys_only = key_fn is not None
     key_fn = key_fn or _message_identity
     if len(messages or []) < len(prefix or []):
         return False
     for idx, expected in enumerate(prefix or []):
-        if key_fn((messages or [])[idx]) != key_fn(expected):
+        actual = (messages or [])[idx]
+        if strict_keys_only:
+            if _comparison_keys_equal(key_fn(actual), key_fn(expected)):
+                continue
             return False
+        if (
+            _message_requires_exact_prefix_payload(actual)
+            or _message_requires_exact_prefix_payload(expected)
+        ):
+            if allow_exact_payload and _comparison_keys_equal(
+                _canonical_message_digest(actual),
+                _canonical_message_digest(expected),
+            ):
+                continue
+            return False
+        if _comparison_keys_equal(key_fn(actual), key_fn(expected)):
+            continue
+        if allow_exact_payload and _comparison_keys_equal(
+            _canonical_message_digest(actual),
+            _canonical_message_digest(expected),
+        ):
+            continue
+        return False
     return True
 
 
 def _message_replay_key(msg):
     """Return a stable comparison key for replay/overlap de-duplication."""
+    durable_empty_key = _durable_empty_assistant_replay_key(msg)
+    if durable_empty_key is not None:
+        return ('durable_empty', durable_empty_key)
+    if type(msg) is not dict:
+        return None
+    if (
+        _message_has_structured_replay_fields(msg)
+        or _message_content_has_nontext_parts(msg.get('content', ''))
+        or any(
+            _structured_replay_value_is_nonempty(msg.get(field))
+            for field in _STRUCTURED_REPLAY_FIELDS
+        )
+    ):
+        return None
     identity = _message_identity(msg)
     # ``api_content`` is a provider-facing replay sidecar.  It must participate
     # in context/replay overlap identity or two same-visible turns can collapse
@@ -5880,7 +6073,10 @@ def _message_replay_key(msg):
         if sidecar is not None:
             return (*identity, sidecar)
         return identity
-    if not isinstance(msg, dict):
+    if (
+        str(msg.get('role') or '') == 'assistant'
+        and not _is_admissible_empty_text_content(msg.get('content'))
+    ):
         return None
     key = (
         str(msg.get('role') or ''),
@@ -5905,7 +6101,10 @@ def _strip_replayed_prefix(existing_messages, candidates):
     for overlap in range(max_overlap, 0, -1):
         left = [_message_replay_key(m) for m in existing_messages[-overlap:]]
         right = [_message_replay_key(m) for m in candidates[:overlap]]
-        if left == right:
+        if all(
+            _comparison_keys_equal(left_key, right_key)
+            for left_key, right_key in zip(left, right, strict=True)
+        ):
             return candidates[overlap:]
     return candidates
 
@@ -5970,7 +6169,10 @@ def _strip_replayed_context_items(existing_messages, candidates):
             while (
                 idx + length < len(candidate_keys)
                 and start + length < len(existing_keys)
-                and candidate_keys[idx + length] == existing_keys[start + length]
+                and _comparison_keys_equal(
+                    candidate_keys[idx + length],
+                    existing_keys[start + length],
+                )
             ):
                 length += 1
             if length > best:
@@ -6758,6 +6960,7 @@ def _merge_display_messages_after_agent_result(
     msg_text,
     source: str = "webui",
     verification_nudge_provenance=None,
+    result_has_authoritative_full_history_prefix=False,
 ):
     """Keep UI transcript durable while allowing model context to compact.
 
@@ -6781,31 +6984,7 @@ def _merge_display_messages_after_agent_result(
     # three inputs consistently so prefix/delta detection below stays aligned.
     # (#5334; same internal-control-message class as #3320/#3821/#4373/#4875)
     previous_display = _drop_synthetic_control_messages(previous_display)
-    previous_display, _ = _collapse_duplicate_incomplete_message_ids(previous_display)
-    # Deduplicate stale _partial messages that accumulated in previous_display.
-    # A bug in cancel_stream() could insert multiple identical _partial messages
-    # when _stripped was empty but _has_reasoning/_has_tools was True. The
-    # merge's _message_identity previously returned None for empty _partial
-    # messages, so the seen-set couldn't catch them — they doubled each turn.
-    # Scan backwards and keep only the LAST occurrence of each unique _partial
-    # identity, then reverse back to original order.
-    _partial_seen = set()
-    _deduped_rev = []
-    for m in reversed(previous_display):
-        if isinstance(m, dict) and m.get('_partial'):
-            key = _message_identity(m)
-            if key is not None:
-                if key in _partial_seen:
-                    continue
-                _partial_seen.add(key)
-        _deduped_rev.append(m)
-    _deduped = list(reversed(_deduped_rev))
-    if len(_deduped) < len(previous_display):
-        logger.debug(
-            "Deduplicated %d stale _partial messages from previous_display (was %d, now %d)",
-            len(previous_display) - len(_deduped), len(previous_display), len(_deduped),
-        )
-    previous_display = _deduped
+    previous_display, _ = _collapse_replayed_assistant_rows(previous_display)
     previous_context = list(previous_context or [])
     result_messages = list(result_messages or [])
     if isinstance(verification_nudge_provenance, dict):
@@ -6832,10 +7011,19 @@ def _merge_display_messages_after_agent_result(
     # would otherwise slip into the merged transcript as a real delta. (#5334)
     previous_context = _drop_synthetic_control_messages(previous_context)
     result_messages = _drop_synthetic_control_messages(result_messages)
-    previous_context, _ = _collapse_duplicate_incomplete_message_ids(previous_context)
-    result_messages, _ = _collapse_duplicate_incomplete_message_ids(result_messages)
+    previous_context, _ = _collapse_replayed_assistant_rows(previous_context)
+    result_messages, _ = _collapse_replayed_assistant_rows(result_messages)
     if not result_messages:
         return previous_display
+    if not result_has_authoritative_full_history_prefix:
+        result_has_authoritative_full_history_prefix = (
+            _result_has_authoritative_full_history_prefix(
+                result_messages,
+                previous_context,
+                _active_turn_identity,
+                msg_text,
+            )
+        )
     previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
 
     # ── Backfill normal turns from previous_context that are missing from
@@ -6957,7 +7145,11 @@ def _merge_display_messages_after_agent_result(
                 )
                 previous_display = _backfilled
 
-    if _messages_have_prefix(result_messages, previous_context):
+    if _messages_have_prefix(
+        result_messages,
+        previous_context,
+        allow_exact_payload=result_has_authoritative_full_history_prefix,
+    ):
         candidates = result_messages[len(previous_context):]
         # Normalize stale merges only in the new-turn slice; never rewrite
         # historical rows in the already-committed previous_context prefix.
@@ -7086,18 +7278,6 @@ def _merge_display_messages_after_agent_result(
             ):
                 merged[-1]['id'] = msg['id']
             continue
-        if (
-            key is not None
-            and isinstance(msg, dict)
-            and msg.get('role') == 'assistant'
-            and merged
-            and _message_identity(merged[-1]) == key
-        ):
-            # Some provider/result replay paths can include the same assistant
-            # message twice in the current delta. Treat only adjacent identity
-            # matches as replay duplicates so identical answers in separate
-            # user turns remain visible.
-            continue
         if _is_context_compression_marker(msg) and key is not None and key in seen:
             continue
         display_msg = msg
@@ -7112,6 +7292,7 @@ def _merge_display_messages_after_agent_result(
         merged.append(copy.deepcopy(display_msg))
         if key is not None:
             seen.add(key)
+    merged, _ = _collapse_replayed_assistant_rows(merged)
     return merged
 
 
@@ -7135,7 +7316,11 @@ def _assistant_reply_added_after_current_turn(result_messages, previous_context,
     """Return True only when the just-finished turn produced assistant text."""
     result_messages = list(result_messages or [])
     previous_context = list(previous_context or [])
-    if _messages_have_prefix(result_messages, previous_context):
+    if _messages_have_prefix(
+        result_messages,
+        previous_context,
+        allow_exact_payload=True,
+    ):
         candidates = result_messages[len(previous_context):]
     else:
         current_user_idx = _find_current_user_turn(result_messages, msg_text)

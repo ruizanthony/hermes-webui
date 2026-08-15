@@ -103,14 +103,16 @@ def test_session_load_collapses_adjacent_duplicate_partials(tmp_path, monkeypatc
     assert (session_dir / f"{sid}.json.bak").exists()
 
 
-def test_reasoning_only_incomplete_identity_uses_stable_message_id():
+def test_reasoning_only_incomplete_identity_requires_exact_payload():
     from api.streaming import _message_identity
 
     first = _incomplete_reasoning_only(1701)
-    replay = _incomplete_reasoning_only(1701, timestamp=999)
+    replay = dict(first)
+    same_id_distinct_payload = _incomplete_reasoning_only(1701, timestamp=999)
     distinct = _incomplete_reasoning_only(1702)
 
     assert _message_identity(first) == _message_identity(replay)
+    assert _message_identity(first) != _message_identity(same_id_distinct_payload)
     assert _message_identity(first) != _message_identity(distinct)
     assert _message_identity({"role": "assistant", "content": "", "finish_reason": "incomplete"}) is None
 
@@ -452,8 +454,8 @@ def test_save_writes_index_from_same_collapsed_snapshot(tmp_path, monkeypatch):
     )
     session.save()  # full-rebuild path creates the index
 
-    # A replayed duplicate carrying a LATER timestamp lands in the live list.
-    session.messages.append(_incomplete_reasoning_only(1701, timestamp=999))
+    # An exact replayed duplicate lands in the live list.
+    session.messages.append(dict(session.messages[0]))
     session._metadata_message_count = 2
     session.save()  # fast path: _write_session_index(updates=[self])
 
@@ -463,8 +465,7 @@ def test_save_writes_index_from_same_collapsed_snapshot(tmp_path, monkeypatch):
 
     index_entries = json.loads(index_file.read_text(encoding="utf-8"))
     entry = next(e for e in index_entries if e["session_id"] == "index-parity")
-    # The sidebar index must reflect the SAME collapsed snapshot: no count of
-    # 2, and no adoption of the dropped duplicate's later timestamp.
+    # The sidebar index must reflect the SAME collapsed snapshot.
     assert entry["message_count"] == sidecar["message_count"] == 1
     assert entry["last_message_at"] == 100
 
@@ -630,7 +631,7 @@ def test_reconciliation_and_persistence_share_incomplete_eligibility():
         assert reconciliation_incomplete_key(message) is None
     assert (
         reconciliation_incomplete_key(partial_same_id_different_reasoning[0])
-        == reconciliation_incomplete_key(partial_same_id_different_reasoning[1])
+        != reconciliation_incomplete_key(partial_same_id_different_reasoning[1])
     )
     assert (
         reconciliation_incomplete_key(partial_different_ids_same_reasoning[0])

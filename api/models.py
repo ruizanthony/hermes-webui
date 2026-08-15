@@ -1142,8 +1142,7 @@ def _load_session_from_path(path: Path) -> "Session | None":
         data = json.loads(path.read_text(encoding='utf-8'))
     except Exception:
         return None
-    data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
-    data['messages'], _collapsed_incomplete_ids = _collapse_duplicate_incomplete_message_ids(data.get('messages'))
+    data, _, _ = _repair_session_message_projections(data)
     return Session(**data)
 
 
@@ -1437,8 +1436,18 @@ class Session:
             key: copy.deepcopy(value)
             for key, value in self.__dict__.items()
         }
-        owned_messages = generation.messages
-        messages_to_persist, _ = _collapse_duplicate_incomplete_message_ids(owned_messages)
+        projection_data = {
+            'messages': generation.messages,
+            'context_messages': generation.context_messages,
+            'compression_anchor_visible_idx': generation.compression_anchor_visible_idx,
+        }
+        projection_data, messages_changed, _ = _repair_session_message_projections(
+            projection_data
+        )
+        messages_to_persist = projection_data['messages']
+        generation.context_messages = projection_data['context_messages']
+        if messages_changed:
+            generation.compression_anchor_visible_idx = None
         # Write metadata fields first so load_metadata_only() can read them
         # without parsing the full messages array (which may be 400KB+).
         # Fields are listed in the order they should appear in the JSON file.
@@ -1617,10 +1626,9 @@ class Session:
         # during the parse (TOCTOU guard against an atomic replace mid-read).
         _pre_read_sig = _sidecar_stat_signature(p)
         data = json.loads(p.read_text(encoding='utf-8'))
-        data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
-        data['messages'], _collapsed_incomplete_ids = _collapse_duplicate_incomplete_message_ids(data.get('messages'))
+        data, messages_changed, context_changed = _repair_session_message_projections(data)
         session = cls(**data)
-        if _collapsed_partials or _collapsed_incomplete_ids:
+        if messages_changed or context_changed:
             try:
                 # Self-heal bloated sessions on first full load without touching
                 # recency/index ordering; save() creates a .bak because this
@@ -2410,35 +2418,16 @@ def _latest_user_matches_pending_text(messages, pending_text):
     return False
 
 
-def _partial_message_signature(message: dict) -> tuple:
-    """Return a stable identity for partial assistant markers recovered on load."""
+def _partial_message_signature(message: dict) -> bytes | None:
+    """Return an exact JSON identity for a partial marker, or ``None``.
+
+    Partial rows can carry durable ids, attachments, provider sidecars, and
+    structured tool state. Reducing on a hand-picked subset can erase a
+    distinct row before the stricter reducers ever see it.
+    """
     if not isinstance(message, dict):
-        return ('', '', ())
-    tool_sig = []
-    for tool_call in message.get('_partial_tool_calls') or []:
-        if not isinstance(tool_call, dict):
-            continue
-        try:
-            args_sig = json.dumps(
-                tool_call.get('args') or {},
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            )
-        except Exception:
-            args_sig = str(tool_call.get('args') or '')
-        tool_sig.append((
-            str(tool_call.get('name') or ''),
-            args_sig,
-            bool(tool_call.get('done', False)),
-            bool(tool_call.get('is_error', False)),
-            str(tool_call.get('preview') or tool_call.get('snippet') or ''),
-        ))
-    return (
-        str(message.get('content') or '').strip(),
-        str(message.get('reasoning') or '').strip(),
-        tuple(tool_sig),
-    )
+        return None
+    return _canonical_message_digest(message)
 
 
 def _collapse_adjacent_duplicate_partials(messages) -> tuple[list, bool]:
@@ -2451,7 +2440,7 @@ def _collapse_adjacent_duplicate_partials(messages) -> tuple[list, bool]:
     for message in messages:
         if isinstance(message, dict) and message.get('_partial'):
             sig = _partial_message_signature(message)
-            if previous_partial_sig == sig:
+            if sig is not None and previous_partial_sig == sig:
                 changed = True
                 continue
             previous_partial_sig = sig
@@ -2532,26 +2521,69 @@ def _incomplete_message_content_text(content) -> str:
     return _strip_thinking_markup_for_incomplete(str(content or '').strip())
 
 
+def _is_admissible_empty_text_content(content) -> bool:
+    """Return True only for empty content shapes safe for replay removal."""
+    if content is None:
+        return True
+    if type(content) is str:
+        return not bool(_incomplete_message_content_text(content))
+    if type(content) is not list or not content:
+        return False
+    value_fields = {
+        'text': ('text', 'content'),
+        'input_text': ('input_text', 'text', 'content'),
+        'output_text': ('output_text', 'text', 'content'),
+    }
+    allowed_keys = {
+        'type', 'text', 'content', 'input_text', 'output_text', 'annotations',
+    }
+    for part in content:
+        if type(part) is not dict or any(type(key) is not str for key in part):
+            return False
+        part_type = part.get('type')
+        if type(part_type) is not str:
+            return False
+        part_type = part_type.lower()
+        if part_type not in value_fields or not set(part).issubset(allowed_keys):
+            return False
+        present_values = [
+            part[field]
+            for field in value_fields[part_type]
+            if field in part
+        ]
+        if len(present_values) != 1 or type(present_values[0]) is not str:
+            return False
+        annotations = part.get('annotations')
+        if annotations not in (None, [], {}):
+            return False
+    return not bool(_incomplete_message_content_text(content))
+
+
 def _incomplete_reasoning_message_id(message):
-    """Return the strict typed identity key of an empty incomplete assistant result.
+    """Return typed id plus exact payload digest for an empty incomplete result.
 
     This is the SINGLE eligibility predicate shared by the persistence
     boundary (Session.save/load and .bak recovery) and the in-memory
     reconciliation layer (api.streaming._message_identity): a row one layer
     collapses is exactly a row the other layer collapses, so neither can
-    drop a row the other considers distinct.  Returns a hashable
-    type-tagged tuple, or None when the row is not an eligible empty
-    incomplete assistant result.
+    drop a row the other considers distinct. Returns a hashable type-tagged
+    tuple with a type-faithful digest, or None when the row is not eligible.
     """
     if not isinstance(message, dict) or message.get('role') != 'assistant':
         return None
     if str(message.get('finish_reason') or '').lower() != 'incomplete':
         return None
-    if _incomplete_message_content_text(message.get('content')):
+    if not _is_admissible_empty_text_content(message.get('content')):
         return None
-    if message.get('tool_call_id') or message.get('tool_calls'):
+    if _message_has_structured_replay_fields(message):
         return None
-    return _strict_incomplete_message_id_key(message.get('id'))
+    typed_id_key = _strict_incomplete_message_id_key(message.get('id'))
+    if typed_id_key is None:
+        return None
+    payload_digest = _canonical_message_digest(message)
+    if payload_digest is None:
+        return None
+    return ('message_id', typed_id_key, payload_digest)
 
 
 def _message_information_score(message) -> int:
@@ -2588,6 +2620,179 @@ def _collapse_duplicate_incomplete_message_ids(messages) -> tuple[list, bool]:
         if _message_information_score(message) > _message_information_score(existing):
             collapsed[existing_index] = message
     return collapsed, changed
+
+
+def _is_strict_json_tree(value) -> bool:
+    """Return whether ``value`` preserves its Python identity through JSON."""
+    if value is None or type(value) in (str, int, bool):
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list:
+        return all(_is_strict_json_tree(item) for item in value)
+    if type(value) is dict:
+        return all(
+            type(key) is str and _is_strict_json_tree(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _canonical_message_digest(message):
+    """Hash one strictly JSON-preserving message, or fail closed."""
+    if not _is_strict_json_tree(message):
+        return None
+    try:
+        canonical_payload = json.dumps(
+            message,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+            allow_nan=False,
+        ).encode('utf-8')
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(canonical_payload).digest()
+
+
+def _collapse_adjacent_exact_assistant_replays(messages) -> tuple[list, bool]:
+    """Collapse only adjacent assistants with identical strict JSON payloads."""
+    if not isinstance(messages, list):
+        return messages, False
+    collapsed = []
+    changed = False
+    for message in messages:
+        message_digest = (
+            _canonical_message_digest(message)
+            if type(message) is dict and message.get('role') == 'assistant'
+            else None
+        )
+        previous_digest = (
+            _canonical_message_digest(collapsed[-1])
+            if collapsed
+            and type(collapsed[-1]) is dict
+            and collapsed[-1].get('role') == 'assistant'
+            else None
+        )
+        if message_digest is not None and message_digest == previous_digest:
+            changed = True
+            continue
+        collapsed.append(message)
+    return collapsed, changed
+
+
+_STRUCTURED_REPLAY_FIELDS = frozenset({
+    'tool_call_id',
+    'tool_calls',
+    'function_call',
+    'function_calls',
+    '_partial_tool_calls',
+    'refusal',
+    'attachments',
+})
+
+
+def _message_has_structured_replay_fields(message):
+    """Return True for empty assistants whose structure is non-comparable."""
+    return bool(
+        isinstance(message, dict)
+        and message.get('role') == 'assistant'
+        and _is_admissible_empty_text_content(message.get('content'))
+        and any(field in message for field in _STRUCTURED_REPLAY_FIELDS)
+    )
+
+
+def _durable_empty_assistant_replay_key(message):
+    """Return strict identity for a non-incomplete empty assistant replay."""
+    if not isinstance(message, dict) or message.get('role') != 'assistant':
+        return None
+    if str(message.get('finish_reason') or '').lower() == 'incomplete':
+        return None
+    if message.get('_partial'):
+        return None
+    if not _is_admissible_empty_text_content(message.get('content')):
+        return None
+    if _message_has_structured_replay_fields(message):
+        return None
+    payload_digest = _canonical_message_digest(message)
+    if payload_digest is None:
+        return None
+    typed_id_key = _strict_incomplete_message_id_key(message.get('id'))
+    if typed_id_key is not None:
+        return ('message_id', typed_id_key, payload_digest)
+    recovered_stream_key = _strict_incomplete_message_id_key(
+        message.get('_recovered_stream_id')
+    )
+    timestamp = (
+        message.get('timestamp')
+        if message.get('timestamp') is not None
+        else message.get('_ts')
+    )
+    recovered_timestamp_key = _strict_incomplete_message_id_key(timestamp)
+    if recovered_stream_key is not None and recovered_timestamp_key is not None:
+        return (
+            'recovered',
+            recovered_stream_key,
+            recovered_timestamp_key,
+            payload_digest,
+        )
+    return None
+
+
+def _collapse_duplicate_durable_empty_assistant_replays(messages) -> tuple[list, bool]:
+    """Collapse replayed empty assistant rows with an exact durable identity."""
+    if not isinstance(messages, list):
+        return messages, False
+    collapsed = []
+    seen_indexes = {}
+    changed = False
+    for message in messages:
+        replay_key = _durable_empty_assistant_replay_key(message)
+        if replay_key is None:
+            collapsed.append(message)
+            continue
+        existing_index = seen_indexes.get(replay_key)
+        if existing_index is None:
+            seen_indexes[replay_key] = len(collapsed)
+            collapsed.append(message)
+            continue
+        changed = True
+        existing = collapsed[existing_index]
+        if message == existing:
+            continue
+        if _message_information_score(message) > _message_information_score(existing):
+            collapsed[existing_index] = message
+    return collapsed, changed
+
+
+def _collapse_replayed_assistant_rows(messages) -> tuple[list, bool]:
+    """Apply the complete replay-repair contract to one message projection."""
+    repaired, exact_changed = _collapse_adjacent_exact_assistant_replays(messages)
+    repaired, partials_changed = _collapse_adjacent_duplicate_partials(repaired)
+    repaired, incomplete_changed = _collapse_duplicate_incomplete_message_ids(repaired)
+    repaired, durable_changed = _collapse_duplicate_durable_empty_assistant_replays(
+        repaired
+    )
+    return repaired, bool(
+        exact_changed or partials_changed or incomplete_changed or durable_changed
+    )
+
+
+def _repair_session_message_projections(data: dict) -> tuple[dict, bool, bool]:
+    """Repair visible and model-facing projections with the same pipeline."""
+    if not isinstance(data, dict):
+        return data, False, False
+    data['messages'], messages_changed = _collapse_replayed_assistant_rows(
+        data.get('messages')
+    )
+    context_changed = False
+    if isinstance(data.get('context_messages'), list) and data['context_messages']:
+        data['context_messages'], context_changed = _collapse_replayed_assistant_rows(
+            data['context_messages']
+        )
+    if messages_changed:
+        data['compression_anchor_visible_idx'] = None
+    return data, messages_changed, context_changed
 
 
 def _find_existing_assistant_for_journal_content(

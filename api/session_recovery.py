@@ -30,7 +30,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sqlite3
 import threading
 from contextlib import closing
@@ -90,9 +89,9 @@ def _msg_count(p: Path) -> int:
     # resurrect the amplification.  Unique backup messages still increase the
     # effective count and remain recoverable.
     try:
-        from api.models import _collapse_duplicate_incomplete_message_ids
+        from api.models import _collapse_replayed_assistant_rows
 
-        msgs, _ = _collapse_duplicate_incomplete_message_ids(msgs)
+        msgs, _ = _collapse_replayed_assistant_rows(msgs)
     except Exception:
         logger.debug("Failed to compute effective recovery message count for %s", p, exc_info=True)
         return -1
@@ -488,13 +487,12 @@ def recover_session(session_path: Path) -> dict:
         bak_data = json.loads(bak_path.read_text(encoding='utf-8'))
         if not isinstance(bak_data, dict):
             raise ValueError("backup payload is not a session object")
-        from api.models import _collapse_duplicate_incomplete_message_ids
+        from api.models import _repair_session_message_projections
 
+        bak_data, _, _ = _repair_session_message_projections(bak_data)
         bak_messages = bak_data.get('messages')
         if isinstance(bak_messages, list):
-            collapsed_messages, _ = _collapse_duplicate_incomplete_message_ids(bak_messages)
-            bak_data['messages'] = collapsed_messages
-            bak_data['message_count'] = len(collapsed_messages)
+            bak_data['message_count'] = len(bak_messages)
         tmp_path.write_text(
             json.dumps(bak_data, ensure_ascii=False, indent=2), encoding='utf-8'
         )
