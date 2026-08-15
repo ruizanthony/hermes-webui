@@ -78,6 +78,18 @@ these signals.
 - Other profiles and worker agents must not independently surface the same
   completion notification.
 
+### Maintenance admission
+
+Autonomous in-process turns (Goal continuations, process wakeups, delegation
+completions, and sibling workers) must enter through `start_session_turn` and
+therefore `api.maintenance_gate.webui_server_turn_admission`. The gate couples
+the Gateway drain marker with the Agent shared maintenance lease. A rejected
+turn returns retryable HTTP status `409`; durable producers must release or
+retain their claim and must not acknowledge, discard, or consume a retry.
+Goal continuations additionally acquire the same gate before claiming an
+intent so maintenance cannot create claim churn. Never bypass this chokepoint
+for a new autonomous turn source.
+
 - Keep one logical change per PR; split unrelated refactors or cleanup.
 - Read `docs/CONTRACTS.md` and the linked contract/RFC for the touched
   subsystem before editing.

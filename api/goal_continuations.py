@@ -604,6 +604,29 @@ def drain_goal_continuations_once(
     is_goal_active: Callable[..., bool] | None = None,
     now: float | None = None,
 ) -> int:
+    """Drain one Goal intent only inside the shared maintenance admission."""
+    from api.maintenance_gate import (
+        WebUIMaintenanceInProgress,
+        webui_server_turn_admission,
+    )
+
+    try:
+        with webui_server_turn_admission():
+            return _drain_goal_continuations_once_impl(
+                start_turn=start_turn,
+                is_goal_active=is_goal_active,
+                now=now,
+            )
+    except WebUIMaintenanceInProgress:
+        return 0
+
+
+def _drain_goal_continuations_once_impl(
+    *,
+    start_turn: Callable[..., dict[str, Any]] | None = None,
+    is_goal_active: Callable[..., bool] | None = None,
+    now: float | None = None,
+) -> int:
     """Claim and dispatch at most one due continuation.
 
     Returns one only after a server-side turn was accepted.  Busy sessions

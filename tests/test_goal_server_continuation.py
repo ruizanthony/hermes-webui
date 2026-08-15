@@ -491,6 +491,29 @@ def test_drain_starts_exactly_one_server_turn_and_marks_it_running(continuation_
     assert record["attempts"] == 1
 
 
+def test_drain_leaves_intent_unclaimed_when_marker_is_active(
+    continuation_store, monkeypatch
+):
+    from api import maintenance_gate
+
+    gc, _path = continuation_store
+    _schedule(gc)
+    monkeypatch.setattr(maintenance_gate, "external_drain_requested", lambda: True)
+    starts = []
+
+    started = gc.drain_goal_continuations_once(
+        start_turn=lambda *_args, **_kwargs: starts.append(True),
+        is_goal_active=lambda *_args, **_kwargs: True,
+        now=100.0,
+    )
+
+    record = gc.get_goal_continuation("session-a")
+    assert started == 0
+    assert starts == []
+    assert record["status"] == "pending"
+    assert record["claim_id"] is None
+
+
 def test_shutdown_stop_refuses_new_default_dispatch_and_releases_claim(continuation_store):
     gc, _path = continuation_store
     _schedule(gc)
