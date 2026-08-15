@@ -37,7 +37,9 @@ class TestAutoConfig:
     def test_defaults(self, monkeypatch):
         monkeypatch.setattr("api.config.load_settings", lambda: {})
         cfg = cb.get_auto_config()
-        assert cfg["enabled"] is True
+        # Direction decision 2026-08-15: auto brief is opt-in via the Settings
+        # switch; default must be off. Manual ↻ regeneration always works.
+        assert cfg["enabled"] is False
         assert cfg["min_interval_seconds"] == 60.0
         assert "model" not in cfg
         assert "effort" not in cfg
@@ -535,3 +537,19 @@ class TestFrontendStatic:
         for key in ('"context_brief_auto"', '"context_brief_min_interval_seconds"'):
             assert key in src, key
         assert '"context_brief_model"' not in src
+
+    def test_default_auto_off_in_settings_defaults(self):
+        src = open("api/config.py").read()
+        assert '"context_brief_auto": False' in src
+
+    def test_switch_static_wiring(self):
+        index = open("static/index.html").read()
+        assert 'id="settingsContextBriefAuto"' in index
+        assert 'settings_label_context_brief_auto' in index
+        panels = open("static/panels.js").read()
+        assert "payload.context_brief_auto=" in panels
+        assert "settings.context_brief_auto===true" in panels
+        assert "settingsContextBriefAuto" in panels
+        i18n = open("static/i18n.js").read()
+        assert "settings_label_context_brief_auto" in i18n
+        assert "settings_desc_context_brief_auto" in i18n

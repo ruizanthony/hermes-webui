@@ -9616,7 +9616,7 @@ _SETTINGS_DEFAULTS = {
     # Context brief auto-regeneration (validated 2026-08-14): worker toggle
     # and per-session debounce interval. Model routing is owned by
     # auxiliary.compression in Hermes Agent.
-    "context_brief_auto": True,
+    "context_brief_auto": False,
     "context_brief_min_interval_seconds": 60,
     "default_message_mode": "steer",  # behavior when sending while agent is running: queue | interrupt | steer
     "password_hash": None,  # PBKDF2-HMAC-SHA256 hash; None = auth disabled
