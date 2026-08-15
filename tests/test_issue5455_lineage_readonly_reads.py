@@ -9,13 +9,14 @@ lineage-metadata reads, and the gateway-watcher fingerprint projection (a 5s
 poll), were still opening a read-WRITE connection. This shared them onto the
 same ``open_state_db_readonly`` helper.
 """
-import logging
+import inspect
 import sqlite3
 from contextlib import closing
 
 import pytest
 
 import api.agent_sessions as agent_sessions
+from api import routes
 from api.agent_sessions import (
     open_state_db_readonly,
     read_session_lineage_metadata,
@@ -98,25 +99,21 @@ def test_helper_encodes_special_path_chars(tmp_path, monkeypatch):
     assert calls[0]["target"].endswith("?mode=ro")
 
 
-def test_helper_falls_back_to_writable_and_logs(tmp_path, monkeypatch, caplog):
+def test_helper_read_only_failure_is_fail_closed(tmp_path, monkeypatch):
     db = tmp_path / "state.db"
     _make_lineage_db(db)
-    real_connect = sqlite3.connect
+    calls = []
 
     def fail_read_only(target, *args, **kwargs):
-        if kwargs.get("uri"):
-            raise sqlite3.OperationalError("synthetic read-only URI failure")
-        return real_connect(target, *args, **kwargs)
+        calls.append({"target": str(target), "uri": bool(kwargs.get("uri"))})
+        raise sqlite3.OperationalError("synthetic read-only URI failure")
 
     monkeypatch.setattr(agent_sessions.sqlite3, "connect", fail_read_only)
-    with caplog.at_level(logging.WARNING, logger="api.agent_sessions"):
-        conn = open_state_db_readonly(db)
-    try:
-        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 2
-    finally:
-        conn.close()
-    assert "read-only open failed" in caplog.text
-    assert "synthetic read-only URI failure" in caplog.text
+    with pytest.raises(sqlite3.OperationalError, match="synthetic read-only URI failure"):
+        open_state_db_readonly(db)
+    assert len(calls) == 1
+    assert calls[0]["uri"] is True
+    assert "mode=ro" in calls[0]["target"]
 
 
 def test_helper_raises_on_missing_db_instead_of_creating_a_ghost(tmp_path):
@@ -126,6 +123,20 @@ def test_helper_raises_on_missing_db_instead_of_creating_a_ghost(tmp_path):
     with pytest.raises(FileNotFoundError):
         open_state_db_readonly(missing)
     assert not missing.exists(), "helper created a ghost state.db for a missing path"
+
+
+@pytest.mark.parametrize(
+    "reader",
+    (
+        routes._latest_cron_session_info_for_jobs,
+        routes._handle_insights,
+        routes._deep_health_checks,
+    ),
+)
+def test_route_state_db_readers_use_fail_closed_helper(reader):
+    source = inspect.getsource(reader)
+    assert "open_state_db_readonly" in source
+    assert "sqlite3.connect(str(db_path))" not in source
 
 
 # ── lineage reads route through the helper ───────────────────────────────────

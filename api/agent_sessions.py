@@ -13,30 +13,52 @@ def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> 
     Same rationale as the session-listing path (#5455): a write-capable handle
     on the multi-GB, WAL ``state.db`` while the agent streams into it adds
     needless checkpoint/lock surface. The read-only ``file:...?mode=ro`` URI
-    avoids that. Falls back to a writable connection (and warns) if the
-    read-only open fails, so callers never lose data on exotic filesystems.
+    avoids that. Failure stays failure: a pure-read path must never recover by
+    opening a write-capable handle on the live Agent database.
 
     The caller must ensure ``db_path`` exists — this raises ``FileNotFoundError``
-    for a missing path rather than letting the writable fallback below create an
-    empty, writable ``state.db`` there (a ghost DB in the agent's HOME). The
-    fallback is only for an *existing* DB whose read-only open fails on an exotic
-    filesystem, so a real read never loses data.
+    rather than creating an empty ghost DB in the Agent home.
 
     Callers own the returned connection (wrap it in ``contextlib.closing``).
     """
-    log = log or logger
+    _ = log  # retained for call-site compatibility
     if not db_path.exists():
         raise FileNotFoundError(f"agent state.db not found: {db_path}")
     read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    return sqlite3.connect(read_only_uri, uri=True)
+
+
+def _index_matches(
+    cursor: sqlite3.Cursor,
+    *,
+    table: str,
+    index_name: str,
+    expected_keys: tuple[tuple[str, str, int], ...],
+) -> bool:
+    """Return whether a named index exactly matches the covering contract."""
     try:
-        return sqlite3.connect(read_only_uri, uri=True)
-    except sqlite3.Error as exc:
-        log.warning(
-            "agent state.db read-only open failed for %s; falling back to writable connection: %s",
-            db_path,
-            exc,
+        cursor.execute(f"PRAGMA index_list({table})")
+        listed = next(
+            (row for row in cursor.fetchall() if str(row[1]) == index_name),
+            None,
         )
-        return sqlite3.connect(str(db_path))
+        if listed is None:
+            return False
+        if bool(listed[2]) or (len(listed) > 4 and bool(listed[4])):
+            return False
+        cursor.execute(f"PRAGMA index_xinfo({index_name})")
+        actual_keys = tuple(
+            (
+                str(row[2]),
+                str(row[4] or "BINARY").upper(),
+                int(row[3]),
+            )
+            for row in cursor.fetchall()
+            if int(row[5]) == 1
+        )
+        return actual_keys == expected_keys
+    except (sqlite3.Error, StopIteration, TypeError, ValueError):
+        return False
 
 
 MESSAGING_SOURCES = {
@@ -544,18 +566,11 @@ def read_importable_agent_session_rows(
     # Open read-only for this projection/listing path: it is a pure read, and
     # holding a write-capable handle on the live (multi-GB, WAL) state.db while
     # the agent streams into it adds needless checkpoint/lock surface (#5455).
-    # The defensive index self-heal below still runs, but through a separate
-    # short-lived writable connection on the rare missing-index path only.
-    read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro"
-    try:
-        conn = sqlite3.connect(read_only_uri, uri=True)
-    except sqlite3.Error as exc:
-        log.warning(
-            "agent session listing read-only open failed for %s; falling back to writable connection: %s",
-            db_path,
-            exc,
-        )
-        conn = sqlite3.connect(str(db_path))
+    # Missing covering indexes never turn this request path into a writer: an
+    # online CREATE INDEX can retain SQLite's writer lock for minutes on a
+    # multi-GiB state.db. The projection degrades to denormalized session
+    # metadata until maintenance installs the indexes explicitly.
+    conn = open_state_db_readonly(db_path, log=log)
     with closing(conn):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -599,58 +614,95 @@ def read_importable_agent_session_rows(
         # fall back to the per-session ``s.message_count`` / ``s.started_at``. (#3762)
         messages_has_session_id = 'session_id' in message_cols
         messages_has_timestamp = 'timestamp' in message_cols
-        use_messages_join = messages_has_session_id
-        count_col = 'id' if 'id' in message_cols else 'session_id'
+        # Inspect only. Schema repair belongs to explicit maintenance while the
+        # WebUI is drained; listing must never create an index (#3887/#5455).
+        messages_index_present = messages_has_session_id and _index_matches(
+            cur,
+            table="messages",
+            index_name="idx_messages_session",
+            expected_keys=(
+                ("session_id", "BINARY", 0),
+                ("timestamp", "BINARY", 0),
+            ),
+        )
+        messages_role_index_present = messages_has_session_id and _index_matches(
+            cur,
+            table="messages",
+            index_name="idx_messages_session_role",
+            expected_keys=(
+                ("session_id", "BINARY", 0),
+                ("role", "NOCASE", 0),
+            ),
+        )
 
-        # Defensive index prime (#3887). The normal candidate-ordering shape uses
-        # the agent's standard ``idx_messages_session ON messages(session_id,
-        # timestamp)`` index; without it, large cron-only scans degrade badly.
-        # Writable dbs self-heal by recreating the index. Read-only or locked dbs
-        # fall back to the pre-aggregated cron-only path below instead of failing.
-        messages_index_present = False
-        if messages_has_session_id and messages_has_timestamp:
-            try:
-                cur.execute("PRAGMA index_list(messages)")
-                messages_index_present = any(str(row[1]) == "idx_messages_session" for row in cur.fetchall())
-            except sqlite3.Error:
-                messages_index_present = False
-            if not messages_index_present:
-                # Self-heal via a separate writable connection so the common
-                # (index-present) path keeps its read-only handle. On a truly
-                # read-only/locked db this fails and we degrade to the
-                # pre-aggregated cron-only path below, exactly as before.
-                try:
-                    with closing(sqlite3.connect(str(db_path))) as _heal:
-                        _heal.execute(
-                            "CREATE INDEX IF NOT EXISTS idx_messages_session "
-                            "ON messages(session_id, timestamp)"
-                        )
-                        _heal.commit()
-                    messages_index_present = True
-                except sqlite3.Error:
-                    pass  # read-only db / locked / older schema — degrade gracefully
-
-        if use_messages_join:
-            actual_count_expr = f"COUNT(m.{count_col})"
-            if 'role' in message_cols:
-                user_message_count_expr = "COUNT(CASE WHEN LOWER(m.role) = 'user' THEN 1 END)"
-            else:
-                user_message_count_expr = f"COUNT(m.{count_col})"
-            last_activity_expr = "MAX(m.timestamp)" if messages_has_timestamp else "NULL"
-            join_clause = "LEFT JOIN messages m ON m.session_id = s.id"
-            group_by_clause = "GROUP BY s.id"
+        use_indexed_timestamp_projection = (
+            messages_has_session_id
+            and messages_has_timestamp
+            and messages_index_present
+        )
+        use_indexed_role_projection = (
+            messages_has_session_id
+            and 'role' in message_cols
+            and messages_role_index_present
+        )
+        # The fast fingerprint trusts ``sessions.message_count``. This deferred
+        # projection still repairs any metadata drift, but only for the bounded
+        # candidate window and through the covering session/timestamp index.
+        if use_indexed_timestamp_projection:
+            actual_count_expr = (
+                "(SELECT COUNT(*) FROM messages mc INDEXED BY idx_messages_session "
+                "WHERE mc.session_id = s.id)"
+            )
         else:
-            # No usable messages table: use the denormalized per-session counts
-            # and ``started_at`` so the rows still surface in the sidebar.
             actual_count_expr = "s.message_count"
-            user_message_count_expr = "s.message_count"
-            last_activity_expr = "NULL"
-            join_clause = ""
-            group_by_clause = ""
+        if use_indexed_role_projection:
+            # Sidebar visibility only distinguishes 0, 1 and >=2 user turns.
+            # Stop at that threshold instead of scanning all user-role entries.
+            user_message_count_expr = (
+                "(SELECT COUNT(*) FROM ("
+                "SELECT 1 FROM messages mu INDEXED BY idx_messages_session_role "
+                "WHERE mu.session_id = s.id AND mu.role COLLATE NOCASE = 'user' "
+                f"LIMIT {CLI_MIN_UNTITLED_USER_MESSAGE_COUNT}))"
+            )
+        else:
+            # Missing role index: preserve the session row but fail closed for
+            # role-derived visibility rather than scanning message payload pages.
+            user_message_count_expr = "NULL"
+        if use_indexed_timestamp_projection:
+            # Exact recency remains a single index-edge lookup per bounded
+            # candidate and therefore detects same-count transcript rewrites.
+            last_activity_expr = (
+                "(SELECT MAX(mt.timestamp) FROM messages mt INDEXED BY idx_messages_session "
+                "WHERE mt.session_id = s.id)"
+            )
+        else:
+            last_activity_expr = (
+                "s.last_activity_at" if 'last_activity_at' in session_cols else "NULL"
+            )
+        join_clause = ""
+        group_by_clause = ""
 
         order_by_clause = "ORDER BY s.started_at DESC"
-        latest_messages_cte = None
         candidate_order_clause = "ORDER BY s.started_at DESC"
+        if use_indexed_timestamp_projection:
+            order_by_clause = f"ORDER BY COALESCE({last_activity_expr}, s.started_at) DESC"
+            if 'last_activity_at' in session_cols:
+                # ``last_activity_at`` is a heartbeat, not transcript truth. Use
+                # it only to choose an 8x oversampled candidate window; exact
+                # indexed message recency orders the resulting rows.
+                candidate_order_clause = (
+                    "ORDER BY MAX(COALESCE(s.last_activity_at, 0), "
+                    "COALESCE(s.started_at, 0)) DESC, "
+                    "s.started_at DESC"
+                )
+            else:
+                candidate_order_clause = (
+                    "ORDER BY COALESCE("
+                    f"{last_activity_expr}, s.started_at) DESC, s.started_at DESC"
+                )
+        elif 'last_activity_at' in session_cols:
+            order_by_clause = "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC"
+            candidate_order_clause = order_by_clause
 
         where_clauses = ["s.source IS NOT NULL"]
         params: list[object] = []
@@ -667,32 +719,6 @@ def read_importable_agent_session_rows(
                 placeholders = ", ".join("?" for _ in excluded)
                 where_clauses.append(f"s.source NOT IN ({placeholders})")
                 params.extend(excluded)
-
-        use_preaggregated_candidate_order = (
-            use_messages_join
-            and messages_has_timestamp
-            and included == ("cron",)
-            and not messages_index_present
-        )
-        if use_preaggregated_candidate_order:
-            order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
-            latest_messages_cte = (
-                "latest_messages AS (\n"
-                "                    SELECT mx.session_id AS session_id, MAX(mx.timestamp) AS last_message_at\n"
-                "                    FROM messages mx\n"
-                "                    GROUP BY mx.session_id\n"
-                "                )"
-            )
-            candidate_order_clause = "ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC, s.started_at DESC"
-        elif use_messages_join and messages_has_timestamp:
-            order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
-            candidate_order_clause = (
-                "ORDER BY COALESCE(\n"
-                "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
-                "                        s.started_at\n"
-                "                    ) DESC,\n"
-                "                    s.started_at DESC"
-            )
 
         select_sql = f"""
             SELECT s.id, s.title, s.model, s.message_count,
@@ -726,34 +752,18 @@ def read_importable_agent_session_rows(
             # Oversampling preserves room for hidden compression segments or
             # other rows filtered after projection.
             candidate_limit = max(result_limit * 8, result_limit)
-            if latest_messages_cte:
-                candidate_cte = (
-                    "WITH {latest_messages_cte}, candidates AS (\n"
-                    "                    SELECT s.id\n"
-                    "                    FROM sessions s\n"
-                    "                    LEFT JOIN latest_messages lm ON lm.session_id = s.id\n"
-                    "                    WHERE {where_clause}\n"
-                    "                    {candidate_order_clause}\n"
-                    "                    LIMIT ?\n"
-                    "                )"
-                ).format(
-                    latest_messages_cte=latest_messages_cte,
-                    where_clause=" AND ".join(where_clauses),
-                    candidate_order_clause=candidate_order_clause,
-                )
-            else:
-                candidate_cte = (
-                    "WITH candidates AS (\n"
-                    "                    SELECT s.id\n"
-                    "                    FROM sessions s\n"
-                    "                    WHERE {where_clause}\n"
-                    "                    {candidate_order_clause}\n"
-                    "                    LIMIT ?\n"
-                    "                )"
-                ).format(
-                    where_clause=" AND ".join(where_clauses),
-                    candidate_order_clause=candidate_order_clause,
-                )
+            candidate_cte = (
+                "WITH candidates AS (\n"
+                "                    SELECT s.id\n"
+                "                    FROM sessions s\n"
+                "                    WHERE {where_clause}\n"
+                "                    {candidate_order_clause}\n"
+                "                    LIMIT ?\n"
+                "                )"
+            ).format(
+                where_clause=" AND ".join(where_clauses),
+                candidate_order_clause=candidate_order_clause,
+            )
 
             cur.execute(
                 f"""

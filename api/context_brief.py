@@ -16,6 +16,8 @@ and never mutates the session.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
 import threading
@@ -402,16 +404,74 @@ def load_llm_brief(session, sid: str) -> dict | None:
     return payload
 
 
-def _save_llm_brief(session, sid: str, *, text: str, source: str, message_count: int) -> dict | None:
+def _session_messages(session) -> list[dict]:
+    return [
+        message
+        for message in (getattr(session, "messages", None) or [])
+        if isinstance(message, dict)
+    ]
+
+
+def _transcript_revision(session) -> str:
+    """Stable content revision for same-count rewrites and state.db sessions."""
+    encoded = json.dumps(
+        _session_messages(session),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _session_revision(session) -> dict:
+    messages = _session_messages(session)
+    try:
+        updated_at = float(getattr(session, "updated_at", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    return {
+        "message_count": len(messages),
+        "updated_at": updated_at or None,
+        "transcript": _transcript_revision(session),
+    }
+
+
+def _snapshot_session(session):
+    """Freeze mutable transcript state before the auxiliary-model call."""
+    snapshot = copy.copy(session)
+    snapshot.messages = copy.deepcopy(_session_messages(session))
+    return snapshot
+
+
+def _same_transcript_revision(left: dict, right: dict) -> bool:
+    return (
+        left.get("message_count") == right.get("message_count")
+        and left.get("transcript") == right.get("transcript")
+    )
+
+
+def _save_llm_brief(
+    session,
+    sid: str,
+    *,
+    text: str,
+    source: str,
+    message_count: int,
+    revision: dict | None = None,
+) -> dict | None:
     path = _brief_store_path(session, sid)
     if path is None:
         return None
+    revision = dict(revision or _session_revision(session))
     payload = {
         "format": 1,
         "session_id": sid,
         "generated_at": time.time(),
         "source": source,
         "message_count_at_generation": int(message_count),
+        "session_updated_at_at_generation": revision.get("updated_at"),
+        "transcript_revision_at_generation": revision.get("transcript"),
         "text": text,
     }
     try:
@@ -421,6 +481,68 @@ def _save_llm_brief(session, sid: str, *, text: str, source: str, message_count:
         logger.warning("context brief: persist failed for %s", sid, exc_info=True)
         return None
     return payload
+
+
+def _llm_brief_is_current(session, payload: dict | None, message_count: int) -> bool:
+    """Return whether a stored brief matches the targeted session revision."""
+    if not payload:
+        return False
+    try:
+        if int(payload.get("message_count_at_generation") or 0) != int(message_count):
+            return False
+    except (TypeError, ValueError):
+        return False
+    stored_transcript_revision = str(
+        payload.get("transcript_revision_at_generation") or ""
+    ).strip()
+    if stored_transcript_revision:
+        return stored_transcript_revision == _transcript_revision(session)
+    # Legacy payloads without an immutable transcript digest are unverifiable.
+    # Message count and mutable ``updated_at`` cannot prove freshness after a
+    # same-count rewrite; state.db shims do not even expose updated_at.
+    return False
+
+
+def _persist_revalidated_llm_brief(
+    sid: str,
+    *,
+    expected_source: str,
+    expected_revision: dict,
+    text: str,
+    brief_source: str,
+    message_count: int,
+    automatic: bool,
+) -> tuple[dict, object, bool]:
+    """Revalidate and persist under the route's canonical admission fence."""
+    from api.models import _get_session_agent_lock
+
+    with _get_session_agent_lock(sid):
+        fresh_session, fresh_source = _resolve_session(sid)
+        if fresh_source != expected_source:
+            raise BriefError("session source changed during brief generation", 409)
+        if automatic and bool(getattr(fresh_session, "archived", False)):
+            raise BriefError("session was archived during brief generation", 410)
+        if _session_has_active_run(sid, session=fresh_session):
+            raise BriefError("session resumed during brief generation", 409)
+        if not _same_transcript_revision(
+            expected_revision, _session_revision(fresh_session)
+        ):
+            raise BriefError("session changed during brief generation", 409)
+        payload = _save_llm_brief(
+            fresh_session,
+            sid,
+            text=text,
+            source=brief_source,
+            message_count=message_count,
+            revision=expected_revision,
+        )
+        if payload is None:
+            raise BriefError("brief persistence failed", 500)
+        return (
+            payload,
+            fresh_session,
+            _llm_brief_is_current(fresh_session, payload, message_count),
+        )
 
 
 def get_brief_payload(sid: str) -> dict:
@@ -435,7 +557,11 @@ def get_brief_payload(sid: str) -> dict:
             "generated_at": llm.get("generated_at"),
             "source": llm.get("source"),
             "message_count_at_generation": llm.get("message_count_at_generation"),
-            "stale": llm.get("message_count_at_generation") != current_count,
+            "session_updated_at_at_generation": llm.get("session_updated_at_at_generation"),
+            "transcript_revision_at_generation": llm.get(
+                "transcript_revision_at_generation"
+            ),
+            "stale": not _llm_brief_is_current(session, llm, current_count),
         }
     else:
         brief["llm_brief"] = None
@@ -532,7 +658,7 @@ def _generate_llm_brief(session, sid: str, deterministic: dict) -> tuple[str, st
 
 # ── job orchestration ────────────────────────────────────────────────────
 
-def start_brief_job(sid: str) -> dict:
+def start_brief_job(sid: str, *, automatic: bool = False) -> dict:
     """Start (or refuse to duplicate) the background LLM-narrative job.
 
     The session resolution I/O happens before the registry lock; the
@@ -542,6 +668,8 @@ def start_brief_job(sid: str) -> dict:
     session, _source = _resolve_session(sid)  # 404 before registering a job
     if not (getattr(session, "messages", None) or []):
         raise BriefError("nothing to brief (session has no messages)")
+    if automatic and bool(getattr(session, "archived", False)):
+        raise BriefError("archived sessions are not briefed automatically", 410)
 
     job_id = uuid.uuid4().hex[:16]
     job = {
@@ -552,6 +680,7 @@ def start_brief_job(sid: str) -> dict:
         "finished_at": None,
         "result": None,
         "error": None,
+        "_automatic": bool(automatic),
     }
     with _JOBS_LOCK:
         _purge_jobs_locked()
@@ -564,7 +693,13 @@ def start_brief_job(sid: str) -> dict:
         target=_run_brief_job, args=(job,), daemon=True, name=f"context-brief-{sid[:12]}"
     )
     job["_thread"] = thread
-    thread.start()
+    try:
+        thread.start()
+    except BaseException:
+        with _JOBS_LOCK:
+            if _JOBS.get(job_id) is job:
+                _JOBS.pop(job_id, None)
+        raise
     return _job_snapshot(job)
 
 
@@ -578,17 +713,28 @@ def _finish_job(job: dict, *, result: dict | None = None, error: str | None = No
 
 def _run_brief_job(job: dict) -> None:
     sid = job["session_id"]
+    automatic = bool(job.get("_automatic"))
     started = time.monotonic()
     try:
         session, source = _resolve_session(sid)
-        deterministic = build_deterministic_brief(session, sid, source=source)
-        text, brief_source = _generate_llm_brief(session, sid, deterministic)
-        payload = _save_llm_brief(
-            session,
+        if automatic and bool(getattr(session, "archived", False)):
+            raise BriefError("session was archived before brief generation", 410)
+        if automatic and _session_has_active_run(sid, session=session):
+            raise BriefError("session resumed before brief generation", 409)
+        snapshot = _snapshot_session(session)
+        revision = _session_revision(snapshot)
+        deterministic = build_deterministic_brief(snapshot, sid, source=source)
+        # Provider, model and effort are resolved canonically by the
+        # auxiliary.compression task (post-02aefee1); no per-call override here.
+        text, brief_source = _generate_llm_brief(snapshot, sid, deterministic)
+        payload, _fresh_session, payload_is_current = _persist_revalidated_llm_brief(
             sid,
+            expected_source=source,
+            expected_revision=revision,
             text=text,
-            source=brief_source,
+            brief_source=brief_source,
             message_count=deterministic["meta"]["message_count"],
+            automatic=automatic,
         )
         _finish_job(
             job,
@@ -597,31 +743,42 @@ def _run_brief_job(job: dict) -> None:
                 "brief_source": brief_source,
                 "brief_chars": len(text),
                 "elapsed_seconds": round(time.monotonic() - started, 2),
-                "persisted": payload is not None,
+                "persisted": True,
                 "llm_brief": {
                     "text": text,
-                    "generated_at": (payload or {}).get("generated_at") or time.time(),
+                    "generated_at": payload.get("generated_at") or time.time(),
                     "source": brief_source,
                     "message_count_at_generation": deterministic["meta"]["message_count"],
-                    "stale": False,
+                    "session_updated_at_at_generation": payload.get(
+                        "session_updated_at_at_generation"
+                    ),
+                    "transcript_revision_at_generation": payload.get(
+                        "transcript_revision_at_generation"
+                    ),
+                    "stale": not payload_is_current,
                 },
             },
         )
     except BriefError as exc:
+        if automatic and exc.status not in {404, 410}:
+            _requeue_auto_session(sid)
         _finish_job(job, error=str(exc))
     except Exception as exc:
+        if automatic:
+            _requeue_auto_session(sid)
         logger.exception("context brief job failed for %s", sid)
         _finish_job(job, error=f"internal error: {exc}")
 
 
 # ── automatic end-of-turn regeneration (validated 2026-08-14) ────────────
 #
-# A daemon worker regenerates the LLM narrative after a turn ends, so the
-# brief is already fresh when the user opens the panel. Cost guards, all
-# evaluated before any LLM call:
-#   - gated on config.LAST_RUN_FINISHED_AT: no scan unless a run just ended;
-#   - no regeneration when the stored brief still matches the transcript
-#     (no new messages since the last generation);
+# A daemon worker receives the exact session ids whose runs just ended, so the
+# brief is already fresh when the user opens the panel without scanning the
+# session fleet. Cost guards, all evaluated before any LLM call:
+#   - no global session listing: only ids claimed from the finished-run queue;
+#   - archived sessions are never regenerated automatically;
+#   - no regeneration when the stored brief matches the message count and
+#     session revision (including same-count retries/edits);
 #   - never while the session has an active run (fail-closed on doubt);
 #   - per-session minimum interval (default 60 s, bounded 30–600 s);
 #   - single brief job per session (registry single-flight);
@@ -638,8 +795,38 @@ _AUTO_LIFECYCLE_LOCK = threading.Lock()
 _AUTO_STOP = threading.Event()
 _AUTO_WAKE = threading.Event()
 _AUTO_THREAD = None
-_AUTO_LAST_ENQUEUE_AT: dict[str, float] = {}  # sid -> monotonic enqueue time
-_AUTO_LAST_SEEN_FINISH = 0.0
+_AUTO_LAST_ENQUEUE_AT: dict[str, float] = {}
+_AUTO_PENDING_SESSION_IDS: set[str] = set()
+_AUTO_PENDING_LOCK = threading.Lock()
+
+
+def _add_auto_pending(session_ids) -> None:
+    with _AUTO_PENDING_LOCK:
+        _AUTO_PENDING_SESSION_IDS.update(str(sid) for sid in session_ids if sid)
+
+
+def _discard_auto_pending(sid: str) -> None:
+    with _AUTO_PENDING_LOCK:
+        _AUTO_PENDING_SESSION_IDS.discard(sid)
+
+
+def _claim_auto_pending(sid: str) -> bool:
+    """Atomically consume the current pending generation before starting work."""
+    with _AUTO_PENDING_LOCK:
+        if sid not in _AUTO_PENDING_SESSION_IDS:
+            return False
+        _AUTO_PENDING_SESSION_IDS.remove(sid)
+        return True
+
+
+def _auto_pending_snapshot() -> tuple[str, ...]:
+    with _AUTO_PENDING_LOCK:
+        return tuple(_AUTO_PENDING_SESSION_IDS)
+
+
+def _requeue_auto_session(sid: str) -> None:
+    _add_auto_pending((sid,))
+    _AUTO_WAKE.set()
 
 
 def get_auto_config() -> dict:
@@ -667,8 +854,8 @@ def get_auto_config() -> dict:
     }
 
 
-def _session_has_active_run(sid: str) -> bool:
-    """True when the run registry holds an active run for the session.
+def _session_has_active_run(sid: str, *, session=None) -> bool:
+    """True when the run registry or durable admission state is active.
 
     Fail-closed: any registry error means 'assume active' so a turn in
     progress is never interrupted by a brief job competing for the session.
@@ -682,67 +869,100 @@ def _session_has_active_run(sid: str) -> bool:
                     return True
     except Exception:
         return True
-    return False
+    if session is None:
+        try:
+            session, _source = _resolve_session(sid)
+        except Exception:
+            return True
+    return bool(
+        getattr(session, "active_stream_id", None)
+        or getattr(session, "pending_user_message", None)
+        or getattr(session, "pending_turn_id", None)
+        or getattr(session, "pending_started_at", None)
+    )
 
 
 def _auto_tick() -> None:
-    global _AUTO_LAST_SEEN_FINISH
+    """Process only changed, non-archived sessions whose run just finished."""
     cfg = get_auto_config()
-    if not cfg["enabled"]:
-        return
     from api import config as _cfg
 
-    last_finished = float(getattr(_cfg, "LAST_RUN_FINISHED_AT", 0.0) or 0.0)
-    if last_finished <= _AUTO_LAST_SEEN_FINISH:
-        return  # no turn ended since the previous scan — nothing to do
     try:
-        from api import models as _models
-
-        sessions = _models.all_sessions(include_lineage_metadata=False)
+        finished = _cfg.claim_finished_run_session_ids()
     except Exception:
-        logger.exception("auto brief: session scan failed")
+        logger.exception("auto brief: finished-session claim failed")
+        if not cfg["enabled"]:
+            with _AUTO_PENDING_LOCK:
+                _AUTO_PENDING_SESSION_IDS.clear()
+            _AUTO_LAST_ENQUEUE_AT.clear()
         return
-    _AUTO_LAST_SEEN_FINISH = last_finished
+    if not cfg["enabled"]:
+        # Disabled means discard, not defer: runs completed while auto-brief is
+        # off must never be retained or billed retroactively on re-enable.
+        with _AUTO_PENDING_LOCK:
+            _AUTO_PENDING_SESSION_IDS.clear()
+        _AUTO_LAST_ENQUEUE_AT.clear()
+        return
+    _add_auto_pending(finished)
+    pending = _auto_pending_snapshot()
+    if not pending:
+        return
+
     now = time.monotonic()
     # Prune debounce entries older than one hour so the map stays bounded.
     for old_sid, ts in list(_AUTO_LAST_ENQUEUE_AT.items()):
         if now - ts > 3600.0:
             _AUTO_LAST_ENQUEUE_AT.pop(old_sid, None)
     enqueued = 0
-    for s in sessions:
+    for sid in sorted(pending):
         if enqueued >= _AUTO_MAX_PER_TICK:
             break
-        # all_sessions() returns metadata dicts: session_id, message_count,
-        # updated_at — messages are NOT loaded here (that would be expensive).
-        if not isinstance(s, dict):
+        if not sid:
+            _discard_auto_pending(sid)
             continue
-        sid = str(s.get("session_id") or "")
-        count = int(s.get("message_count") or 0)
-        if not sid or count <= 0:
-            continue
-        stored = load_llm_brief(s, sid)
-        try:
-            stored_count = int(stored.get("message_count_at_generation") or 0) if stored else 0
-        except (TypeError, ValueError):
-            continue  # hand-corrupted sidecar — skip rather than abort the tick
-        if stored and stored_count == count:
-            continue  # fresh — no new messages since the last generation
-        if _session_has_active_run(sid):
-            continue  # turn in progress
         if now - _AUTO_LAST_ENQUEUE_AT.get(sid, 0.0) < cfg["min_interval_seconds"]:
-            continue  # debounce window
+            continue  # keep pending until the debounce window expires
+        try:
+            session, _source = _resolve_session(sid)
+        except BriefError as exc:
+            if exc.status in {404, 410}:
+                _discard_auto_pending(sid)
+            else:
+                logger.warning("auto brief: resolve rejected for %s: %s", sid, exc)
+            continue
+        except Exception:
+            logger.exception("auto brief: resolve failed for %s", sid)
+            continue
+        if bool(getattr(session, "archived", False)):
+            _discard_auto_pending(sid)
+            continue
+        if _session_has_active_run(sid, session=session):
+            continue  # route admission or worker registry says the run resumed
+        count = len(getattr(session, "messages", None) or [])
+        if count <= 0:
+            _discard_auto_pending(sid)
+            continue
+        stored = load_llm_brief(session, sid)
+        if _llm_brief_is_current(session, stored, count):
+            _discard_auto_pending(sid)
+            continue  # unchanged since the last generation
         with _JOBS_LOCK:
             duplicate = any(
                 str(j.get("session_id")) == sid and j.get("status") == "running"
                 for j in _JOBS.values()
             )
         if duplicate:
+            continue  # retain a newer finish event until the older job exits
+        if not _claim_auto_pending(sid):
             continue
         try:
-            start_brief_job(sid)
-        except BriefError:
-            continue  # e.g. racing manual regenerate — fine
+            start_brief_job(sid, automatic=True)
+        except BriefError as exc:
+            if exc.status not in {404, 410}:
+                _requeue_auto_session(sid)
+            continue
         except Exception:
+            _requeue_auto_session(sid)
             logger.exception("auto brief: enqueue failed for %s", sid)
             continue
         _AUTO_LAST_ENQUEUE_AT[str(sid)] = now

@@ -505,6 +505,55 @@ only; it does not sweep existing sessions or `_run_journal` files. Manual contex
 compression preserves any existing recovery backup because it does not reduce the
 persisted display transcript.
 
+#### 4.4.1 Context-brief and Gateway projection resource guards
+
+Automatic context briefs are event-targeted, not fleet-scanned. Run teardown adds
+the exact session id to a process-local finished-run set; the brief worker claims
+those ids and resolves only the affected sessions. Archived sessions are excluded
+from automatic generation but remain available to the explicit refresh endpoint.
+A persisted brief records a stable transcript-content digest in addition to its
+message count and `updated_at`. Generation uses a deep snapshot, then resolves the
+session again immediately before persistence; changed transcripts are rejected, while
+newly archived sessions stop only automatic jobs and explicit refresh still persists.
+Legacy briefs without a transcript digest are always stale. Automatic pending ids are
+claimed before thread start and restored on any failed or superseded start, so a finish
+event arriving during enqueue cannot be erased. Automatic workers check both the active
+run registry and durable route-admission fields before calling the model. Final canonical
+revalidation, active-admission checks, freshness computation, and sidecar persistence run
+under the same per-session lock as chat-start admission, so route admission and brief
+publication are linearized. Conflicted automatic jobs are requeued. The worker never
+calls `all_sessions()` and keeps a bounded per-tick burst cap.
+When automatic briefs are disabled, each tick still claims and discards finished-run
+events and clears process-local pending/debounce state; re-enabling never replays or bills
+work completed while the feature was off.
+
+The Gateway watcher remains idle while it has no SSE subscribers. On current Hermes
+`state.db` schemas, drained maintenance installs
+`idx_sessions_webui_fingerprint(source, id, message_count, last_activity_at)` via
+`scripts/ensure_state_db_read_indexes.py`, together with the timestamp and case-insensitive
+role indexes used by exact projection. That CLI requires explicit drain confirmation,
+holds the cooperative Agent turn lock exclusively, rejects same-name/wrong-table or
+wrong-collation indexes, and verifies covering query plans without temporary sorts. The
+five-second change fingerprint is then served entirely by the compact covering index.
+Before the index exists, the watcher
+falls back to DB/WAL file metadata rather than scanning either SQLite table; this is
+sound but may re-project on excluded WebUI/cron writes. A changed fingerprint or the
+60-second parity gate selects an oversampled candidate window from
+`last_activity_at`/`started_at`, then uses covering
+`messages(session_id, timestamp)` and `messages(session_id, role COLLATE NOCASE)`
+indexes only for exact candidate recency, exact candidate message totals, and a
+user-turn count capped at the sidebar visibility threshold. The cheap fingerprint
+trusts the transactionally maintained `sessions.message_count`; periodic parity repairs
+any metadata drift over the bounded candidate set. A listing and watcher never open a
+writable connection or create an index; failure of the `mode=ro` URI is fail-closed and
+never retried with a writable handle. Missing projection indexes degrade to denormalized
+session metadata until explicit drained maintenance installs them. Periodic SSE parity
+hashes the complete ordered projection, so title/model/source/end-state/lineage changes
+publish even when count and timestamps are unchanged. This
+avoids fleet-wide message counts, message-content reads, and request-path writer locks
+while preserving bounded sidebar ordering, visibility, and compression-lineage
+reconciliation on the current schema.
+
 on_token callback:
     if text is None: return  # end-of-stream sentinel from AIAgent
     put('token', {'text': text})
