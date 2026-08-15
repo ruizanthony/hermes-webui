@@ -23189,6 +23189,8 @@ def start_session_turn(
 
     try:
         workspace = _resolve_chat_workspace_with_recovery(s, None)
+        s = getattr(workspace, "session", s)
+        workspace = str(workspace)
     except WorkspaceBindingPersistenceError as e:
         return {"error": str(e), "_status": 500}
     except ValueError as e:
@@ -23894,6 +23896,8 @@ def _handle_chat_start(handler, body, diag=None):
                 workspace = _resolve_chat_workspace_for_regeneration(s, body.get("workspace"))
             else:
                 workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
+            s = getattr(workspace, "session", s)
+            workspace = str(workspace)
         except WorkspaceBindingPersistenceError as e:
             return bad(handler, str(e), 500)
         except ValueError as e:
@@ -24045,7 +24049,16 @@ def _handle_chat_start(handler, body, diag=None):
 
 
 
-def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> str:
+class _ResolvedChatWorkspace(str):
+    """String-compatible workspace resolution carrying the durable SID owner."""
+
+    def __new__(cls, workspace, session):
+        resolved = super().__new__(cls, str(workspace))
+        resolved.session = session
+        return resolved
+
+
+def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> _ResolvedChatWorkspace:
     """Recover stale implicit session workspaces without hiding explicit errors."""
     def _validated_target(candidate) -> str:
         target = str(candidate)
@@ -24058,32 +24071,20 @@ def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> str:
 
     explicit = requested_workspace not in (None, "")
     if explicit:
-        return _validated_target(resolve_trusted_workspace(requested_workspace))
+        return _ResolvedChatWorkspace(resolve_trusted_workspace(requested_workspace), s)
     stored_workspace = getattr(s, "workspace", None)
     workspace, recovered = resolve_implicit_workspace_with_recovery(
         stored_workspace,
         get_last_workspace,
     )
     if not recovered:
-        return _validated_target(workspace)
-    workspace = _validated_target(workspace)
+        return _ResolvedChatWorkspace(workspace, s)
     persisted = persist_recovered_workspace_binding(
         s,
         workspace,
         expected_workspace=stored_workspace,
     )
-    return _validated_target(persisted.workspace)
-
-
-def _resolve_chat_workspace_for_regeneration(s, requested_workspace) -> str:
-    """Resolve regeneration's workspace without persisting before start acceptance."""
-    if requested_workspace not in (None, ""):
-        return str(resolve_trusted_workspace(requested_workspace))
-    workspace, _recovered = resolve_implicit_workspace_with_recovery(
-        getattr(s, "workspace", None),
-        get_last_workspace,
-    )
-    return str(workspace)
+    return _ResolvedChatWorkspace(persisted.workspace, persisted)
 
 
 def _normalize_chat_attachments(raw_attachments):
