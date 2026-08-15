@@ -785,7 +785,9 @@ def _run_brief_job(job: dict) -> None:
 #   - burst cap: at most _AUTO_MAX_PER_TICK jobs enqueued per tick, so a
 #     downtime backlog drains slowly instead of storming the provider.
 
-_AUTO_DEFAULT_ENABLED = True
+# Direction decision 2026-08-15: auto brief is opt-in (Settings switch);
+# default off. Manual ↻ regeneration in the Context tab is unaffected.
+_AUTO_DEFAULT_ENABLED = False
 _AUTO_DEFAULT_MIN_INTERVAL = 60.0
 _AUTO_MIN_INTERVAL_BOUNDS = (30.0, 600.0)
 _AUTO_TICK_SECONDS = 20.0
