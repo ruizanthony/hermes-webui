@@ -24005,6 +24005,7 @@ def _handle_chat_start(handler, body, diag=None):
                 status=409,
             )
 
+        candidate_recovery = compression_recovery_payload_for_session(s)
         diag.stage("resolve_workspace") if diag else None
         try:
             if regeneration is not None:
@@ -24016,6 +24017,12 @@ def _handle_chat_start(handler, body, diag=None):
         except WorkspaceBindingPersistenceError as e:
             return bad(handler, str(e), 500)
         except ValueError as e:
+            if (
+                candidate_recovery
+                and not attachments
+                and is_generic_continuation_intent(msg)
+            ):
+                return _compression_recovery_required_response(candidate_recovery)
             return bad(handler, str(e))
         if not _authorize_chat_start_session(s):
             return bad(handler, "Session not found", 404)
