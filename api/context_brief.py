@@ -496,9 +496,7 @@ def _fallback_brief_text(deterministic: dict, reason: str) -> str:
     return "\n".join(lines)
 
 
-def _generate_llm_brief(
-    session, sid: str, deterministic: dict, *, model: str | None = None, effort: str | None = None
-) -> tuple[str, str]:
+def _generate_llm_brief(session, sid: str, deterministic: dict) -> tuple[str, str]:
     """Return (text, source). source ∈ auxiliary-llm | fallback-template."""
     distilled = _distill_transcript(session)
     title = (deterministic.get("meta") or {}).get("title") or sid
@@ -511,13 +509,8 @@ def _generate_llm_brief(
     try:
         from agent.auxiliary_client import call_llm
 
-        call_kwargs: dict = {}
-        # Selectable low-cost model (panel dropdown, settings-persisted).
-        # "auxiliary" keeps the historical task-routed behaviour.
-        if model and model != "auxiliary":
-            call_kwargs["model"] = model
-            if effort:
-                call_kwargs["reasoning_config"] = {"effort": effort}
+        # Provider, model and effort are resolved canonically by Hermes Agent's
+        # auxiliary.compression task; the WebUI must not duplicate that routing.
         response = call_llm(
             task="compression",
             messages=[
@@ -526,7 +519,6 @@ def _generate_llm_brief(
             ],
             max_tokens=2048,
             timeout=180,
-            **call_kwargs,
         )
         text = _extract_llm_content(response)
         if len(text) >= MIN_BRIEF_CHARS:
@@ -590,10 +582,7 @@ def _run_brief_job(job: dict) -> None:
     try:
         session, source = _resolve_session(sid)
         deterministic = build_deterministic_brief(session, sid, source=source)
-        cfg = get_auto_config()
-        text, brief_source = _generate_llm_brief(
-            session, sid, deterministic, model=cfg["model"], effort=cfg["effort"]
-        )
+        text, brief_source = _generate_llm_brief(session, sid, deterministic)
         payload = _save_llm_brief(
             session,
             sid,
@@ -639,9 +628,6 @@ def _run_brief_job(job: dict) -> None:
 #   - burst cap: at most _AUTO_MAX_PER_TICK jobs enqueued per tick, so a
 #     downtime backlog drains slowly instead of storming the provider.
 
-_AUTO_MODEL_CHOICES = ("auxiliary", "gpt-5.6-luna")  # bounded selector values
-_AUTO_DEFAULT_MODEL = "gpt-5.6-luna"
-_AUTO_DEFAULT_EFFORT = "low"
 _AUTO_DEFAULT_ENABLED = True
 _AUTO_DEFAULT_MIN_INTERVAL = 60.0
 _AUTO_MIN_INTERVAL_BOUNDS = (30.0, 600.0)
@@ -664,8 +650,6 @@ def get_auto_config() -> dict:
         settings = load_settings() or {}
     except Exception:
         settings = {}
-    raw_model = str(settings.get("context_brief_model") or "").strip()
-    model = raw_model if raw_model in _AUTO_MODEL_CHOICES else _AUTO_DEFAULT_MODEL
     try:
         min_interval = float(
             settings.get("context_brief_min_interval_seconds") or _AUTO_DEFAULT_MIN_INTERVAL
@@ -679,10 +663,7 @@ def get_auto_config() -> dict:
         enabled = bool(enabled)
     return {
         "enabled": enabled,
-        "model": model,
-        "effort": _AUTO_DEFAULT_EFFORT,
         "min_interval_seconds": min_interval,
-        "choices": list(_AUTO_MODEL_CHOICES),
     }
 
 

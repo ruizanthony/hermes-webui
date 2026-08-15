@@ -1,5 +1,5 @@
 # Auto end-of-turn brief regeneration (validated 2026-08-14): worker guards,
-# bounded model selection, and route payload.
+# canonical auxiliary routing, and route payload.
 import threading
 import time
 from types import SimpleNamespace
@@ -33,14 +33,18 @@ class TestAutoConfig:
         monkeypatch.setattr("api.config.load_settings", lambda: {})
         cfg = cb.get_auto_config()
         assert cfg["enabled"] is True
-        assert cfg["model"] == "gpt-5.6-luna"
-        assert cfg["effort"] == "low"
         assert cfg["min_interval_seconds"] == 60.0
-        assert cfg["choices"] == ["auxiliary", "gpt-5.6-luna"]
+        assert "model" not in cfg
+        assert "effort" not in cfg
+        assert "choices" not in cfg
 
-    def test_invalid_model_falls_back(self, monkeypatch):
-        monkeypatch.setattr("api.config.load_settings", lambda: {"context_brief_model": "gpt-5.6-sol"})
-        assert cb.get_auto_config()["model"] == "gpt-5.6-luna"
+    def test_legacy_model_setting_is_ignored(self, monkeypatch):
+        monkeypatch.setattr(
+            "api.config.load_settings", lambda: {"context_brief_model": "gpt-5.6-luna"}
+        )
+        cfg = cb.get_auto_config()
+        assert "model" not in cfg
+        assert "choices" not in cfg
 
     def test_interval_clamped(self, monkeypatch):
         monkeypatch.setattr(
@@ -52,7 +56,7 @@ class TestAutoConfig:
         assert cfg["enabled"] is False
 
 
-class TestModelThreading:
+class TestAuxiliaryRouting:
     def _fake_call_llm(self, monkeypatch, captured):
         import agent.auxiliary_client as aux
 
@@ -64,26 +68,16 @@ class TestModelThreading:
         monkeypatch.setattr(cb, "_distill_transcript", lambda s: "distilled")
         monkeypatch.setattr(cb, "_extract_llm_content", lambda r: "x" * 300)
 
-    def test_generate_passes_model_and_effort(self, monkeypatch):
+    def test_generate_uses_compression_slot_without_model_override(self, monkeypatch):
         captured = {}
         self._fake_call_llm(monkeypatch, captured)
         text, source = cb._generate_llm_brief(
-            _session(), "sid", {"meta": {"title": "t", "message_count": 5}},
-            model="gpt-5.6-luna", effort="low",
+            _session(), "sid", {"meta": {"title": "t", "message_count": 5}}
         )
         assert source == "auxiliary-llm"
-        assert captured["model"] == "gpt-5.6-luna"
-        assert captured["reasoning_config"] == {"effort": "low"}
         assert captured["task"] == "compression"
-
-    def test_auxiliary_choice_omits_model_override(self, monkeypatch):
-        captured = {}
-        self._fake_call_llm(monkeypatch, captured)
-        cb._generate_llm_brief(
-            _session(), "sid", {"meta": {"title": "t", "message_count": 5}}, model="auxiliary"
-        )
-        assert captured  # the fake really ran (no real provider call in tests)
         assert "model" not in captured
+        assert "reasoning_config" not in captured
 
 
 class TestWorkerGuards:
@@ -172,20 +166,13 @@ class TestRoutePayload:
 
 
 class TestFrontendStatic:
-    def test_model_select_and_auto_refresh_present(self):
+    def test_auto_refresh_present_without_redundant_model_select(self):
         src = open("static/panels.js").read()
-        assert "function _contextBriefModelSelect(brief)" in src
-        assert "onchange=\"_contextBriefModelChange(this)\"" in src
         assert "_contextBriefAutoTimer = setInterval" in src
-        assert 'body: JSON.stringify({context_brief_model: value})' in src
-
-    def test_i18n_keys_all_locales(self):
-        src = open("static/i18n.js").read()
-        for key in ("context_brief_model_label:", "context_brief_model_aux:", "context_brief_model_saved:"):
-            assert src.count(key) == 3, key
-
-    def test_css(self):
-        assert ".ctx-brief-model-select" in open("static/style.css").read()
+        assert "_contextBriefModelSelect" not in src
+        assert "_contextBriefModelChange" not in src
+        assert "context_brief_model" not in src
+        assert ".ctx-brief-model-select" not in open("static/style.css").read()
 
     def test_refresh_reads_match_payload_key(self):
         # The auto-refresh must read brief.llm_brief (the only key the server
@@ -198,6 +185,6 @@ class TestFrontendStatic:
 
     def test_settings_keys_registered(self):
         src = open("api/config.py").read()
-        for key in ('"context_brief_auto"', '"context_brief_model"', '"context_brief_min_interval_seconds"'):
+        for key in ('"context_brief_auto"', '"context_brief_min_interval_seconds"'):
             assert key in src, key
-        assert '"context_brief_model": {"auxiliary", "gpt-5.6-luna"}' in src
+        assert '"context_brief_model"' not in src
