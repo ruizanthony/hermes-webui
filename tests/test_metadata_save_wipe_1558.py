@@ -244,6 +244,82 @@ def test_recover_all_sessions_on_startup_restores_shrunken_session(temp_session_
     assert len(restored["messages"]) == 1000
 
 
+def test_startup_recovery_uses_index_to_defer_archived_sessions(temp_session_dir):
+    """The hot startup pass repairs active rows without parsing archived backups."""
+    active_sid = _make_session_on_disk(
+        temp_session_dir,
+        sid="s_active_recovery",
+        n_msgs=12,
+    )
+    archived_sid = _make_session_on_disk(
+        temp_session_dir,
+        sid="s_archived_recovery",
+        n_msgs=12,
+    )
+
+    for sid, archived in ((active_sid, False), (archived_sid, True)):
+        live_path = temp_session_dir / f"{sid}.json"
+        payload = json.loads(live_path.read_text(encoding="utf-8"))
+        payload["archived"] = archived
+        live_path.with_suffix(".json.bak").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+        payload["messages"] = []
+        live_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    (temp_session_dir / "_index.json").write_text(
+        json.dumps(
+            [
+                {"session_id": active_sid, "archived": False},
+                {"session_id": archived_sid, "archived": True},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    from api.session_recovery import recover_all_sessions_on_startup
+
+    result = recover_all_sessions_on_startup(
+        temp_session_dir,
+        include_archived=False,
+    )
+
+    assert result["restored"] == 1
+    assert result["scanned"] == 1
+    assert result["skipped_archived"] == 1
+    assert len(
+        json.loads((temp_session_dir / f"{active_sid}.json").read_text(encoding="utf-8"))["messages"]
+    ) == 12
+    assert json.loads(
+        (temp_session_dir / f"{archived_sid}.json").read_text(encoding="utf-8")
+    )["messages"] == []
+
+
+def test_startup_recovery_defers_oversized_candidates(temp_session_dir):
+    """The boot path must not parse a candidate beyond its explicit memory budget."""
+    sid = _make_session_on_disk(temp_session_dir, sid="s_large_recovery", n_msgs=12)
+    live_path = temp_session_dir / f"{sid}.json"
+    live_payload = json.loads(live_path.read_text(encoding="utf-8"))
+    live_path.with_suffix(".json.bak").write_text(
+        json.dumps(live_payload),
+        encoding="utf-8",
+    )
+    live_payload["messages"] = []
+    live_path.write_text(json.dumps(live_payload), encoding="utf-8")
+
+    from api.session_recovery import recover_all_sessions_on_startup
+
+    result = recover_all_sessions_on_startup(
+        temp_session_dir,
+        max_candidate_bytes=64,
+    )
+
+    assert result["restored"] == 0
+    assert result["deferred_oversized"] == 1
+    assert json.loads(live_path.read_text(encoding="utf-8"))["messages"] == []
+
+
 def test_recover_all_sessions_on_startup_restores_orphan_bak(temp_session_dir):
     """Startup self-heal: if only <sid>.json.bak survived, recreate <sid>.json."""
     sid = _make_session_on_disk(temp_session_dir, n_msgs=293)
@@ -493,6 +569,11 @@ def test_metadata_only_cached_session_mutation_routes_reload_full_session(
     captured = {}
     monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
     monkeypatch.setattr(routes, "read_body", lambda handler: request_body)
+    monkeypatch.setattr(
+        routes,
+        "_guard_request_worktree_ownership",
+        lambda *args, **kwargs: True,
+    )
     monkeypatch.setattr(
         routes,
         "j",

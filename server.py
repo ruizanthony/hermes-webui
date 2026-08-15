@@ -544,6 +544,48 @@ def _abort_if_already_serving(host: str, port: int) -> None:
         pass
 
 
+def _run_startup_session_recovery() -> None:
+    """Repair active, bounded recovery candidates after HTTP is available."""
+    try:
+        from api.models import (
+            _INLINE_REPLAY_REPAIR_MAX_BYTES,
+            _active_state_db_path,
+        )
+        from api.session_recovery import recover_all_sessions_on_startup
+
+        result = recover_all_sessions_on_startup(
+            SESSION_DIR,
+            rebuild_index=False,
+            state_db_path=_active_state_db_path(),
+            include_archived=False,
+            max_candidate_bytes=_INLINE_REPLAY_REPAIR_MAX_BYTES,
+        )
+        if result.get("restored"):
+            print(
+                f"[recovery] Restored {result['restored']}/{result['scanned']} "
+                "active sessions from .bak (see #1558).",
+                flush=True,
+            )
+        if result.get("deferred_oversized"):
+            print(
+                f"[recovery] Deferred {result['deferred_oversized']} oversized "
+                "session candidate(s) to bounded offline repair.",
+                flush=True,
+            )
+    except Exception as exc:
+        # Recovery is best-effort; never stop the already-bound server.
+        print(f"[recovery] startup recovery failed: {exc}", flush=True)
+
+
+def _schedule_startup_session_recovery(delay: float = 1.0) -> threading.Timer:
+    """Schedule recovery after serve_forever has had time to accept requests."""
+    timer = threading.Timer(delay, _run_startup_session_recovery)
+    timer.name = "webui-startup-session-recovery"
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 def main() -> None:
     from api.config import print_startup_config, verify_hermes_imports, _HERMES_FOUND
 
@@ -568,20 +610,6 @@ def main() -> None:
         print(f"[!!] WARNING: Could not raise file descriptor limit: {fd_limit.get('error')}", flush=True)
 
     fix_credential_permissions()
-
-    try:
-        from api.models import _active_state_db_path
-        from api.session_recovery import recover_all_sessions_on_startup
-        result = recover_all_sessions_on_startup(
-            SESSION_DIR,
-            rebuild_index=True,
-            state_db_path=_active_state_db_path(),
-        )
-        if result.get("restored"):
-            print(f"[recovery] Restored {result['restored']}/{result['scanned']} sessions from .bak (see #1558).", flush=True)
-    except Exception as exc:
-        # Recovery is best-effort; never block server startup.
-        print(f"[recovery] startup recovery failed: {exc}", flush=True)
 
     within_container = False
     try:
@@ -720,6 +748,7 @@ def main() -> None:
         # Not on the main thread (e.g. embedded/test harness); skip handler.
         logger.debug("Could not install SIGTERM handler", exc_info=True)
 
+    _schedule_startup_session_recovery()
     try:
         httpd.serve_forever()
     finally:

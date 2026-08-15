@@ -5498,6 +5498,27 @@ def _reconcile_stale_stream_state_for_session_rows(session_rows) -> bool:
         if row.get("is_streaming") is True:
             continue
         try:
+            from api.models import _INLINE_REPLAY_REPAIR_MAX_BYTES
+
+            if _sidecar_file_exceeds_threshold(
+                sid,
+                _INLINE_REPLAY_REPAIR_MAX_BYTES,
+            ):
+                logger.warning(
+                    "Deferred stale stream cleanup for oversized session %s; "
+                    "use bounded offline repair before loading the full sidecar",
+                    sid,
+                )
+                continue
+        except Exception:
+            # Size probing is only an optimization guard. Preserve the existing
+            # fail-open cleanup path when the file cannot be inspected.
+            logger.debug(
+                "Could not inspect sidecar size while reconciling stale stream state for %s",
+                sid,
+                exc_info=True,
+            )
+        try:
             session = get_session(sid, metadata_only=True)
         except Exception:
             logger.debug(
