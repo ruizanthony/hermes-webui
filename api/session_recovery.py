@@ -531,6 +531,18 @@ def _recover_session_owned(
     status = inspect_session_recovery_status(session_path)
     if status["recommend"] != "restore":
         return {**status, "restored": False}
+    # A durable WebUI delete tombstone fences restoration no matter whether the
+    # live sidecar still exists: restoring any artifact for a deleted SID would
+    # resurrect a session the operator intentionally removed. strict=True fails
+    # closed when the tombstone cannot be read.
+    from api.models import _webui_deleted_session_is_tombstoned
+
+    if _webui_deleted_session_is_tombstoned(
+        session_path.stem,
+        session_dir=session_path.parent,
+        strict=True,
+    ):
+        return {**status, "restored": False, "deleted": True}
     if expected_live_revision.state == "ABSENT":
         if _durable_tombstone_marks_deleted_webui_session(
             session_path.parent,

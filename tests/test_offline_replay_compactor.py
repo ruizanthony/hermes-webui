@@ -680,7 +680,7 @@ def test_runtime_save_preserves_and_advances_sidecar_generation(tmp_path, monkey
     assert persisted["_sidecar_generation_v1"] == 8
 
 
-def test_fresh_runtime_writer_adopts_existing_sidecar_revision(tmp_path, monkeypatch):
+def test_fresh_runtime_writer_is_rejected_until_it_loads_the_existing_sidecar(tmp_path, monkeypatch):
     from api import models
 
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
@@ -690,18 +690,36 @@ def test_fresh_runtime_writer_adopts_existing_sidecar_revision(tmp_path, monkeyp
     original.save(skip_index=True)
     original_payload = json.loads(original.path.read_text(encoding="utf-8"))
 
+    # Contract: a fresh in-memory writer that never observed the durable sidecar
+    # must not adopt its revision implicitly — saving is rejected fail-closed and
+    # the durable payload is preserved untouched (anti-overwrite fence).
     replacement = models.Session(
         session_id="fresh-writer",
         title="replacement",
         messages=[{"role": "user", "content": "replacement"}],
     )
-    assert replacement._sidecar_revision_v1 is None
+    record = replacement._sidecar_revisions.get("fresh-writer") or {}
+    assert record.get("generation") == 0 and record.get("digest_sha256") is None
 
-    replacement.save(skip_index=True)
+    import pytest
 
-    persisted = json.loads(replacement.path.read_text(encoding="utf-8"))
+    with pytest.raises(models.StaleSessionGenerationError):
+        replacement.save(skip_index=True)
+
+    persisted = json.loads(original.path.read_text(encoding="utf-8"))
+    assert persisted == original_payload
+
+    # After an explicit load, the writer owns the observed revision and the next
+    # save continues the generation/epoch lineage of the durable sidecar.
+    loaded = models.Session.load("fresh-writer")
+    assert loaded is not None
+    loaded.title = "replacement"
+    loaded.messages = [{"role": "user", "content": "replacement"}]
+    loaded.save(skip_index=True)
+
+    persisted = json.loads(loaded.path.read_text(encoding="utf-8"))
     assert persisted["title"] == "replacement"
-    assert persisted["messages"] == replacement.messages
+    assert persisted["messages"] == loaded.messages
     assert persisted["_sidecar_generation_v1"] == 2
     assert persisted["_sidecar_epoch_v1"] == original_payload["_sidecar_epoch_v1"]
 
