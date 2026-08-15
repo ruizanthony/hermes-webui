@@ -23247,6 +23247,42 @@ def start_session_turn(
     source: str = "process_wakeup",
     continuation_claim_id: str | None = None,
 ):
+    """Atomically admit one server-side turn against site maintenance.
+
+    Completion, delegation, and Goal workers may run without a browser or a new
+    HTTP connection, so a network fence alone cannot stop them.  The shared
+    lease closes the check/start race with the updater's exclusive lease.  A
+    maintenance collision is reported as an ordinary retryable 409, preserving
+    each producer's durable claim/queue semantics.
+    """
+    from api.maintenance_gate import (
+        WebUIMaintenanceInProgress,
+        webui_server_turn_admission,
+    )
+
+    try:
+        with webui_server_turn_admission():
+            return _start_session_turn_impl(
+                session_id,
+                message,
+                source=source,
+                continuation_claim_id=continuation_claim_id,
+            )
+    except WebUIMaintenanceInProgress:
+        return {
+            "error": "maintenance_in_progress",
+            "message": "Hermes maintenance is in progress; retry this turn later.",
+            "_status": 409,
+        }
+
+
+def _start_session_turn_impl(
+    session_id: str,
+    message: str,
+    *,
+    source: str = "process_wakeup",
+    continuation_claim_id: str | None = None,
+):
     """Start a server-side agent turn for ``session_id`` with ``message``.
 
     Option Z primary wakeup entrypoint. This is the minimal, HTTP-handler-free
