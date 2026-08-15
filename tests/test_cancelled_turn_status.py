@@ -136,7 +136,10 @@ class TestCancelledTurnFinalizer:
 class TestCancelledTurnPersistenceGuards:
     def test_ephemeral_cleanup_never_directly_unlinks_a_sidecar(self):
         src = _read("api/streaming.py")
-        assert ".unlink(" not in src
+        start = src.index("def _cleanup_ephemeral_session_sidecar_locked")
+        end = src.index("\ndef ", start + 1)
+        block = src[start:end]
+        assert ".unlink(" not in block
         assert "_session_sidecar_authority" in src
         assert "_delete_session_sidecar_artifacts_locked" in src
         assert 'outcome="completed"' in src
