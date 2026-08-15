@@ -254,6 +254,46 @@ the failed attempt, then accepts either a complete pair from the new result or
 a complete pair from the new agent. Fields from separate attempts or sources
 must never be combined into deletion authority.
 
+#### Session sidecar publication authority
+
+Every compliant writer of `SESSION_DIR/<sid>.json` participates in the same
+per-SID thread and cross-process authority. This includes normal `Session.save()`
+writes, backup recovery, and discoverability repairs. Existing sidecars are
+fenced by their generation plus exact digest; first publication is create-or-fail,
+so a stale alias or repair cannot overwrite a sidecar that appeared concurrently.
+Out-of-band replacements increment `_sidecar_generation_v1` and invalidate cached
+aliases before later saves can proceed.
+
+When a State DB self-heal saves through a freshly loaded owner, the caller's
+cached alias inherits the new revision only if it owned the exact pre-save
+revision. Otherwise the self-heal returns and installs the freshly saved owner;
+it never grants a stale alias authority over unrelated unsaved fields.
+
+State DB sidecar materialization treats its initial scan only as candidate
+discovery and re-reads the complete authoritative row after acquiring the SID
+authority. That targeted reread uses one explicit SQLite read transaction for
+session metadata and ordered messages. Its private temporary file is flushed
+before create-only publication. Hidden background-session cleanup follows agent
+lock then SID authority, records a durable delete tombstone before unlinking,
+invalidates cached aliases, removes recoverable backups, attempts State DB
+cleanup, and fsyncs the session directory.
+
+Deleted-WebUI-session tombstone updates are serialized by a global cross-process
+authority in a lock-path namespace that no accepted session SID can alias. It is
+acquired only after any SID authority. Tombstone publication flushes the file
+and parent directory before sidecar deletion can start; a failure is returned to
+the delete caller with the sidecar intact. Primary, backup, or archive unlink
+failure also fails closed before State DB cleanup or success. A successful
+delete verifies those files are absent and fsyncs the session directory again.
+
+Sidecar, primary-backup, and incomparable-backup archive publications flush the
+file before atomic publication and fsync the parent directory on POSIX. Native
+Windows keeps atomic publication and file flushing, but Python does not expose an
+equivalent directory-fsync guarantee here; the final directory entry is therefore
+not guaranteed across sudden power loss on native Windows. POSIX ignores only
+filesystem-declared unsupported directory-fsync errors (`EINVAL`/`ENOTSUP`);
+permission and I/O failures propagate.
+
 #### Imported `state.db` sidebar projection
 
 `api.models.get_cli_sessions()` projects conversations from the active Hermes

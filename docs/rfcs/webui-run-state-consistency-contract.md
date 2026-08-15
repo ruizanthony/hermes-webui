@@ -145,6 +145,26 @@ and 5; it does not mark every run-state boundary implemented.
 8. **Every mutation names its layer.** A PR touching streaming, recovery,
    context reconstruction, compression, replay, or sidebar metadata should state
    which layer it changes and what regression proves the invariant still holds.
+9. **Sidecar writes are generation-fenced.** A writer may replace a session JSON
+   sidecar only while the exact durable revision it observed is still current.
+   Text publication must use canonical LF bytes so the stored digest matches the
+   file on native Windows. First creation must use an atomic create-only primitive:
+   hard-link on POSIX, create-only rename on Windows, or fail closed when neither
+   is available. SID rotation must start from an absent revision for the new ID.
+   A raw metadata patch may advance only aliases that owned the exact pre-write
+   revision; stale aliases are invalidated and reloaded instead, and callers must
+   adopt the returned revision owner before model resolution or turn start.
+   Recovery must recheck durable deletes under the SID authority, validate the
+   embedded SID, and invalidate stale in-memory aliases. A shrinking write must
+   not proceed unless its recoverable history is durable: row count alone does
+   not prove dominance; malformed, non-object, foreign-SID, and incomparable
+   primary backups are archived byte-for-byte and content-addressedly before the
+   valid live snapshot is promoted. Archive publication streams into a complete
+   temporary file, verifies the expected digest, and atomically renames it, so
+   archive preservation does not depend on hard-link support; the stricter
+   create-only primitive remains mandatory for live sidecars. Backup retirement
+   requires matching receipts for both the backup and the committed live
+   generation.
 
 ## Review Checklist
 
@@ -163,6 +183,13 @@ context reconstruction, or session metadata:
 - Can this change move a session in the sidebar without meaningful user or
   assistant activity?
 - Can automatic compression or recovery text become visible active-turn content?
+- Can a stale save, repair, recovery, or metadata patch replace a newer sidecar?
+  Does recovery revalidate delete tombstones and state-db ownership while holding
+  the same SID authority used for publication?
+- If the write shrinks history, is backup publication fail-closed and monotone by
+  ordered semantic row coverage rather than count? Are incomparable generations
+  archived before promotion, and does cleanup prove both backup and live receipts
+  still match before unlinking?
 - What test or manual evidence proves the invariant?
 
 ## Existing Issue Map

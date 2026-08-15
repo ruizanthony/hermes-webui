@@ -32,6 +32,7 @@ import os
 import re
 import sqlite3
 import threading
+import uuid
 from contextlib import closing
 from pathlib import Path
 
@@ -466,37 +467,110 @@ def inspect_session_recovery_status(session_path: Path) -> dict:
     }
 
 
-def recover_session(session_path: Path) -> dict:
-    """Restore session_path from its .bak when the bak has more messages.
+def recover_session(
+    session_path: Path,
+    *,
+    state_db_path: Path | None = None,
+) -> dict:
+    """Restore from .bak without superseding a newer sidecar generation."""
+    from api.models import _session_sidecar_authority
 
-    Returns a status dict identical to ``inspect_session_recovery_status``
-    plus a "restored" boolean.
-    """
+    with _session_sidecar_authority(
+        session_path.stem,
+        session_dir=session_path.parent,
+    ):
+        return _recover_session_owned(
+            session_path,
+            state_db_path=state_db_path,
+        )
+
+
+def _recover_session_owned(
+    session_path: Path,
+    *,
+    state_db_path: Path | None = None,
+) -> dict:
+    """Run one recovery while holding the cross-process SID authority."""
+    from api.models import (
+        _fsync_sidecar_directory,
+        _invalidate_cached_session_generation,
+        _publish_sidecar_no_replace,
+        _read_sidecar_revision,
+        _safe_replace,
+    )
+
+    bak_path = session_path.with_suffix('.json.bak')
+    expected_live_revision = _read_sidecar_revision(
+        session_path,
+        session_path.stem,
+    )
+    expected_backup_revision = _read_sidecar_revision(
+        bak_path,
+        session_path.stem,
+    )
     status = inspect_session_recovery_status(session_path)
     if status["recommend"] != "restore":
         return {**status, "restored": False}
-    bak_path = session_path.with_suffix('.json.bak')
-    # Stage the recovery via a tmp write + atomic replace so a crash
-    # mid-restore cannot leave a half-written session.json.
-    tmp_path = session_path.with_suffix('.json.recover.tmp')
+    if expected_live_revision.state == "ABSENT":
+        if _durable_tombstone_marks_deleted_webui_session(
+            session_path.parent,
+            session_path.stem,
+        ):
+            return {**status, "restored": False, "deleted": True}
+        if not _state_db_has_session(session_path.stem, state_db_path):
+            return {
+                **status,
+                "restored": False,
+                "deleted": True,
+                "missing_state_row": True,
+            }
+    if expected_backup_revision.state != "PRESENT":
+        return {**status, "restored": False, "stale_generation": True}
+    tmp_path = session_path.with_suffix(
+        f'.json.recover.tmp.{os.getpid()}.{threading.current_thread().ident}'
+    )
     try:
-        # #6600: restore the SAME effective payload that _msg_count()
-        # evaluated — collapse replayed empty ``incomplete`` rows and
-        # recompute message_count from the collapsed list — so recovery never
-        # resurrects the duplicate amplification it just decided to repair.
-        bak_data = json.loads(bak_path.read_text(encoding='utf-8'))
-        if not isinstance(bak_data, dict):
+        backup = json.loads(bak_path.read_text(encoding='utf-8'))
+        if not isinstance(backup, dict):
             raise ValueError("backup payload is not a session object")
+        if backup.get('session_id') != session_path.stem:
+            raise ValueError("backup session id does not match sidecar path")
+        # Restore the same effective replay payload that recovery evaluated.
         from api.models import _repair_session_message_projections
 
-        bak_data, _, _ = _repair_session_message_projections(bak_data)
-        bak_messages = bak_data.get('messages')
-        if isinstance(bak_messages, list):
-            bak_data['message_count'] = len(bak_messages)
-        tmp_path.write_text(
-            json.dumps(bak_data, ensure_ascii=False, indent=2), encoding='utf-8'
+        backup, _, _ = _repair_session_message_projections(backup)
+        backup_messages = backup.get('messages')
+        if isinstance(backup_messages, list):
+            backup['message_count'] = len(backup_messages)
+        base_generation = (
+            expected_live_revision.generation
+            if expected_live_revision.state == "PRESENT"
+            else expected_backup_revision.generation
         )
-        tmp_path.replace(session_path)
+        backup['_sidecar_generation_v1'] = base_generation + 1
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps(backup, ensure_ascii=False, indent=2))
+            fh.flush()
+            os.fsync(fh.fileno())
+        if (
+            _read_sidecar_revision(session_path, session_path.stem)
+            != expected_live_revision
+            or _read_sidecar_revision(bak_path, session_path.stem)
+            != expected_backup_revision
+        ):
+            tmp_path.unlink(missing_ok=True)
+            return {**status, "restored": False, "stale_generation": True}
+        if expected_live_revision.state == "ABSENT":
+            try:
+                _publish_sidecar_no_replace(tmp_path, session_path)
+            except FileExistsError:
+                tmp_path.unlink(missing_ok=True)
+                return {**status, "restored": False, "stale_generation": True}
+            tmp_path.unlink(missing_ok=True)
+        else:
+            _safe_replace(tmp_path, session_path)
+            _fsync_sidecar_directory(session_path.parent)
+        _invalidate_cached_session_generation(session_path.stem)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         logger.warning("recover_session: copy failed for %s: %s", session_path, exc)
         try:
@@ -582,6 +656,7 @@ def _read_state_db_missing_sidecar_rows(
     state_db_path: Path | None,
     *,
     include_empty: bool = False,
+    session_id: str | None = None,
 ) -> list[dict]:
     """Return WebUI-origin state.db rows whose JSON sidecar is missing."""
     if state_db_path is None or not state_db_path.exists():
@@ -589,6 +664,9 @@ def _read_state_db_missing_sidecar_rows(
     try:
         with closing(sqlite3.connect(f"file:{state_db_path}?mode=ro", uri=True)) as conn:
             conn.row_factory = sqlite3.Row
+            # A read-only connection does not begin a transaction for SELECTs
+            # automatically. Pin metadata and messages to one SQLite snapshot.
+            conn.execute("BEGIN")
             session_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
             message_cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
             if not {'id', 'source'}.issubset(session_cols):
@@ -604,6 +682,11 @@ def _read_state_db_missing_sidecar_rows(
             worktree_repo_root_expr = _sql_optional_col('worktree_repo_root', session_cols)
             worktree_created_at_expr = _sql_optional_col('worktree_created_at', session_cols)
             rows = []
+            where_clause = "source = 'webui'"
+            query_params: tuple[str, ...] = ()
+            if session_id is not None:
+                where_clause += " AND id = ?"
+                query_params = (session_id,)
             for row in conn.execute(
                 f"""
                 SELECT id, source, {title_expr}, {model_expr}, {started_expr},
@@ -611,9 +694,10 @@ def _read_state_db_missing_sidecar_rows(
                        {worktree_path_expr}, {worktree_branch_expr},
                        {worktree_repo_root_expr}, {worktree_created_at_expr}
                 FROM sessions
-                WHERE source = 'webui'
+                WHERE {where_clause}
                 ORDER BY COALESCE(started_at, 0) DESC
-                """
+                """,
+                query_params,
             ).fetchall():
                 data = dict(row)
                 sid = str(data.get('id') or '').strip()
@@ -732,6 +816,8 @@ def _state_db_row_to_sidecar(row: dict) -> dict:
 
 def recover_missing_sidecars_from_state_db(session_dir: Path, state_db_path: Path | None) -> dict:
     """Materialize missing WebUI JSON sidecars from canonical state.db rows."""
+    from api.models import _publish_sidecar_no_replace, _session_sidecar_authority
+
     rows = _read_state_db_missing_sidecar_rows(session_dir, state_db_path)
     materialized = 0
     details: list[dict] = []
@@ -743,30 +829,62 @@ def recover_missing_sidecars_from_state_db(session_dir: Path, state_db_path: Pat
         target = session_dir / f"{sid}.json"
         if target.exists():
             continue
-        payload = _state_db_row_to_sidecar(row)
         # Per-process/per-thread tmp suffix to avoid corruption under
         # concurrent reconciliation calls (matches api/models.py:484
         # Session.save() convention).
-        tmp_suffix = f".json.reconcile.tmp.{os.getpid()}.{threading.current_thread().ident}"
+        tmp_suffix = (
+            f".json.reconcile.tmp.{os.getpid()}."
+            f"{threading.current_thread().ident}.{uuid.uuid4().hex}"
+        )
         tmp = target.with_suffix(tmp_suffix)
         detail_recorded = False
-        try:
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-        except OSError as exc:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            details.append({'session_id': sid, 'materialized': False, 'error': str(exc)})
-            continue
+        payload = None
         # Atomic create-or-fail: os.link() refuses to overwrite an existing
         # target. Closes the TOCTOU window between the target.exists() check
         # above and the rename — a concurrent Session.save() for the same SID
         # will win and we silently skip rather than overwrite a live sidecar.
         materialized_now = False
+        skipped_deleted = False
         try:
-            os.link(str(tmp), str(target))
-            materialized_now = True
+            with _session_sidecar_authority(sid, session_dir=session_dir):
+                if _durable_tombstone_marks_deleted_webui_session(session_dir, sid):
+                    skipped_deleted = True
+                else:
+                    current_row = next(
+                        (
+                            candidate
+                            for candidate in _read_state_db_missing_sidecar_rows(
+                                session_dir,
+                                state_db_path,
+                                session_id=sid,
+                            )
+                            if str(candidate.get('id') or '').strip() == sid
+                        ),
+                        None,
+                    )
+                    if current_row is None:
+                        skipped_deleted = True
+                    else:
+                        payload = _state_db_row_to_sidecar(current_row)
+                        payload['_sidecar_generation_v1'] = 1
+                        fd = os.open(
+                            tmp,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                        )
+                        with os.fdopen(
+                            fd,
+                            'w',
+                            encoding='utf-8',
+                            newline='\n',
+                        ) as handle:
+                            handle.write(
+                                json.dumps(payload, ensure_ascii=False, indent=2)
+                            )
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        _publish_sidecar_no_replace(tmp, target)
+                        materialized_now = True
         except FileExistsError:
             # Live sidecar appeared between the check and the link — keep it.
             pass
@@ -780,7 +898,13 @@ def recover_missing_sidecars_from_state_db(session_dir: Path, state_db_path: Pat
                 pass
         if materialized_now:
             materialized += 1
-            details.append({'session_id': sid, 'materialized': True, 'messages': len(payload.get('messages') or [])})
+            details.append({
+                'session_id': sid,
+                'materialized': True,
+                'messages': len((payload or {}).get('messages') or []),
+            })
+        elif skipped_deleted:
+            details.append({'session_id': sid, 'materialized': False, 'skipped': 'deleted_during_reconcile'})
         elif not detail_recorded:
             details.append({'session_id': sid, 'materialized': False, 'skipped': 'sidecar_appeared_during_reconcile'})
     return {'scanned': len(rows), 'materialized': materialized, 'details': details}
@@ -1139,7 +1263,7 @@ def recover_all_sessions_on_startup(
     scanned = len(live_paths) + len(orphan_paths)
     for path in [*recovery_paths, *orphan_paths]:
         try:
-            result = recover_session(path)
+            result = recover_session(path, state_db_path=state_db_path)
         except Exception as exc:
             # Defensive: a malformed session file shouldn't break recovery
             # for the rest. Log and continue.

@@ -15308,22 +15308,61 @@ def handle_post(handler, parsed) -> bool:
         session_lock = _get_session_agent_lock(sid)
         if not session_lock.acquire(timeout=5):
             return bad(handler, "Session busy, try again", 503)
+        sidecar_authority = None
         try:
-            with LOCK:
-                SESSIONS.pop(sid, None)
+            from api.models import (
+                _fsync_sidecar_directory,
+                _session_sidecar_authority,
+            )
+
+            sidecar_authority = _session_sidecar_authority(sid)
+            sidecar_authority.__enter__()
             try:
                 p = (SESSION_DIR / f"{sid}.json").resolve()
                 p.relative_to(SESSION_DIR.resolve())
             except Exception:
                 return bad(handler, "Invalid session_id", 400)
-            sidecar_deleted = False
+            if not is_messaging_session:
+                try:
+                    _record_webui_deleted_session_tombstone(sid)
+                except Exception:
+                    logger.warning(
+                        "Failed to durably tombstone deleted WebUI session %s",
+                        sid,
+                        exc_info=True,
+                    )
+                    return bad(handler, "Failed to persist session deletion", 500)
+            with LOCK:
+                SESSIONS.pop(sid, None)
+            backup_path = p.with_suffix('.json.bak')
+            archived_backups = list(p.parent.glob(f'{p.name}.bak.archive-*'))
             try:
-                p.unlink(missing_ok=True)
+                for session_file in (p, backup_path, *archived_backups):
+                    session_file.unlink(missing_ok=True)
             except Exception:
-                logger.debug("Failed to unlink session file %s", p)
-            sidecar_deleted = not p.exists()
+                logger.warning(
+                    "Failed to delete required session file for %s",
+                    sid,
+                    exc_info=True,
+                )
+                return bad(handler, "Failed to delete session files", 500)
+            remaining_session_files = [
+                session_file
+                for session_file in (p, backup_path, *archived_backups)
+                if session_file.exists()
+            ]
+            remaining_session_files.extend(
+                p.parent.glob(f'{p.name}.bak.archive-*')
+            )
+            if remaining_session_files:
+                logger.warning(
+                    "Session delete left required files for %s: %s",
+                    sid,
+                    [path.name for path in remaining_session_files],
+                )
+                return bad(handler, "Failed to delete session files", 500)
             # Remove the derivable context-brief cache with the session it
-            # summarizes (best-effort; never blocks the delete itself).
+            # summarizes (best-effort; never blocks the durable deletion).
             try:
                 from api.context_brief import delete_stored_brief
 
@@ -15335,15 +15374,17 @@ def handle_post(handler, parsed) -> bool:
             except Exception:
                 logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
             try:
-                p.with_suffix('.json.bak').unlink(missing_ok=True)
+                _fsync_sidecar_directory(p.parent)
             except Exception:
-                logger.debug("Failed to unlink session backup file %s", p.with_suffix('.json.bak'))
-            if sidecar_deleted and not is_messaging_session:
-                try:
-                    _record_webui_deleted_session_tombstone(sid)
-                except Exception:
-                    logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
+                logger.warning(
+                    "Failed to persist deleted session directory entries for %s",
+                    sid,
+                    exc_info=True,
+                )
+                return bad(handler, "Failed to durably delete session files", 500)
         finally:
+            if sidecar_authority is not None:
+                sidecar_authority.__exit__(None, None, None)
             session_lock.release()
         try:
             from api.goal_continuations import complete_goal_continuation
@@ -15550,7 +15591,9 @@ def handle_post(handler, parsed) -> bool:
             # again (#3542 lifecycle gap).
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, "Untitled")
-            s.save()
+            backup_receipt = s.save()
+            from api.models import _read_sidecar_revision, _retire_backup_if_owned
+            committed_receipt = _read_sidecar_revision(s.path, sid)
             persisted_clear = False
             try:
                 persisted = json.loads(s.path.read_text(encoding="utf-8"))
@@ -15570,7 +15613,12 @@ def handle_post(handler, parsed) -> bool:
                 logger.warning("session clear could not verify persisted empty state for %s", sid, exc_info=True)
             if had_sidecar_messages and persisted_clear:
                 try:
-                    s.path.with_suffix('.json.bak').unlink(missing_ok=True)
+                    _retire_backup_if_owned(
+                        sid,
+                        s.path.with_suffix('.json.bak'),
+                        backup_receipt,
+                        committed_receipt,
+                    )
                 except OSError:
                     logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
         # Evict cached agent outside the per-session lock.  Eviction may run a
@@ -21671,6 +21719,35 @@ def _handle_btw(handler, body):
     return j(handler, {"stream_id": stream_id, "session_id": ephemeral.session_id, "parent_session_id": body["session_id"]})
 
 
+def _delete_hidden_background_session_sidecar(session_id: str) -> None:
+    """Delete a completed hidden session through the normal SID authorities."""
+    if not is_safe_session_id(session_id):
+        raise ValueError(f"Unsafe hidden background session_id {session_id!r}")
+    with _get_session_agent_lock(session_id):
+        from api.models import (
+            _fsync_sidecar_directory,
+            _invalidate_cached_session_generation,
+            _record_webui_deleted_session_tombstone,
+            _session_sidecar_authority,
+            delete_cli_session,
+        )
+
+        with _session_sidecar_authority(session_id):
+            _record_webui_deleted_session_tombstone(session_id)
+            _invalidate_cached_session_generation(session_id)
+            path = SESSION_DIR / f"{session_id}.json"
+            path.unlink(missing_ok=True)
+            path.with_suffix(".json.bak").unlink(missing_ok=True)
+            for archived_backup in path.parent.glob(f"{path.name}.bak.archive-*"):
+                archived_backup.unlink(missing_ok=True)
+            _fsync_sidecar_directory(path.parent)
+        if not delete_cli_session(session_id):
+            logger.warning(
+                "Hidden background session %s remains in state.db; durable tombstone prevents recovery",
+                session_id,
+            )
+
+
 def _handle_background(handler, body):
     """POST /api/background — run prompt in parallel background agent.
 
@@ -21755,7 +21832,7 @@ def _handle_background(handler, body):
             # clutter the sidebar or SESSION_DIR. The index is pruned on the
             # next rebuild via _index_entry_exists().
             try:
-                (SESSION_DIR / f"{bg_sid}.json").unlink(missing_ok=True)
+                _delete_hidden_background_session_sidecar(bg_sid)
             except Exception:
                 pass
         except Exception:
@@ -22579,6 +22656,8 @@ def start_session_turn(
 
     try:
         workspace = _resolve_chat_workspace_with_recovery(s, None)
+        s = getattr(workspace, "session", s)
+        workspace = str(workspace)
     except WorkspaceBindingPersistenceError as e:
         return {"error": str(e), "_status": 500}
     except ValueError as e:
@@ -23178,13 +23257,15 @@ def _handle_chat_start(handler, body, diag=None):
                     return bad(handler, "invalid profile", 400)
             except ImportError:
                 requested_profile = ""
-        session_profile = getattr(s, "profile", None)
-        has_persisted_turns = bool(
-            getattr(s, "messages", None)
-            or getattr(s, "context_messages", None)
-            or getattr(s, "pending_user_message", None)
-        )
-        if not _session_visible_to_active_profile(session_profile, handler):
+        def _authorize_chat_start_session(candidate):
+            session_profile = getattr(candidate, "profile", None)
+            has_persisted_turns = bool(
+                getattr(candidate, "messages", None)
+                or getattr(candidate, "context_messages", None)
+                or getattr(candidate, "pending_user_message", None)
+            )
+            if _session_visible_to_active_profile(session_profile, handler):
+                return True
             if (
                 requested_profile
                 and _profiles_match(requested_profile, active_profile)
@@ -23192,35 +23273,48 @@ def _handle_chat_start(handler, body, diag=None):
             ):
                 # Empty placeholders can still be retagged when the
                 # requested profile matches the active request profile.
-                s.profile = requested_profile
-            else:
-                return bad(handler, "Session not found", 404)
+                candidate.profile = requested_profile
+                return True
+            return False
+
+        if not _authorize_chat_start_session(s):
+            return bad(handler, "Session not found", 404)
         diag.stage("normalize_message") if diag else None
         msg = str(body.get("message", "")).strip()
         if not msg:
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
         attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
-        recovery = compression_recovery_payload_for_session(s)
-        if recovery and not attachments and is_generic_continuation_intent(msg):
+
+        def _compression_recovery_required_response(candidate_recovery):
             return j(
                 handler,
                 {
                     "error": "This session exhausted context compression. Start a focused continuation, then describe the next narrow task.",
                     "type": "compression_recovery_required",
-                    "recommended_recovery_action": recovery.get("recommended_action"),
-                    "compression_recovery": recovery,
+                    "recommended_recovery_action": candidate_recovery.get(
+                        "recommended_action"
+                    ),
+                    "compression_recovery": candidate_recovery,
                     "session_id": getattr(s, "session_id", body["session_id"]),
                 },
                 status=409,
             )
+
         diag.stage("resolve_workspace") if diag else None
         try:
             workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
+            s = getattr(workspace, "session", s)
+            workspace = str(workspace)
         except WorkspaceBindingPersistenceError as e:
             return bad(handler, str(e), 500)
         except ValueError as e:
             return bad(handler, str(e))
+        if not _authorize_chat_start_session(s):
+            return bad(handler, "Session not found", 404)
+        recovery = compression_recovery_payload_for_session(s)
+        if recovery and not attachments and is_generic_continuation_intent(msg):
+            return _compression_recovery_required_response(recovery)
         requested_model = body.get("model") or s.model
         requested_provider = (
             body.get("model_provider")
@@ -23366,7 +23460,16 @@ def _handle_chat_start(handler, body, diag=None):
 
 
 
-def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> str:
+class _ResolvedChatWorkspace(str):
+    """String-compatible workspace resolution carrying the durable SID owner."""
+
+    def __new__(cls, workspace, session):
+        resolved = super().__new__(cls, str(workspace))
+        resolved.session = session
+        return resolved
+
+
+def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> _ResolvedChatWorkspace:
     """Recover stale implicit session workspaces without hiding explicit errors."""
     def _validated_target(candidate) -> str:
         target = str(candidate)
@@ -23379,21 +23482,24 @@ def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> str:
 
     explicit = requested_workspace not in (None, "")
     if explicit:
-        return _validated_target(resolve_trusted_workspace(requested_workspace))
+        workspace = _validated_target(resolve_trusted_workspace(requested_workspace))
+        return _ResolvedChatWorkspace(workspace, s)
     stored_workspace = getattr(s, "workspace", None)
     workspace, recovered = resolve_implicit_workspace_with_recovery(
         stored_workspace,
         get_last_workspace,
     )
     if not recovered:
-        return _validated_target(workspace)
+        workspace = _validated_target(workspace)
+        return _ResolvedChatWorkspace(workspace, s)
     workspace = _validated_target(workspace)
     persisted = persist_recovered_workspace_binding(
         s,
         workspace,
         expected_workspace=stored_workspace,
     )
-    return _validated_target(persisted.workspace)
+    persisted_workspace = _validated_target(persisted.workspace)
+    return _ResolvedChatWorkspace(persisted_workspace, persisted)
 
 
 def _normalize_chat_attachments(raw_attachments):
@@ -25891,7 +25997,18 @@ def _handle_session_compress(handler, body):
             if not preserves_automatic_tail_lineage:
                 s.compression_anchor_mode = "manual"
             s.last_prompt_tokens = new_tokens
-            s.save()
+            backup_receipt = s.save()
+            # Drop stale backups that would undo an intentional manual compress.
+            try:
+                from api.models import _read_sidecar_revision, _retire_backup_if_owned
+                _retire_backup_if_owned(
+                    s.session_id,
+                    s.path.with_suffix(".json.bak"),
+                    backup_receipt,
+                    _read_sidecar_revision(s.path, s.session_id),
+                )
+            except OSError:
+                pass
 
         session_payload = redact_session_data(
             s.compact() | {
