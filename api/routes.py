@@ -15400,11 +15400,33 @@ def handle_post(handler, parsed) -> bool:
                     return bad(handler, "Failed to persist session deletion", 500)
             with LOCK:
                 SESSIONS.pop(sid, None)
+            backup_path = p.with_suffix('.json.bak')
+            archived_backups = list(p.parent.glob(f'{p.name}.bak.archive-*'))
             try:
-                p.unlink(missing_ok=True)
+                for session_file in (p, backup_path, *archived_backups):
+                    session_file.unlink(missing_ok=True)
             except Exception:
-                logger.debug("Failed to unlink session file %s", p)
-            sidecar_deleted = not p.exists()
+                logger.warning(
+                    "Failed to delete required session file for %s",
+                    sid,
+                    exc_info=True,
+                )
+                return bad(handler, "Failed to delete session files", 500)
+            remaining_session_files = [
+                session_file
+                for session_file in (p, backup_path, *archived_backups)
+                if session_file.exists()
+            ]
+            remaining_session_files.extend(
+                p.parent.glob(f'{p.name}.bak.archive-*')
+            )
+            if remaining_session_files:
+                logger.warning(
+                    "Session delete left required files for %s: %s",
+                    sid,
+                    [path.name for path in remaining_session_files],
+                )
+                return bad(handler, "Failed to delete session files", 500)
             # Remove the derivable context-brief cache with the session it
             # summarizes (best-effort; never blocks the delete itself).
             try:
@@ -15417,15 +15439,6 @@ def handle_post(handler, parsed) -> bool:
                 prune_session_from_index(sid)
             except Exception:
                 logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
-            try:
-                p.with_suffix('.json.bak').unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to unlink session backup file %s", p.with_suffix('.json.bak'))
-            try:
-                for archived_backup in p.parent.glob(f'{p.name}.bak.archive-*'):
-                    archived_backup.unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to unlink archived session backups for %s", p)
             try:
                 _fsync_sidecar_directory(p.parent)
             except Exception:
@@ -21987,10 +22000,13 @@ def _delete_hidden_background_session_sidecar(session_id: str) -> None:
         from api.models import (
             _fsync_sidecar_directory,
             _invalidate_cached_session_generation,
+            _record_webui_deleted_session_tombstone,
             _session_sidecar_authority,
+            delete_cli_session,
         )
 
         with _session_sidecar_authority(session_id):
+            _record_webui_deleted_session_tombstone(session_id)
             _invalidate_cached_session_generation(session_id)
             path = SESSION_DIR / f"{session_id}.json"
             path.unlink(missing_ok=True)
@@ -21998,6 +22014,11 @@ def _delete_hidden_background_session_sidecar(session_id: str) -> None:
             for archived_backup in path.parent.glob(f"{path.name}.bak.archive-*"):
                 archived_backup.unlink(missing_ok=True)
             _fsync_sidecar_directory(path.parent)
+        if not delete_cli_session(session_id):
+            logger.warning(
+                "Hidden background session %s remains in state.db; durable tombstone prevents recovery",
+                session_id,
+            )
 
 
 def _handle_background(handler, body):
