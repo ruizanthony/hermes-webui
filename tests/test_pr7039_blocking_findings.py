@@ -254,12 +254,29 @@ def test_workspace_recovery_patch_releases_waiting_canonical_save_without_lost_t
     assert not raw_thread.is_alive()
     assert not canonical_thread.is_alive()
     assert raw_outcome == ["saved"]
-    assert canonical_outcome == ["saved"]
+    # Contract (post-PR2): the canonical save that loaded its revision before the
+    # workspace patch is rejected with an explicit stale error — the turn is
+    # never silently lost, it must be retried after a reload.
+    assert canonical_outcome == [
+        f"stale:StaleSessionGenerationError:Stale session generation for '{sid}'; "
+        "reload before saving"
+    ]
 
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    # Only the workspace patch landed; the rejected save could not clobber it.
+    assert payload["_sidecar_generation_v1"] == generation_before + 1
+    assert payload["workspace"] == str((tmp_path / "after").resolve())
+
+    # The full retry contract: after reloading the patched sidecar, the pending
+    # turn is persisted on top of the new workspace binding — nothing is lost.
+    reloaded = models.Session.load(sid)
+    assert reloaded is not None
+    reloaded.messages.append({"role": "assistant", "content": "new durable turn"})
+    reloaded.save(skip_index=True)
     payload = json.loads(sidecar.read_text(encoding="utf-8"))
     contents = [row.get("content") for row in payload.get("messages") or []]
     generation_after = payload["_sidecar_generation_v1"]
-    assert generation_after >= generation_before + 2
+    assert generation_after == generation_before + 2
     assert "new durable turn" in contents
     assert payload["workspace"] == str((tmp_path / "after").resolve())
 

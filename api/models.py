@@ -1662,13 +1662,13 @@ def _record_webui_deleted_session_tombstone(sid: str) -> None:
     if not sid:
         return
     with _webui_deleted_session_tombstone_authority():
-        current = set(_load_webui_deleted_session_tombstone())
+        current = set(_load_webui_deleted_session_tombstone(strict=True))
         if sid in current:
             _fsync_sidecar_directory(SESSION_DIR)
         else:
             current.add(sid)
             _save_webui_deleted_session_tombstone(current, required_sid=sid)
-        if sid not in _load_webui_deleted_session_tombstone():
+        if sid not in _load_webui_deleted_session_tombstone(strict=True):
             raise RuntimeError(
                 f"Deleted-session tombstone did not retain current SID {sid!r}"
             )
@@ -1679,7 +1679,7 @@ def _clear_webui_deleted_session_tombstone(sid: str) -> None:
     if not sid:
         return
     with _webui_deleted_session_tombstone_authority():
-        current = set(_load_webui_deleted_session_tombstone())
+        current = set(_load_webui_deleted_session_tombstone(strict=True))
         if sid not in current:
             return
         ordered = [
@@ -2797,6 +2797,16 @@ class Session:
             )
         next_sidecar_generation = current_revision.generation + 1
         output_epoch = self._sidecar_epoch_v1
+        if expected_record is None and current_revision.state == "ABSENT" and any(
+            str(known_sid) != str(self.session_id)
+            for known_sid in (self._sidecar_revisions or {})
+        ):
+            # This object still carries revision state for another session id
+            # (e.g. a renamed continuation): the epoch belongs to that other
+            # SID lineage and must not leak into the new sidecar, otherwise the
+            # ABA fence could confuse the two lineages.
+            output_epoch = uuid.uuid4().hex
+            self._sidecar_epoch_v1 = output_epoch
         _validated_sidecar_epoch(output_epoch)
         source_mode = (
             stat_module.S_IMODE(self.path.stat().st_mode)
