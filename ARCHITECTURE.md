@@ -354,11 +354,15 @@ cleanup, and fsyncs the session directory.
 
 Deleted-WebUI-session tombstone updates are serialized by a global cross-process
 authority in a lock-path namespace that no accepted session SID can alias. It is
-acquired only after any SID authority. Tombstone publication flushes the file
-and parent directory before sidecar deletion can start; a failure is returned to
-the delete caller with the sidecar intact. Primary, backup, or archive unlink
-failure also fails closed before State DB cleanup or success. A successful
-delete verifies those files are absent and fsyncs the session directory again.
+acquired only after any SID authority. Manual delete, hidden-background cleanup,
+and empty-session cleanup share one artifact-removal helper. Empty-session cleanup
+reads and validates the embedded SID, payload, and exact revision while holding
+the SID authority, then rechecks that revision immediately before deletion.
+Tombstone publication flushes the file and parent directory before sidecar
+deletion can start; a failure leaves that candidate uncounted. Primary, backup,
+or archive unlink failure also fails closed before State DB cleanup or cleanup
+success. A successful delete verifies those files are absent and fsyncs the
+session directory again.
 
 Sidecar, primary-backup, and incomparable-backup archive publications flush the
 file before atomic publication and fsync the parent directory on POSIX. Native
@@ -367,6 +371,17 @@ equivalent directory-fsync guarantee here; the final directory entry is therefor
 not guaranteed across sudden power loss on native Windows. POSIX ignores only
 filesystem-declared unsupported directory-fsync errors (`EINVAL`/`ENOTSUP`);
 permission and I/O failures propagate.
+
+Hidden ephemeral (`/btw`) sessions use the same deletion protocol on both
+cancelled and normally completed turns. Callers keep the canonical lock order
+(agent lock, then SID authority), validate the session ID, canonical sidecar
+path, embedded payload, and exact owned revision, and then invoke the shared
+artifact-removal helper. The durable tombstone is published before removing the
+primary, `.json.bak`, incomparable-backup archives, or session-owned replay-v10
+backup/manifest/temporary artifacts. Cleanup remains best-effort for the SSE
+response, but protocol failures are warning-logged and never fall back to a raw
+sidecar unlink; a successful normal cleanup clears transient in-memory stream
+fields so final recovery does not attempt to recreate the deleted sidecar.
 
 #### Imported `state.db` sidebar projection
 

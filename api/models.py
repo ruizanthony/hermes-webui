@@ -318,6 +318,17 @@ def _read_sidecar_revision(path: Path, sid: str | None = None) -> SidecarRevisio
     return _sidecar_revision_from_bytes(resolved_sid, raw)
 
 
+def _read_sidecar_snapshot(path: Path, sid: str) -> tuple[SidecarRevision, dict]:
+    """Read one validated payload and its exact durable revision."""
+    raw = path.read_bytes()
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Session sidecar for {sid!r} is not an object")
+    if payload.get("session_id") != sid:
+        raise ValueError(f"Session sidecar for {sid!r} has a foreign embedded SID")
+    return _sidecar_revision_from_bytes(sid, raw, parsed=payload), payload
+
+
 def _fsync_sidecar_directory(directory: Path) -> None:
     """Persist a sidecar directory entry where POSIX supports directory fsync.
 
@@ -360,28 +371,253 @@ def _publish_sidecar_no_replace(source: Path, destination: Path) -> None:
         _fsync_sidecar_directory(destination.parent)
 
 
-def _message_rows_cover(candidate, baseline) -> bool:
-    """Return whether baseline is an ordered exact-row subsequence of candidate."""
-    if not isinstance(candidate, list) or not isinstance(baseline, list):
+_BACKUP_SNAPSHOT_DOMINANCE_MAX_FIELDS = 512
+_BACKUP_SNAPSHOT_DOMINANCE_MAX_LIST_ROWS = 200_000
+_BACKUP_SNAPSHOT_DOMINANCE_MAX_CANONICAL_BYTES = 64 * 1024 * 1024
+_BACKUP_SNAPSHOT_DOMINANCE_MAX_DEPTH = 64
+_BACKUP_SNAPSHOT_DOMINANCE_MAX_ITEMS = 1_000_000
+
+
+class _SnapshotDominanceBudgetExceeded(ValueError):
+    """Canonical snapshot comparison exceeded its fail-closed work budget."""
+
+
+class _SnapshotDominanceBudget:
+    def __init__(self, max_canonical_bytes: int):
+        self.remaining_bytes = max_canonical_bytes
+        self.remaining_rows = _BACKUP_SNAPSHOT_DOMINANCE_MAX_LIST_ROWS
+        self.remaining_items = _BACKUP_SNAPSHOT_DOMINANCE_MAX_ITEMS
+        self._active_containers = set()
+
+    def consume_rows(self, count: int) -> None:
+        if count > self.remaining_rows:
+            raise _SnapshotDominanceBudgetExceeded
+        self.remaining_rows -= count
+
+    def _consume_items(self, count: int) -> None:
+        if count > self.remaining_items:
+            raise _SnapshotDominanceBudgetExceeded
+        self.remaining_items -= count
+
+    @staticmethod
+    def _add_size(total: int, amount: int, limit: int) -> int:
+        if amount > limit - total:
+            raise _SnapshotDominanceBudgetExceeded
+        return total + amount
+
+    def _measure_string(self, value: str, limit: int) -> int:
+        size = len(value) + 2  # one UTF-8 byte minimum per codepoint, plus quotes
+        if size > limit:
+            raise _SnapshotDominanceBudgetExceeded
+        if value.isascii():
+            for match in re.finditer(r'["\\\x00-\x1f]', value):
+                codepoint = ord(match.group())
+                size = self._add_size(
+                    size,
+                    1 if codepoint in {8, 9, 10, 12, 13, 34, 92} else 5,
+                    limit,
+                )
+            return size
+
+        size = 2
+        for char in value:
+            codepoint = ord(char)
+            if char in {'"', '\\'} or char in {'\b', '\f', '\n', '\r', '\t'}:
+                encoded_size = 2
+            elif codepoint < 0x20:
+                encoded_size = 6
+            elif codepoint < 0x80:
+                encoded_size = 1
+            elif codepoint < 0x800:
+                encoded_size = 2
+            elif 0xD800 <= codepoint <= 0xDFFF:
+                raise UnicodeError("surrogate is not valid UTF-8 JSON")
+            elif codepoint < 0x10000:
+                encoded_size = 3
+            else:
+                encoded_size = 4
+            size = self._add_size(size, encoded_size, limit)
+        return size
+
+    def _measure_json(self, value, *, depth: int, limit: int) -> int:
+        if depth > _BACKUP_SNAPSHOT_DOMINANCE_MAX_DEPTH:
+            raise _SnapshotDominanceBudgetExceeded
+
+        value_type = type(value)
+        if value_type is str:
+            return self._measure_string(value, limit)
+        if value is None:
+            if limit < 4:
+                raise _SnapshotDominanceBudgetExceeded
+            return 4
+        if value_type is bool:
+            size = 4 if value else 5
+            if size > limit:
+                raise _SnapshotDominanceBudgetExceeded
+            return size
+        if value_type is int:
+            bit_count = abs(value).bit_length()
+            digit_upper_bound = max(1, (bit_count * 30103 + 99_999) // 100_000)
+            size = digit_upper_bound + int(value < 0)
+            if size > limit:
+                raise _SnapshotDominanceBudgetExceeded
+            return size
+        if value_type is float:
+            # CPython's JSON float spellings are bounded by the longest finite
+            # repr (24 ASCII bytes); NaN and infinities are shorter.
+            if limit < 24:
+                raise _SnapshotDominanceBudgetExceeded
+            return 24
+        if value_type not in {list, dict}:
+            raise TypeError("snapshot value is not canonical JSON")
+
+        container_id = id(value)
+        if container_id in self._active_containers:
+            raise ValueError("circular snapshot value")
+        self._active_containers.add(container_id)
+        try:
+            self._consume_items(len(value))
+            size = 2  # [] or {}
+            if size > limit:
+                raise _SnapshotDominanceBudgetExceeded
+            if value_type is list:
+                for index, item in enumerate(value):
+                    if index:
+                        size = self._add_size(size, 1, limit)
+                    item_size = self._measure_json(
+                        item,
+                        depth=depth + 1,
+                        limit=limit - size,
+                    )
+                    size = self._add_size(size, item_size, limit)
+                return size
+
+            for index, (key, item) in enumerate(value.items()):
+                if type(key) is not str:
+                    raise TypeError("snapshot object key is not a string")
+                if index:
+                    size = self._add_size(size, 1, limit)
+                key_size = self._measure_string(key, limit - size)
+                size = self._add_size(size, key_size, limit)
+                size = self._add_size(size, 1, limit)  # colon
+                item_size = self._measure_json(
+                    item,
+                    depth=depth + 1,
+                    limit=limit - size,
+                )
+                size = self._add_size(size, item_size, limit)
+            return size
+        finally:
+            self._active_containers.remove(container_id)
+
+    def consume_json(self, value) -> str:
+        encoded_size = self._measure_json(
+            value,
+            depth=0,
+            limit=self.remaining_bytes,
+        )
+        self.remaining_bytes -= encoded_size
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+
+def _ordered_json_rows_cover(candidate, baseline, *, _budget=None) -> bool:
+    """Return whether baseline is an ordered canonical-row subsequence."""
+    if type(candidate) is not list or type(baseline) is not list:
         return False
     try:
-        candidate_rows = iter(
-            json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            for row in candidate
+        budget = _budget or _SnapshotDominanceBudget(
+            _BACKUP_SNAPSHOT_DOMINANCE_MAX_CANONICAL_BYTES
         )
-        baseline_rows = (
-            json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            for row in baseline
-        )
-    except (TypeError, ValueError):
-        return False
-    try:
+        budget.consume_rows(len(candidate) + len(baseline))
+        candidate_rows = iter(budget.consume_json(row) for row in candidate)
+        baseline_rows = (budget.consume_json(row) for row in baseline)
         return all(
             any(candidate_row == baseline_row for candidate_row in candidate_rows)
             for baseline_row in baseline_rows
         )
-    except (TypeError, ValueError):
+    except (
+        MemoryError,
+        OverflowError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
         return False
+
+
+_BACKUP_SNAPSHOT_BOOKKEEPING_FIELDS = frozenset({
+    "_sidecar_generation_v1",
+    "message_count",
+    "updated_at",
+})
+
+
+def _session_snapshot_covers(
+    candidate,
+    baseline,
+    *,
+    max_canonical_bytes=_BACKUP_SNAPSHOT_DOMINANCE_MAX_CANONICAL_BYTES,
+) -> bool:
+    """Return whether candidate covers the complete recoverable baseline.
+
+    Top-level lists use ordered canonical-row coverage; every other durable
+    field must remain canonically equal.  Storage generation, derived count,
+    and the superseded activity timestamp are bookkeeping rather than recovery
+    content.  Missing fields in legacy baselines are therefore compatible,
+    while an unknown baseline field can never be silently discarded.
+
+    Comparison work is capped.  Oversized, deeply nested, or non-canonical
+    payloads are incomparable and therefore take the archive/keep path.
+    """
+    if type(candidate) is not dict or type(baseline) is not dict:
+        return False
+    if (
+        type(max_canonical_bytes) is not int
+        or max_canonical_bytes <= 0
+        or len(candidate) > _BACKUP_SNAPSHOT_DOMINANCE_MAX_FIELDS
+        or len(baseline) > _BACKUP_SNAPSHOT_DOMINANCE_MAX_FIELDS
+    ):
+        return False
+    try:
+        if any(type(key) is not str for key in candidate) or any(
+            type(key) is not str for key in baseline
+        ):
+            return False
+        budget = _SnapshotDominanceBudget(max_canonical_bytes)
+        for key, baseline_value in baseline.items():
+            if key in _BACKUP_SNAPSHOT_BOOKKEEPING_FIELDS:
+                continue
+            if key not in candidate:
+                return False
+            candidate_value = candidate[key]
+            if isinstance(baseline_value, list):
+                if not _ordered_json_rows_cover(
+                    candidate_value,
+                    baseline_value,
+                    _budget=budget,
+                ):
+                    return False
+                continue
+            if budget.consume_json(candidate_value) != budget.consume_json(
+                baseline_value
+            ):
+                return False
+    except (
+        MemoryError,
+        OverflowError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        return False
+    return True
 
 
 def _archive_incomparable_backup(
@@ -535,6 +771,8 @@ def _session_sidecar_authority(
     session_dir: Path | None = None,
 ):
     """Serialize compliant sidecar writers for one SID across processes."""
+    if not is_safe_session_id(session_id):
+        raise ValueError(f"Unsafe session_id {session_id!r}")
     with _cross_process_sidecar_file_authority(
         session_id,
         session_dir=session_dir,
@@ -1210,12 +1448,32 @@ def _load_webui_deleted_session_tombstone() -> frozenset[str]:
     )
 
 
-def _save_webui_deleted_session_tombstone(ids) -> None:
+def _save_webui_deleted_session_tombstone(
+    ids,
+    *,
+    required_sid: str | None = None,
+) -> None:
     sorted_ids = sorted(set(
         str(sid).strip() for sid in (ids or []) if str(sid or "").strip()
     ))
+    required_sid = str(required_sid or "").strip()
+    if required_sid and required_sid not in sorted_ids:
+        raise ValueError("required deleted-session tombstone SID is missing")
     if len(sorted_ids) > WEBUI_DELETED_SESSION_TOMBSTONE_CAP:
-        sorted_ids = sorted_ids[-WEBUI_DELETED_SESSION_TOMBSTONE_CAP:]
+        if required_sid:
+            if WEBUI_DELETED_SESSION_TOMBSTONE_CAP < 1:
+                raise RuntimeError("deleted-session tombstone cannot retain required SID")
+            other_ids = [candidate for candidate in sorted_ids if candidate != required_sid]
+            retained_other_count = WEBUI_DELETED_SESSION_TOMBSTONE_CAP - 1
+            sorted_ids = (
+                other_ids[-retained_other_count:]
+                if retained_other_count
+                else []
+            )
+            sorted_ids.append(required_sid)
+            sorted_ids.sort()
+        else:
+            sorted_ids = sorted_ids[-WEBUI_DELETED_SESSION_TOMBSTONE_CAP:]
     payload = {
         "version": WEBUI_DELETED_SESSION_TOMBSTONE_VERSION,
         "ids": sorted_ids,
@@ -1251,9 +1509,13 @@ def _record_webui_deleted_session_tombstone(sid: str) -> None:
         current = set(_load_webui_deleted_session_tombstone())
         if sid in current:
             _fsync_sidecar_directory(SESSION_DIR)
-            return
-        current.add(sid)
-        _save_webui_deleted_session_tombstone(current)
+        else:
+            current.add(sid)
+            _save_webui_deleted_session_tombstone(current, required_sid=sid)
+        if sid not in _load_webui_deleted_session_tombstone():
+            raise RuntimeError(
+                f"Deleted-session tombstone did not retain current SID {sid!r}"
+            )
 
 
 def _clear_webui_deleted_session_tombstone(sid: str) -> None:
@@ -1272,6 +1534,93 @@ def _clear_webui_deleted_session_tombstone(sid: str) -> None:
             _webui_deleted_session_tombstone_file().unlink(missing_ok=True)
         except Exception:
             logger.debug("Failed to remove empty webui deleted-session tombstone", exc_info=True)
+
+
+class SessionDeleteTombstoneError(RuntimeError):
+    """A sidecar delete could not durably fence stale writers."""
+
+
+def _offline_replay_artifact_paths(sidecar: Path) -> list[Path]:
+    """Return replay-v10 recovery artifacts owned by one session sidecar."""
+    sidecar = Path(sidecar)
+    name = sidecar.name
+
+    def is_owned(candidate_name: str) -> bool:
+        return bool(
+            (
+                candidate_name.startswith(f"{name}.replay-v10.")
+                and candidate_name.endswith(".bak")
+            )
+            or (
+                candidate_name.startswith(f"_replay-v10.{name}.")
+                and candidate_name.endswith(".manifest.json")
+            )
+            or candidate_name.startswith(f".{name}.replay-v10.tmp.")
+            or candidate_name.startswith(f".{name}.replay-v10.restore.")
+            or (
+                candidate_name.startswith(f"._replay-v10.{name}.")
+                and ".manifest.json.tmp." in candidate_name
+            )
+        )
+
+    return [candidate for candidate in sidecar.parent.iterdir() if is_owned(candidate.name)]
+
+
+def _delete_session_sidecar_artifacts_locked(
+    sid: str,
+    *,
+    session_dir: Path | None = None,
+    expected_revision: SidecarRevision | None = None,
+    record_tombstone: bool = True,
+) -> bool:
+    """Delete one SID's sidecar artifacts while its authority is held.
+
+    Callers must hold ``_session_sidecar_authority(sid)``. When supplied, the
+    expected revision is rechecked immediately before the durable tombstone and
+    unlinks; a mismatch returns False without changing any state.
+    """
+    if not is_safe_session_id(sid):
+        raise ValueError(f"Unsafe session_id {sid!r}")
+    directory = Path(session_dir or SESSION_DIR)
+    sidecar = directory / f"{sid}.json"
+    if expected_revision is not None:
+        if not isinstance(expected_revision, SidecarRevision):
+            return False
+        if _read_sidecar_revision(sidecar, sid) != expected_revision:
+            return False
+    if record_tombstone:
+        try:
+            _record_webui_deleted_session_tombstone(sid)
+        except Exception as exc:
+            raise SessionDeleteTombstoneError(
+                f"Failed to durably tombstone deleted WebUI session {sid!r}"
+            ) from exc
+
+    _invalidate_cached_session_generation(sid)
+    backup = sidecar.with_suffix(".json.bak")
+    archived_backups = list(directory.glob(f"{sidecar.name}.bak.archive-*"))
+    replay_artifacts = _offline_replay_artifact_paths(sidecar)
+    failures = []
+    for artifact in (sidecar, backup, *archived_backups, *replay_artifacts):
+        try:
+            artifact.unlink(missing_ok=True)
+        except Exception as exc:
+            failures.append(exc)
+
+    remaining = [
+        artifact
+        for artifact in (sidecar, backup, *archived_backups, *replay_artifacts)
+        if artifact.exists()
+    ]
+    remaining.extend(directory.glob(f"{sidecar.name}.bak.archive-*"))
+    remaining.extend(_offline_replay_artifact_paths(sidecar))
+    _fsync_sidecar_directory(directory)
+    if failures or remaining:
+        cause = failures[0] if failures else None
+        raise RuntimeError(
+            f"Failed to delete required sidecar artifacts for {sid!r}"
+        ) from cause
+    return True
 
 
 def _content_has_reasoning_only_parts(content) -> bool:
@@ -2433,11 +2782,9 @@ class Session:
                             backup = json.loads(bak_path.read_text(encoding='utf-8'))
                             if not isinstance(backup, dict):
                                 raise ValueError("backup payload is not a session snapshot")
-                            backup_messages = backup.get('messages')
-                            existing_messages = existing.get('messages')
-                            if not isinstance(backup_messages, list):
+                            if not isinstance(backup.get('messages'), list):
                                 raise ValueError("backup payload is not a session snapshot")
-                            if not isinstance(existing_messages, list):
+                            if not isinstance(existing.get('messages'), list):
                                 raise ValueError("live payload is not a session snapshot")
                         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                             _archive_incomparable_backup(
@@ -2455,13 +2802,13 @@ class Session:
                                 )
                                 replace_backup = True
                             else:
-                                existing_covers_backup = _message_rows_cover(
-                                    existing_messages,
-                                    backup_messages,
+                                existing_covers_backup = _session_snapshot_covers(
+                                    existing,
+                                    backup,
                                 )
-                                backup_covers_existing = _message_rows_cover(
-                                    backup_messages,
-                                    existing_messages,
+                                backup_covers_existing = _session_snapshot_covers(
+                                    backup,
+                                    existing,
                                 )
                                 if backup_covers_existing:
                                     backup_receipt = current_backup_receipt
@@ -6506,14 +6853,11 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         if not is_linked_worktree(s.workspace):
             raise ValueError("worktree_info does not identify a linked Git worktree")
         default_authority().claim(s.workspace, s.session_id)
-    # #4985: defensive — auto-generated uuids don't collide with the
-    # tombstone, but if a future caller ever passes an explicit id that
-    # was previously pruned, clear the entry so the new session isn't
-    # shadowed on the next poll. Wrapped because a tombstone failure
-    # must never block new-session creation.
+    # #4985: clear the zero-message orphan tombstone defensively. The deleted-
+    # session tombstone is cleared only by a successful ``Session.save`` while
+    # the per-SID authority is held, so it cannot race a verified delete.
     try:
         _clear_webui_zero_message_orphan_tombstone(s.session_id)
-        _clear_webui_deleted_session_tombstone(s.session_id)
     except Exception:
         logger.debug(
             "Failed to clear webui tombstone for %s",
@@ -8331,13 +8675,11 @@ def import_cli_session(
         parent_session_id=parent_session_id,
     )
     # #4985: import_cli_session uses an explicit sid (the CLI sidecar's id).
-    # If that sid was previously tombstoned as a webui zero-message orphan,
-    # clear the tombstone entry so the freshly-imported session is visible
-    # on the next poll. Wrapped because a tombstone failure must never block
-    # an import.
+    # Clear only the zero-message orphan tombstone here. The deleted-session
+    # tombstone is cleared by ``Session.save`` after durable publication while
+    # the per-SID authority is held, so it cannot race a verified delete.
     try:
         _clear_webui_zero_message_orphan_tombstone(s.session_id)
-        _clear_webui_deleted_session_tombstone(s.session_id)
     except Exception:
         logger.debug(
             "Failed to clear webui tombstone for %s",

@@ -2,13 +2,19 @@ import builtins
 import errno
 import hashlib
 import json
+import logging
 import multiprocessing
 import os
+import queue
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
+import types
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -19,6 +25,26 @@ def _patch_store(monkeypatch, models, session_dir: Path) -> None:
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
     with models.LOCK:
         models.SESSIONS.clear()
+
+
+def _seed_sidecar_delete_artifacts(sidecar: Path) -> tuple[list[Path], Path]:
+    artifacts = [
+        sidecar,
+        sidecar.with_suffix(".json.bak"),
+        sidecar.with_name(f"{sidecar.name}.bak.archive-deadbeef"),
+        sidecar.with_name(f"{sidecar.name}.replay-v10.deadbeef.bak"),
+        sidecar.with_name(f"_replay-v10.{sidecar.name}.deadbeef.manifest.json"),
+        sidecar.with_name(f".{sidecar.name}.replay-v10.tmp.probe"),
+        sidecar.with_name(f".{sidecar.name}.replay-v10.restore.probe"),
+        sidecar.with_name(
+            f"._replay-v10.{sidecar.name}.deadbeef.manifest.json.tmp.probe"
+        ),
+    ]
+    for artifact in artifacts[1:]:
+        artifact.write_text("recoverable hidden transcript", encoding="utf-8")
+    unrelated = sidecar.with_name("unrelated.json.replay-v10.deadbeef.bak")
+    unrelated.write_text("must survive", encoding="utf-8")
+    return artifacts, unrelated
 
 
 def _process_writer(
@@ -39,6 +65,36 @@ def _process_writer(
         result_queue.put((marker, "stale"))
     else:
         result_queue.put((marker, "saved"))
+
+
+def _process_cleanup_race_writer(
+    session_dir,
+    sid,
+    marker,
+    start_event,
+    ready_event,
+    done_event,
+    result_queue,
+):
+    from api import models
+
+    models.SESSION_DIR = Path(session_dir)
+    models.SESSION_INDEX_FILE = Path(session_dir) / "_index.json"
+    session = models.Session.load(sid)
+    assert session is not None
+    session.messages.append({"role": "assistant", "content": marker})
+    ready_event.set()
+    start_event.wait(timeout=15)
+    try:
+        session.save(skip_index=True)
+    except models.StaleSessionGenerationError:
+        result_queue.put("stale")
+    except Exception as exc:
+        result_queue.put(f"{type(exc).__name__}:{exc}")
+    else:
+        result_queue.put("saved")
+    finally:
+        done_event.set()
 
 
 def _process_record_deleted_tombstone(
@@ -182,6 +238,136 @@ def test_existing_deleted_session_tombstone_retries_directory_fsync(
     assert fsynced == [session_dir]
 
 
+def test_sidecar_delete_fails_closed_when_current_tombstone_cannot_be_verified(
+    tmp_path,
+    monkeypatch,
+):
+    from api import models
+
+    session_dir = tmp_path / "sessions"
+    _patch_store(monkeypatch, models, session_dir)
+    sid = "unverifiable-current-tombstone"
+    session = models.Session(
+        session_id=sid,
+        messages=[{"role": "user", "content": "must remain durable"}],
+    )
+    session.save(skip_index=True)
+    artifacts, _unrelated = _seed_sidecar_delete_artifacts(session.path)
+    real_load = models._load_webui_deleted_session_tombstone
+    load_count = 0
+
+    def hide_current_sid_on_verification():
+        nonlocal load_count
+        load_count += 1
+        retained = real_load()
+        if load_count > 1:
+            return frozenset(candidate for candidate in retained if candidate != sid)
+        return retained
+
+    monkeypatch.setattr(
+        models,
+        "_load_webui_deleted_session_tombstone",
+        hide_current_sid_on_verification,
+    )
+
+    with models._session_sidecar_authority(sid):
+        with pytest.raises(models.SessionDeleteTombstoneError):
+            models._delete_session_sidecar_artifacts_locked(sid)
+
+    assert load_count == 2
+    assert all(artifact.exists() for artifact in artifacts)
+
+
+def test_import_clear_cannot_race_tombstone_verification_and_delete(
+    tmp_path,
+    monkeypatch,
+):
+    from api import models
+
+    session_dir = tmp_path / "sessions"
+    _patch_store(monkeypatch, models, session_dir)
+    sid = "import-delete-race"
+    seed = models.Session(
+        session_id=sid,
+        messages=[{"role": "user", "content": "before delete"}],
+    )
+    seed.save(skip_index=True)
+
+    recorded = threading.Event()
+    allow_delete = threading.Event()
+    import_ready_to_save = threading.Event()
+    allow_import_save = threading.Event()
+    errors: queue.Queue[BaseException] = queue.Queue()
+    delete_result: list[bool] = []
+    imported: list[models.Session] = []
+
+    real_record = models._record_webui_deleted_session_tombstone
+    real_save = models.Session.save
+
+    def record_then_pause(target_sid):
+        real_record(target_sid)
+        recorded.set()
+        assert allow_delete.wait(timeout=5)
+
+    def save_after_delete(self, *args, **kwargs):
+        import_ready_to_save.set()
+        assert allow_import_save.wait(timeout=5)
+        return real_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        models,
+        "_record_webui_deleted_session_tombstone",
+        record_then_pause,
+    )
+    monkeypatch.setattr(models.Session, "save", save_after_delete)
+
+    def delete_worker():
+        try:
+            with models._session_sidecar_authority(sid):
+                delete_result.append(
+                    models._delete_session_sidecar_artifacts_locked(sid)
+                )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.put(exc)
+
+    def import_worker():
+        try:
+            imported.append(
+                models.import_cli_session(
+                    sid,
+                    "Imported",
+                    [{"role": "user", "content": "after delete"}],
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.put(exc)
+
+    delete_thread = threading.Thread(target=delete_worker, name="delete-worker")
+    import_thread = threading.Thread(target=import_worker, name="import-worker")
+    delete_thread.start()
+    assert recorded.wait(timeout=5)
+    import_thread.start()
+    assert import_ready_to_save.wait(timeout=5)
+
+    allow_delete.set()
+    delete_thread.join(timeout=5)
+    try:
+        assert not delete_thread.is_alive()
+        assert errors.empty(), list(errors.queue)
+        assert delete_result == [True]
+        assert sid in models._load_webui_deleted_session_tombstone()
+        assert not (session_dir / f"{sid}.json").exists()
+    finally:
+        allow_import_save.set()
+        import_thread.join(timeout=5)
+
+    assert not import_thread.is_alive()
+    assert errors.empty(), list(errors.queue)
+    assert len(imported) == 1
+    assert (session_dir / f"{sid}.json").exists()
+    assert sid not in models._load_webui_deleted_session_tombstone()
+
+
 def test_hidden_background_cleanup_uses_agent_and_sidecar_authorities(
     tmp_path,
     monkeypatch,
@@ -256,6 +442,373 @@ def test_hidden_background_cleanup_uses_agent_and_sidecar_authorities(
         assert sid not in models.SESSIONS
     with pytest.raises(models.StaleSessionGenerationError):
         stale_alias.save(skip_index=True)
+
+
+def test_hidden_ephemeral_cancel_cleanup_uses_durable_sidecar_delete_protocol(
+    tmp_path,
+    monkeypatch,
+):
+    from api import models, streaming
+
+    session_dir = tmp_path / "sessions"
+    _patch_store(monkeypatch, models, session_dir)
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+    sid = "hidden-ephemeral-cancel"
+    session = models.Session(
+        session_id=sid,
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "private side question"}],
+    )
+    session.active_stream_id = "ephemeral-stream"
+    session.pending_user_message = "private side question"
+    session.pending_attachments = ["secret.txt"]
+    session.pending_started_at = time.time()
+    session.pending_user_source = "webui"
+    session.save(skip_index=True)
+    with models.LOCK:
+        models.SESSIONS[sid] = session
+    artifacts, unrelated = _seed_sidecar_delete_artifacts(session.path)
+
+    with streaming._get_session_agent_lock(sid):
+        streaming._finalize_cancelled_turn(session, ephemeral=True)
+
+    assert session.active_stream_id is None
+    assert session.pending_user_message is None
+    assert session.pending_attachments == []
+    assert session.pending_started_at is None
+    assert session.pending_user_source is None
+    assert all(not artifact.exists() for artifact in artifacts)
+    assert unrelated.read_text(encoding="utf-8") == "must survive"
+    assert sid in models._load_webui_deleted_session_tombstone()
+    with models.LOCK:
+        assert sid not in models.SESSIONS
+    with pytest.raises(models.StaleSessionGenerationError):
+        session.save(skip_index=True)
+
+
+def test_hidden_ephemeral_cleanup_logs_tombstone_failure_without_unlinking(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    from api import models, streaming
+
+    session_dir = tmp_path / "sessions"
+    _patch_store(monkeypatch, models, session_dir)
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+    sid = "hidden-ephemeral-tombstone-failure"
+    session = models.Session(session_id=sid, workspace=str(tmp_path))
+    session.active_stream_id = "ephemeral-stream"
+    session.save(skip_index=True)
+    with models.LOCK:
+        models.SESSIONS[sid] = session
+    artifacts, _unrelated = _seed_sidecar_delete_artifacts(session.path)
+
+    def reject_tombstone(_sid):
+        raise OSError("synthetic tombstone persistence failure")
+
+    monkeypatch.setattr(
+        models,
+        "_record_webui_deleted_session_tombstone",
+        reject_tombstone,
+    )
+    with caplog.at_level(logging.WARNING, logger="api.streaming"):
+        with streaming._get_session_agent_lock(sid):
+            streaming._finalize_cancelled_turn(session, ephemeral=True)
+
+    assert all(artifact.exists() for artifact in artifacts)
+    assert sid not in models._load_webui_deleted_session_tombstone()
+    with models.LOCK:
+        assert models.SESSIONS.get(sid) is session
+    assert f"cancelled ephemeral session {sid}" in caplog.text
+    assert "synthetic tombstone persistence failure" in caplog.text
+
+
+def test_hidden_ephemeral_cleanup_rejects_noncanonical_session_path(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    from api import models, streaming
+
+    session_dir = tmp_path / "sessions"
+    _patch_store(monkeypatch, models, session_dir)
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+    sid = "hidden-ephemeral-path-check"
+    session = models.Session(session_id=sid, workspace=str(tmp_path))
+    session.save(skip_index=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("do not unlink", encoding="utf-8")
+    noncanonical = types.SimpleNamespace(
+        session_id=sid,
+        path=outside,
+        _sidecar_revisions=session._sidecar_revisions,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="api.streaming"):
+        with streaming._get_session_agent_lock(sid):
+            deleted = streaming._cleanup_ephemeral_session_sidecar_locked(
+                noncanonical,
+                outcome="cancelled",
+            )
+
+    assert deleted is False
+    assert session.path.exists()
+    assert outside.read_text(encoding="utf-8") == "do not unlink"
+    assert sid not in models._load_webui_deleted_session_tombstone()
+    assert "does not match SID" in caplog.text
+
+
+def test_hidden_ephemeral_normal_completion_uses_durable_sidecar_delete_protocol(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    from api import config, models, streaming
+
+    session_dir = tmp_path / "sessions"
+    _patch_store(monkeypatch, models, session_dir)
+    monkeypatch.setattr(config, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+    sid = "hidden-ephemeral-complete"
+    stream_id = "hidden-ephemeral-stream"
+    session = models.Session(
+        session_id=sid,
+        workspace=str(tmp_path),
+        title="btw: private side question",
+    )
+    session.active_stream_id = stream_id
+    session.pending_user_message = "private side question"
+    session.pending_started_at = time.time()
+    session.pending_user_source = "webui"
+    session.save(skip_index=True)
+    with models.LOCK:
+        models.SESSIONS[sid] = session
+    artifacts, unrelated = _seed_sidecar_delete_artifacts(session.path)
+    event_queue = queue.Queue()
+    streaming.STREAMS[stream_id] = event_queue
+
+    class SuccessfulEphemeralAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id")
+            self.context_compressor = None
+            self.session_prompt_tokens = 3
+            self.session_completion_tokens = 2
+            self.session_estimated_cost_usd = 0.001
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.ephemeral_system_prompt = None
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "messages": history
+                + [
+                    {"role": "user", "content": kwargs["persist_user_message"]},
+                    {"role": "assistant", "content": "private answer"},
+                ]
+            }
+
+        def interrupt(self, _message):
+            pass
+
+    fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+    fake_runtime_module.resolve_runtime_provider = mock.Mock(
+        return_value={
+            "provider": "openai",
+            "api_key": "synthetic-key",
+            "base_url": None,
+        }
+    )
+    fake_hermes_cli = types.ModuleType("hermes_cli")
+    fake_hermes_cli.runtime_provider = fake_runtime_module
+    fake_hermes_state = types.ModuleType("hermes_state")
+    fake_hermes_state.SessionDB = mock.Mock(return_value=None)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        fake_runtime_module,
+    )
+    monkeypatch.setitem(sys.modules, "hermes_state", fake_hermes_state)
+    monkeypatch.setattr(streaming, "get_session", lambda _sid: session)
+    monkeypatch.setattr(
+        streaming,
+        "_get_ai_agent",
+        lambda: SuccessfulEphemeralAgent,
+    )
+    monkeypatch.setattr(
+        streaming,
+        "resolve_model_provider",
+        lambda *_args, **_kwargs: ("test-model", "openai", None),
+    )
+    monkeypatch.setattr(config, "get_config", lambda: {})
+    monkeypatch.setattr(config, "_resolve_cli_toolsets", lambda _cfg: [])
+
+    with caplog.at_level(logging.ERROR, logger="api.streaming"):
+        streaming._run_agent_streaming(
+            session_id=sid,
+            msg_text="private side question",
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id=stream_id,
+            ephemeral=True,
+        )
+
+    assert any(
+        event == "done" and payload.get("answer") == "private answer"
+        for event, payload in list(event_queue.queue)
+    )
+    assert all(not artifact.exists() for artifact in artifacts)
+    assert unrelated.read_text(encoding="utf-8") == "must survive"
+    assert sid in models._load_webui_deleted_session_tombstone()
+    assert "_last_resort_sync_from_core failed" not in caplog.text
+    with models.LOCK:
+        assert sid not in models.SESSIONS
+
+
+@pytest.mark.parametrize(
+    ("zero_only", "title"),
+    [(False, "Untitled"), (True, "Named empty session")],
+)
+def test_empty_session_cleanup_fences_writer_between_check_and_delete(
+    tmp_path,
+    monkeypatch,
+    zero_only,
+    title,
+):
+    from api import models, routes
+
+    session_dir = tmp_path / "sessions"
+    _patch_store(monkeypatch, models, session_dir)
+    monkeypatch.setattr(routes, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(routes, "SESSIONS", models.SESSIONS)
+    monkeypatch.setattr(routes, "LOCK", models.LOCK)
+    sid = f"cleanup-race-{'zero' if zero_only else 'normal'}"
+    marker = "UNIQUE DURABLE TURN"
+    models.Session(
+        session_id=sid,
+        title=title,
+        workspace=str(tmp_path),
+        messages=[],
+    ).save(skip_index=True)
+    sidecar = session_dir / f"{sid}.json"
+    backup = sidecar.with_suffix(".json.bak")
+    archive = backup.with_name(f"{backup.name}.archive-review-probe")
+    backup.write_text("offline backup", encoding="utf-8")
+    archive.write_text("offline archive", encoding="utf-8")
+
+    context = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
+    start_event = context.Event()
+    ready_event = context.Event()
+    done_event = context.Event()
+    result_queue = context.Queue()
+    writer = context.Process(
+        target=_process_cleanup_race_writer,
+        args=(
+            session_dir,
+            sid,
+            marker,
+            start_event,
+            ready_event,
+            done_event,
+            result_queue,
+        ),
+    )
+    writer.start()
+    assert ready_event.wait(timeout=15)
+
+    original_load = models.Session.load.__func__
+
+    def load_then_commit_writer(cls, candidate_sid):
+        loaded = original_load(cls, candidate_sid)
+        if candidate_sid == sid:
+            start_event.set()
+            assert done_event.wait(timeout=15), "writer blocked after cleanup check"
+        return loaded
+
+    monkeypatch.setattr(models.Session, "load", classmethod(load_then_commit_writer))
+    monkeypatch.setattr(routes, "j", lambda _handler, payload: payload)
+    try:
+        result = routes._handle_sessions_cleanup(
+            object(),
+            {},
+            zero_only=zero_only,
+        )
+        # The fixed cleanup reads directly while holding SID authority, so the
+        # legacy Session.load interposition is not reached. Release the writer
+        # after deletion to prove its stale generation remains fenced.
+        start_event.set()
+        writer.join(timeout=20)
+        assert not writer.is_alive()
+        assert writer.exitcode == 0
+        writer_result = result_queue.get(timeout=5)
+    finally:
+        if writer.is_alive():
+            writer.terminate()
+        writer.join(timeout=5)
+
+    assert result == {"ok": True, "cleaned": 1}
+    assert writer_result == "stale"
+    assert not sidecar.exists()
+    assert not backup.exists()
+    assert not archive.exists()
+    assert sid in models._load_webui_deleted_session_tombstone()
+
+
+def test_empty_session_cleanup_does_not_count_partial_delete_as_index_ghost(
+    tmp_path,
+    monkeypatch,
+):
+    from api import models, routes
+
+    session_dir = tmp_path / "sessions"
+    _patch_store(monkeypatch, models, session_dir)
+    index_path = session_dir / "_index.json"
+    monkeypatch.setattr(routes, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(routes, "SESSION_INDEX_FILE", index_path)
+    monkeypatch.setattr(routes, "SESSIONS", models.SESSIONS)
+    monkeypatch.setattr(routes, "LOCK", models.LOCK)
+    failed_sid = "cleanup-partial-delete"
+    healthy_sid = "cleanup-best-effort-peer"
+    for sid in (failed_sid, healthy_sid):
+        models.Session(
+            session_id=sid,
+            title="Untitled",
+            workspace=str(tmp_path),
+            messages=[],
+        ).save(skip_index=True)
+    failed_backup = session_dir / f"{failed_sid}.json.bak"
+    failed_backup.write_text("required offline backup", encoding="utf-8")
+    index_path.write_text(
+        json.dumps(
+            [
+                {"session_id": failed_sid, "title": "Untitled", "message_count": 0},
+                {"session_id": healthy_sid, "title": "Untitled", "message_count": 0},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    real_unlink = Path.unlink
+
+    def fail_required_backup_unlink(path, *args, **kwargs):
+        if path == failed_backup:
+            raise PermissionError("required cleanup backup is locked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_required_backup_unlink)
+    monkeypatch.setattr(routes, "j", lambda _handler, payload: payload)
+
+    result = routes._handle_sessions_cleanup(object(), {})
+
+    assert result == {"ok": True, "cleaned": 1}
+    assert not (session_dir / f"{failed_sid}.json").exists()
+    assert failed_backup.exists()
+    assert not (session_dir / f"{healthy_sid}.json").exists()
+    assert json.loads(index_path.read_text(encoding="utf-8")) == []
+    assert failed_sid in models._load_webui_deleted_session_tombstone()
 
 
 def test_stale_loaded_instance_cannot_overwrite_newer_sidecar(
@@ -992,14 +1545,244 @@ def test_incomparable_backup_is_archived_before_latest_snapshot_promotion(
     assert [row["content"] for row in archived["messages"]] == ["A", "UNIQUE-U"]
 
 
+def test_backup_dominance_preserves_complete_legacy_snapshot_payload(
+    tmp_path, monkeypatch
+):
+    from api import models
+
+    session_dir = tmp_path / "sessions"
+    _patch_store(monkeypatch, models, session_dir)
+    sid = "backup-complete-snapshot"
+    first = {"role": "user", "content": "first"}
+    second = {"role": "assistant", "content": "second"}
+    third = {"role": "user", "content": "third"}
+    unique_tool_call = {"id": "unique-old-tool-call", "name": "must-survive"}
+    unique_context = {"role": "system", "content": "unique old model context"}
+    unique_draft = {"text": "unique old draft", "attachments": ["draft.txt"]}
+    unique_future_metadata = {"opaque": ["future", "must-survive"]}
+    session = models.Session(
+        session_id=sid,
+        workspace=str(tmp_path),
+        messages=[first, second],
+        context_messages=[first, unique_context],
+        tool_calls=[unique_tool_call],
+        composer_draft=unique_draft,
+    )
+    session.save(touch_updated_at=False, skip_index=True)
+
+    session.messages = [first]
+    session.context_messages = [first]
+    session.tool_calls = []
+    session.composer_draft = {}
+    session.save(touch_updated_at=False, skip_index=True)
+    backup_path = session.path.with_suffix(".json.bak")
+
+    # Legacy backups predate the generation/count/fingerprint metadata. Their
+    # remaining durable payload must participate in exactly the same dominance
+    # decision as a current sidecar.
+    legacy_backup = json.loads(backup_path.read_text(encoding="utf-8"))
+    for derived_key in (
+        "_sidecar_generation_v1",
+        "message_count",
+        "anchor_scene_index",
+    ):
+        legacy_backup.pop(derived_key, None)
+    legacy_backup["future_recovery_metadata"] = unique_future_metadata
+    backup_path.write_text(
+        json.dumps(legacy_backup, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # Message-only dominance considers this live snapshot richer, although it
+    # lacks all three uniquely recoverable non-transcript artifacts.
+    session.messages = [first, second, third]
+    session.context_messages = [first, third]
+    session.save(touch_updated_at=False, skip_index=True)
+    session.messages = [first]
+    session.context_messages = [first]
+    session.save(touch_updated_at=False, skip_index=True)
+
+    recoverable_payloads = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in [backup_path, *session_dir.glob(f"{backup_path.name}.archive-*")]
+    ]
+    assert any(
+        unique_tool_call in (payload.get("tool_calls") or [])
+        and unique_context in (payload.get("context_messages") or [])
+        and payload.get("composer_draft") == unique_draft
+        and payload.get("future_recovery_metadata") == unique_future_metadata
+        for payload in recoverable_payloads
+    )
+
+
 def test_backup_dominance_preserves_message_order():
-    from api.models import _message_rows_cover
+    from api.models import _ordered_json_rows_cover
 
     first = {"role": "user", "content": "first"}
     second = {"role": "assistant", "content": "second"}
 
-    assert _message_rows_cover([first, second], [first]) is True
-    assert _message_rows_cover([second, first], [first, second]) is False
+    assert _ordered_json_rows_cover([first, second], [first]) is True
+    assert _ordered_json_rows_cover([second, first], [first, second]) is False
+
+
+def test_backup_snapshot_dominance_budget_exhaustion_fails_closed(monkeypatch):
+    from api import models
+
+    baseline = {
+        "session_id": "bounded-backup",
+        "messages": [{"role": "user", "content": "x" * 128}],
+        "future_metadata": {"opaque": "y" * 128},
+    }
+    candidate = {
+        **baseline,
+        "messages": [
+            *baseline["messages"],
+            {"role": "assistant", "content": "new"},
+        ],
+    }
+
+    assert models._session_snapshot_covers(
+        candidate,
+        baseline,
+        max_canonical_bytes=64,
+    ) is False
+
+    boundary = {"future_metadata": "x" * 7}
+    assert models._session_snapshot_covers(
+        boundary,
+        boundary,
+        max_canonical_bytes=18,
+    ) is True
+
+    real_dumps = models.json.dumps
+    dumps_calls = []
+
+    def counted_dumps(value, *args, **kwargs):
+        dumps_calls.append(value)
+        return real_dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(models.json, "dumps", counted_dumps)
+    assert models._session_snapshot_covers(
+        boundary,
+        boundary,
+        max_canonical_bytes=17,
+    ) is False
+    assert len(dumps_calls) == 1
+
+    oversized = "z" * (4 * 1024 * 1024)
+    deeply_nested = None
+    # Top-level list-valued fields compare their rows independently, so one
+    # layer is consumed by the ordered-subsequence traversal before preflight.
+    for _ in range(66):
+        deeply_nested = [deeply_nested]
+    cyclic = []
+    cyclic.append(cyclic)
+    too_many_items = {"one": 1, "two": 2, "three": 3}
+    lone_surrogate = "\ud800"
+
+    def reject_unproven_serialization(value, *args, **kwargs):
+        if (
+            value is oversized
+            or value is deeply_nested
+            or value is cyclic
+            or value is too_many_items
+            or value is lone_surrogate
+            or value == b"opaque"
+        ):
+            pytest.fail("out-of-budget or non-canonical value reached json.dumps")
+        return real_dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(models.json, "dumps", reject_unproven_serialization)
+    assert models._session_snapshot_covers(
+        {"future_metadata": oversized},
+        {"future_metadata": oversized},
+        max_canonical_bytes=1024 * 1024,
+    ) is False
+    assert models._session_snapshot_covers(
+        {"future_metadata": deeply_nested},
+        {"future_metadata": deeply_nested},
+    ) is False
+    assert models._session_snapshot_covers(
+        {"future_metadata": b"opaque"},
+        {"future_metadata": b"opaque"},
+    ) is False
+    assert models._session_snapshot_covers(
+        {"future_metadata": {"cycle": cyclic}},
+        {"future_metadata": {"cycle": cyclic}},
+    ) is False
+    assert models._session_snapshot_covers(
+        {"future_metadata": lone_surrogate},
+        {"future_metadata": lone_surrogate},
+    ) is False
+
+    monkeypatch.setattr(models, "_BACKUP_SNAPSHOT_DOMINANCE_MAX_ITEMS", 2)
+    assert models._session_snapshot_covers(
+        {"future_metadata": too_many_items},
+        {"future_metadata": too_many_items},
+    ) is False
+
+    def memory_error(*_args, **_kwargs):
+        raise MemoryError
+
+    monkeypatch.setattr(models.json, "dumps", memory_error)
+    assert models._session_snapshot_covers(
+        {"future_metadata": "small"},
+        {"future_metadata": "small"},
+    ) is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux RSS and RLIMIT_AS")
+def test_backup_snapshot_dominance_oversize_preflight_bounds_memory():
+    repo_root = Path(__file__).resolve().parents[1]
+    probe = r'''import json
+import resource
+
+from api.models import _session_snapshot_covers
+
+payload = "x" * (80 * 1024 * 1024)
+snapshot = {"future_unknown_metadata": payload}
+rss_before_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+with open("/proc/self/status", encoding="utf-8") as status_file:
+    vm_size_kib = next(
+        int(line.split()[1])
+        for line in status_file
+        if line.startswith("VmSize:")
+    )
+headroom = 96 * 1024 * 1024
+_, hard_limit = resource.getrlimit(resource.RLIMIT_AS)
+soft_limit = vm_size_kib * 1024 + headroom
+if hard_limit != resource.RLIM_INFINITY:
+    soft_limit = min(soft_limit, hard_limit)
+resource.setrlimit(
+    resource.RLIMIT_AS,
+    (soft_limit, hard_limit),
+)
+try:
+    result = _session_snapshot_covers(snapshot, snapshot)
+except BaseException as exc:
+    outcome = type(exc).__name__
+else:
+    outcome = repr(result)
+rss_after_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+print(json.dumps({
+    "outcome": outcome,
+    "rss_peak_delta_mib": (rss_after_kib - rss_before_kib) / 1024,
+}))
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=repo_root,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout)
+    assert report["outcome"] == "False"
+    assert report["rss_peak_delta_mib"] < 16
 
 
 def test_backup_retirement_requires_live_revision_to_still_match(
