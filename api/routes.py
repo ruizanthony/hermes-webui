@@ -23897,9 +23897,6 @@ def _handle_chat_start(handler, body, diag=None):
                 status=409,
             )
 
-        recovery = compression_recovery_payload_for_session(s)
-        if recovery and not attachments and is_generic_continuation_intent(msg):
-            return _compression_recovery_required_response(recovery)
         diag.stage("resolve_workspace") if diag else None
         try:
             if regeneration is not None:

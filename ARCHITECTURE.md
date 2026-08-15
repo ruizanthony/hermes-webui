@@ -254,6 +254,21 @@ owned by one completed agent attempt. A credential retry clears any pair from
 the failed attempt, then accepts either a complete pair from the new result or
 a complete pair from the new agent. Fields from separate attempts or sources
 must never be combined into deletion authority.
+#### Session sidecar publication authority
+
+Every compliant writer of `SESSION_DIR/<sid>.json` participates in the same
+per-SID thread and cross-process authority. This includes normal `Session.save()`
+writes, backup recovery, and discoverability repairs. Existing sidecars are
+fenced by their generation plus exact digest; first publication is create-or-fail,
+so a stale alias or repair cannot overwrite a sidecar that appeared concurrently.
+Out-of-band replacements increment `_sidecar_generation_v1` and invalidate cached
+aliases before later saves can proceed.
+
+Sidecar, primary-backup, and incomparable-backup archive publications flush the
+file before atomic publication and fsync the parent directory on POSIX. Native
+Windows keeps atomic publication and file flushing, but Python does not expose an
+equivalent directory-fsync guarantee here; the final directory entry is therefore
+not guaranteed across sudden power loss on native Windows.
 
 #### Imported `state.db` sidebar projection
 
