@@ -108,10 +108,11 @@ def _process_record_deleted_tombstone(
     models.SESSION_DIR = Path(session_dir)
     models.SESSION_INDEX_FILE = Path(session_dir) / "_index.json"
     real_load = models._load_webui_deleted_session_tombstone
+    _session_dir_outer = session_dir
 
-    def load_then_wait_for_peer():
-        current = real_load()
-        marker_dir = Path(session_dir) / "tombstone-read-markers"
+    def load_then_wait_for_peer(*, session_dir=None, strict=False):
+        current = real_load(session_dir=session_dir, strict=strict)
+        marker_dir = Path(_session_dir_outer) / "tombstone-read-markers"
         marker_dir.mkdir(parents=True, exist_ok=True)
         (marker_dir / sid).write_text("read", encoding="utf-8")
         deadline = time.monotonic() + 3
@@ -256,10 +257,10 @@ def test_sidecar_delete_fails_closed_when_current_tombstone_cannot_be_verified(
     real_load = models._load_webui_deleted_session_tombstone
     load_count = 0
 
-    def hide_current_sid_on_verification():
+    def hide_current_sid_on_verification(*, session_dir=None, strict=False):
         nonlocal load_count
         load_count += 1
-        retained = real_load()
+        retained = real_load(session_dir=session_dir, strict=strict)
         if load_count > 1:
             return frozenset(candidate for candidate in retained if candidate != sid)
         return retained
