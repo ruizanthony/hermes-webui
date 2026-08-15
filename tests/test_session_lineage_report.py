@@ -34,6 +34,9 @@ def _ensure_state_db(path):
             content TEXT,
             timestamp REAL
         );
+        CREATE INDEX idx_messages_session ON messages(session_id, timestamp);
+        CREATE INDEX idx_messages_session_role
+            ON messages(session_id, role COLLATE NOCASE);
         """
     )
     return conn

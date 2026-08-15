@@ -99,6 +99,10 @@ def _ensure_state_db(profile=None):
             content TEXT,
             timestamp REAL NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS idx_messages_session
+            ON messages(session_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_messages_session_role
+            ON messages(session_id, role COLLATE NOCASE);
     """)
     for column, ddl in (
         ('user_id', 'ALTER TABLE sessions ADD COLUMN user_id TEXT'),
@@ -168,7 +172,7 @@ def _insert_agent_session_row(
     conn,
     session_id,
     source='weixin',
-    title='Agent Session',
+    title: str | None = 'Agent Session',
     model='openai/gpt-5',
     started_at=None,
     parent_session_id=None,
@@ -299,13 +303,15 @@ def test_active_cli_state_db_session_with_persisted_user_turn_is_visible_in_cli_
     active_sid = 'cli_active_visible_001'
     older_sid = 'cli_older_visible_001'
     ended_sid = 'cli_ended_hidden_001'
-    now = time.time()
+    # Keep every synthetic timestamp in the recent past. Future-dated rows are
+    # intentionally quarantined by the sidebar projection.
+    now = time.time() - 30
     try:
         conn.execute(
             "INSERT OR REPLACE INTO sessions "
             "(id, source, title, model, started_at, message_count, ended_at, end_reason) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (active_sid, 'cli', 'Untitled', 'openai/gpt-5', now + 20, 0, None, None),
+            (active_sid, 'cli', 'Untitled', 'openai/gpt-5', now + 20, 1, None, None),
         )
         conn.execute("DELETE FROM messages WHERE session_id = ?", (active_sid,))
         _insert_message(conn, active_sid, 'user', 'Active CLI session still running', now + 21)
@@ -323,7 +329,7 @@ def test_active_cli_state_db_session_with_persisted_user_turn_is_visible_in_cli_
             "INSERT OR REPLACE INTO sessions "
             "(id, source, title, model, started_at, message_count, ended_at, end_reason) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (ended_sid, 'cli', 'Untitled', 'openai/gpt-5', now + 10, 1, now + 11, 'cli-close'),
+            (ended_sid, 'cli', 'Cli Session', 'openai/gpt-5', now + 10, 1, now + 11, 'cli-close'),
         )
         conn.execute("DELETE FROM messages WHERE session_id = ?", (ended_sid,))
         _insert_message(conn, ended_sid, 'user', 'Ended CLI session', now + 11)
@@ -401,7 +407,7 @@ def test_gateway_watcher_hides_sessions_without_messages(monkeypatch):
             session_id=live_sid,
             source='telegram',
             title='Live Telegram Session',
-            message_count=0,
+            message_count=2,
         )
 
         import api.gateway_watcher as gateway_watcher
@@ -724,7 +730,9 @@ def test_default_title_cli_compression_chain_is_kept_by_lineage():
     """Default-titled CLI compression chains are meaningful even with a short tip."""
     conn = _ensure_state_db()
     ids_to_remove = ('cli_default_compress_root_001', 'cli_default_compress_tip_001')
-    t0 = time.time() - 430
+    # Keep the completed parent newer than the Agent test-runtime retention
+    # sweep so this assertion cannot race with legitimate history compaction.
+    t0 = time.time() - 10
     try:
         _insert_agent_session_row(
             conn,
@@ -732,7 +740,7 @@ def test_default_title_cli_compression_chain_is_kept_by_lineage():
             source='cli',
             title='Cli Session',
             started_at=t0,
-            ended_at=t0 + 100,
+            ended_at=t0 + 5,
             end_reason='compression',
             messages=1,
         )
@@ -740,8 +748,10 @@ def test_default_title_cli_compression_chain_is_kept_by_lineage():
             conn,
             'cli_default_compress_tip_001',
             source='cli',
-            title='Cli Session',
-            started_at=t0 + 101,
+            # Real compression successors are allowed to inherit the root
+            # title; duplicating it would violate idx_sessions_title_unique.
+            title=None,
+            started_at=t0 + 6,
             parent_session_id='cli_default_compress_root_001',
             messages=1,
         )
@@ -2260,6 +2270,7 @@ def test_session_prefers_state_db_messages_over_stale_local_snapshot(cleanup_tes
 def test_messaging_session_message_count_matches_deduped_display_messages(cleanup_test_sessions):
     """Thread sessions must not advertise raw DB rows that display merge dedupes away."""
     from api.models import Session
+    from tests.conftest import TEST_WORKSPACE
 
     conn = _ensure_state_db()
     sid = 'gw_display_count_regression_001'
@@ -2298,7 +2309,7 @@ def test_messaging_session_message_count_matches_deduped_display_messages(cleanu
         s = Session(
             session_id=sid,
             title='Legacy Discord Snapshot',
-            workspace='/tmp/hermes-webui-test',
+            workspace=str(TEST_WORKSPACE),
             model='openai/gpt-5',
             messages=[{"role": "user", "content": "Thread question", "timestamp": base_ts + 1}],
             session_source='messaging',
@@ -2319,9 +2330,12 @@ def test_messaging_session_message_count_matches_deduped_display_messages(cleanu
     finally:
         try:
             _remove_test_sessions(conn, sid)
+            _deleted, delete_status = post('/api/session/delete', {'session_id': sid})
             conn.close()
         except Exception:
             pass
+        else:
+            assert delete_status == 200, _deleted
         try:
             post('/api/settings', {'show_cli_sessions': False})
         except Exception:
@@ -2376,9 +2390,12 @@ def test_sessions_prefers_state_db_metadata_for_messaging_overlap(cleanup_test_s
         try:
             post('/api/settings', {'show_cli_sessions': False})
             _remove_test_sessions(conn, sid)
+            _deleted, delete_status = post('/api/session/delete', {'session_id': sid})
             conn.close()
         except Exception:
             pass
+        else:
+            assert delete_status == 200, _deleted
 
 
 def test_archiving_messaging_session_keeps_state_db_history(cleanup_test_sessions):

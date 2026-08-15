@@ -57,6 +57,10 @@ def _make_state_db(path, *, sessions=80, messages_per_session=3, create_messages
             )
     if create_messages_index:
         conn.execute("CREATE INDEX idx_messages_session ON messages(session_id, timestamp)")
+        conn.execute(
+            "CREATE INDEX idx_messages_session_role "
+            "ON messages(session_id, role COLLATE NOCASE)"
+        )
     conn.commit()
     conn.close()
 
@@ -207,19 +211,18 @@ def test_importable_agent_rows_push_sidebar_limit_into_sql(tmp_path):
     src = (REPO_ROOT / "api" / "agent_sessions.py").read_text()
     assert "WITH candidates AS" in src
     assert "JOIN candidates c ON c.id = s.id" in src
-    assert "latest_messages AS" in src
-    assert "LEFT JOIN latest_messages lm ON lm.session_id = s.id" in src
-    assert 'included == ("cron",)' in src
-    assert "not messages_index_present" in src
-    assert "PRAGMA index_list(messages)" in src
-    assert "CREATE INDEX IF NOT EXISTS idx_messages_session" in src
-    assert "_CRON_PREAGGREGATE_CANDIDATE_ORDER_MIN_MESSAGES" not in src
-    assert "MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id" in src
+    assert "def _index_matches(" in src
+    assert "PRAGMA index_xinfo({index_name})" in src
+    assert "CREATE INDEX IF NOT EXISTS idx_messages_session" not in src
+    assert "use_indexed_timestamp_projection" in src
+    assert "use_indexed_role_projection" in src
+    assert "COUNT(*) FROM messages mc INDEXED BY idx_messages_session" in src
+    assert 'actual_count_expr = "s.message_count"' in src
     assert "candidate_limit = max(result_limit * 8, result_limit)" in src
 
 
 def test_importable_agent_rows_candidate_ordering_stays_under_progress_budget(tmp_path, monkeypatch):
-    """Cron-only missing-index scans should fail under the old shape budget, then pass after pre-aggregation."""
+    """Missing-index scans stay bounded by denormalized session metadata."""
     db = tmp_path / "state.db"
     _make_state_db(
         db,

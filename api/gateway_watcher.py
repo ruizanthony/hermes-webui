@@ -9,6 +9,7 @@ This enables real-time session list updates in the sidebar without
 requiring any changes to hermes-agent.
 """
 import hashlib
+import json
 import logging
 import os
 import queue
@@ -27,12 +28,18 @@ logger = logging.getLogger(__name__)
 # ── State hash tracking ─────────────────────────────────────────────────────
 
 def _snapshot_hash(sessions: list) -> str:
-    """Create a lightweight hash of session IDs and timestamps for change detection."""
-    key = '|'.join(
-        f"{s['session_id']}:{s.get('updated_at', 0)}:{s.get('message_count', 0)}"
-        for s in sorted(sessions, key=lambda x: x['session_id'])
+    """Hash the complete canonical projection that subscribers receive."""
+    canonical = sorted(
+        sessions,
+        key=lambda item: str(item.get("session_id") or ""),
     )
-    return hashlib.md5(key.encode(), usedforsecurity=False).hexdigest()
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.md5(encoded, usedforsecurity=False).hexdigest()
 
 
 # Sources excluded from the WebUI sidebar projection. Must match the default
@@ -40,92 +47,70 @@ def _snapshot_hash(sessions: list) -> str:
 # cheap change-detection scan below sees exactly the same row set as the
 # expensive projection (otherwise cron message churn would defeat the gate).
 _WATCHER_EXCLUDED_SOURCES = ("cron", "webui")
+_WATCHER_FINGERPRINT_INDEX = "idx_sessions_webui_fingerprint"
+
+
+def _file_change_fingerprint(db_path: Path) -> str:
+    """Return a metadata-only DB/WAL change signal without reading SQLite pages."""
+    h = hashlib.md5(usedforsecurity=False)
+    for path in (Path(db_path), Path(f"{db_path}-wal")):
+        try:
+            stat = path.stat()
+            marker = (path.name, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        except FileNotFoundError:
+            marker = (path.name, None)
+        h.update(repr(marker).encode("utf-8", "replace"))
+        h.update(b"\x1e")
+    return f"stat:{h.hexdigest()}"
 
 
 def _cheap_change_fingerprint(db_path: Path) -> str | None:
-    """Compute a cheap fingerprint with an index-covered message aggregate.
+    """Compute a cheap fingerprint without scanning either wide SQLite table.
 
-    The expensive projection (``read_importable_agent_session_rows``) runs a CTE
-    plus a per-session ``MAX(messages.timestamp)`` aggregation over an oversampled
-    candidate set every poll. On a large ``state.db`` (hundreds of sessions, tens
-    of thousands of messages) that is ~10x the cost of a single ``sessions``-table
-    scan, and the watcher runs it forever on a 5s timer even when nothing changed
-    (issue #3506).
+    Current deployments install ``idx_sessions_webui_fingerprint`` explicitly
+    during maintenance. Its four columns cover the normal sidebar mutations
+    (new/deleted/source-retagged sessions plus message count/activity changes),
+    so the five-second poll never visits the large ``sessions`` table payload or
+    the multi-GB ``messages`` table.
 
-    This hashes every sessions-table column the projection uses, plus a
-    per-session ``COUNT`` / ``MAX(messages.timestamp)`` aggregate scoped to the
-    same non-cron/webui rows. The message aggregate stays on the agent's existing
-    ``(session_id, timestamp)`` covering index, avoiding a table-page lookup for
-    every historical message.
+    On older schemas, or before maintenance has installed the covering index,
+    fall back to DB/WAL file metadata. That signal may re-project on excluded
+    source churn, but remains sound and costs no SQLite scan. The periodic exact
+    projection covers same-count/role/title/end-state mutations not represented
+    in the compact index.
 
-    ``role`` is intentionally absent because it is not in that index. A bounded
-    periodic full projection in ``GatewayWatcher._poll_once`` covers rare
-    role-only visibility mutations without restoring the five-second table scan.
+    Normal appends update ``message_count``. Same-count rewrites and role-only
+    changes can leave the session row unchanged, so the bounded periodic parity
+    projection still reads exact message activity; only the five-second
+    fingerprint stays sessions-only on current schemas.
 
-    Returns the fingerprint string, or ``None`` on any error / a pre-source
-    schema so the caller falls back to running the expensive projection rather
-    than risk skipping a change.
+    Returns a stable fingerprint string. ``None`` is reserved for a path that
+    cannot be fingerprinted at all, preserving the caller's fail-open contract.
     """
-    # Columns the projection reads from the ``sessions`` table. ``id``/``source``
-    # are always present (``source`` is required for the projection to run at
-    # all); the rest are optional on older agent schemas and filtered below.
-    _PROJECTION_SESSION_COLS = (
-        'id', 'source', 'session_source', 'title', 'model', 'message_count',
-        'started_at', 'ended_at', 'end_reason', 'parent_session_id', 'archived',
-        'user_id', 'chat_id', 'chat_type', 'thread_id', 'session_key',
-        'origin_chat_id', 'origin_user_id', 'platform',
-    )
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return None
     try:
         with closing(open_state_db_readonly(db_path)) as conn:
             cur = conn.cursor()
-            cur.execute("PRAGMA table_info(sessions)")
-            cols = {row[1] for row in cur.fetchall()}
-            if 'source' not in cols:
-                return None
-            selectable = [c for c in _PROJECTION_SESSION_COLS if c in cols]
             placeholders = ", ".join("?" for _ in _WATCHER_EXCLUDED_SOURCES)
             cur.execute(
-                f"SELECT {', '.join(selectable)} FROM sessions "
+                "SELECT source, id, message_count, last_activity_at "
+                f"FROM sessions INDEXED BY {_WATCHER_FINGERPRINT_INDEX} "
                 f"WHERE source IS NOT NULL AND source NOT IN ({placeholders}) "
-                f"ORDER BY id",
+                "ORDER BY source, id",
                 list(_WATCHER_EXCLUDED_SOURCES),
             )
             h = hashlib.md5(usedforsecurity=False)
             for row in cur.fetchall():
                 h.update(repr(row).encode('utf-8', 'replace'))
                 h.update(b'\x1e')
-            # A same-count transcript rewrite (SessionDB.replace_messages used by
-            # /retry, /undo, /compress) deletes + reinserts messages with new
-            # timestamps but can leave sessions.message_count unchanged — so the
-            # sessions-only scan above would miss it and the watcher would skip a
-            # projection whose last_activity (MAX(messages.timestamp)) actually
-            # moved. Fold in a PER-SESSION COUNT/MAX aggregate, scoped to the same
-            # non-excluded sessions as the projection. COUNT preserves drift
-            # detection; MAX catches same-count rewrites because replacement rows
-            # receive fresh timestamps. Do not read ``role`` here: the normal
-            # (session_id, timestamp) index can then cover this five-second scan
-            # instead of forcing a table-page lookup for every historical row.
-            if 'messages' in {r[0] for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}:
-                try:
-                    msg_rows = conn.execute(
-                        "SELECT s.id, COUNT(m.id), "
-                        "COALESCE(MAX(m.timestamp), 0) "
-                        "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
-                        f"WHERE s.source IS NOT NULL AND s.source NOT IN ({placeholders}) "
-                        "GROUP BY s.id ORDER BY s.id",
-                        list(_WATCHER_EXCLUDED_SOURCES),
-                    ).fetchall()
-                    for mrow in msg_rows:
-                        h.update(repr(mrow).encode('utf-8', 'replace'))
-                        h.update(b'\x1e')
-                except sqlite3.Error:
-                    # messages table shape unknown → don't trust the fingerprint;
-                    # signal the caller to run the full projection.
-                    return None
-            return h.hexdigest()
-    except Exception:
-        return None
+            return f"idx:{h.hexdigest()}"
+    except (OSError, sqlite3.Error):
+        try:
+            return _file_change_fingerprint(db_path)
+        except OSError:
+            return None
 
 
 # ── DB resolution (shared pattern with state_sync.py) ──────────────────────
@@ -357,10 +342,13 @@ class GatewayWatcher:
     def _poll_loop(self):
         """Main polling loop. Runs in a daemon thread."""
         while not self._stop_event.is_set():
-            try:
-                self._poll_once()
-            except Exception:
-                logger.debug("Error in gateway watcher poll loop", exc_info=True)
+            with self._sub_lock:
+                has_subscribers = bool(self._subscribers)
+            if has_subscribers:
+                try:
+                    self._poll_once()
+                except Exception:
+                    logger.debug("Error in gateway watcher poll loop", exc_info=True)
 
             # Sleep in small increments so we can stop promptly
             for _ in range(self.POLL_INTERVAL * 10):

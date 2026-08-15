@@ -16,7 +16,6 @@ from unittest.mock import patch
 
 import pytest
 
-import api.models
 from api import context_brief
 
 
@@ -91,15 +90,26 @@ def _isolate_jobs():
         context_brief._JOBS.clear()
     yield
     with context_brief._JOBS_LOCK:
+        threads = []
         for job in context_brief._JOBS.values():
             thread = job.get("_thread")
             if thread is not None:
-                thread.join(timeout=5)
+                threads.append(thread)
+    # Workers call _finish_job(), which needs _JOBS_LOCK. Never join while
+    # holding that lock or the teardown itself strands a worker into the next
+    # test file and lets it touch real api.models state after patches unwind.
+    for thread in threads:
+        thread.join(timeout=5)
+    alive = [thread.name for thread in threads if thread.is_alive()]
+    with context_brief._JOBS_LOCK:
         context_brief._JOBS.clear()
+    assert not alive, f"context-brief worker(s) survived test teardown: {alive}"
 
 
 def _patch_resolution(sess):
-    return patch.object(api.models, "get_session", lambda sid, **kw: sess if sid == SID else (_ for _ in ()).throw(KeyError(sid)))
+    from api import models
+
+    return patch.object(models, "get_session", lambda sid, **kw: sess if sid == SID else (_ for _ in ()).throw(KeyError(sid)))
 
 
 # ── deterministic assembly ───────────────────────────────────────────────
@@ -202,11 +212,13 @@ def test_llm_brief_persisted_and_flagged_stale(tmp_path):
 
 
 def test_get_brief_payload_404_for_unknown_session(tmp_path):
+    from api import models
+
     def _missing(sid, **kw):
         raise KeyError(sid)
 
-    with patch.object(api.models, "get_session", _missing), patch.object(
-        api.models, "get_cli_session_messages", lambda sid, **kw: []
+    with patch.object(models, "get_session", _missing), patch.object(
+        models, "get_cli_session_messages", lambda sid, **kw: []
     ):
         with pytest.raises(context_brief.BriefError) as excinfo:
             context_brief.get_brief_payload("unknown-session")
@@ -214,6 +226,8 @@ def test_get_brief_payload_404_for_unknown_session(tmp_path):
 
 
 def test_cli_session_falls_back_to_state_db(tmp_path):
+    from api import models
+
     def _missing(sid, **kw):
         raise KeyError(sid)
 
@@ -221,8 +235,8 @@ def test_cli_session_falls_back_to_state_db(tmp_path):
         {"role": "user", "content": "demande cli", "timestamp": 2000.0},
         {"role": "assistant", "content": "# CONCLUSION\n---\n> 🟢 fait en cli", "timestamp": 2001.0},
     ]
-    with patch.object(api.models, "get_session", _missing), patch.object(
-        api.models, "get_cli_session_messages", lambda sid, **kw: cli_messages
+    with patch.object(models, "get_session", _missing), patch.object(
+        models, "get_cli_session_messages", lambda sid, **kw: cli_messages
     ):
         brief = context_brief.get_brief_payload(SID)
     assert brief["meta"]["source"] == "state_db"
@@ -230,22 +244,41 @@ def test_cli_session_falls_back_to_state_db(tmp_path):
     assert brief["requests"][0]["text"] == "demande cli"
 
 
+def test_legacy_brief_without_transcript_digest_is_always_unverifiable(tmp_path):
+    sess = _make_session(tmp_path)
+    sess.updated_at = None
+    payload = {
+        "message_count_at_generation": len(sess.messages),
+        "generated_at": time.time(),
+        "text": "legacy",
+    }
+
+    assert context_brief._llm_brief_is_current(sess, payload, len(sess.messages)) is False
+    sess.messages[0] = dict(sess.messages[0], content="same-count rewrite")
+    assert context_brief._llm_brief_is_current(sess, payload, len(sess.messages)) is False
+
+
 # ── job lifecycle ────────────────────────────────────────────────────────
 
 def test_brief_job_generates_fallback_without_aux_model(tmp_path):
     sess = _make_session(tmp_path)
-    with _patch_resolution(sess):
+    with _patch_resolution(sess), patch(
+        "agent.auxiliary_client.call_llm",
+        side_effect=RuntimeError("auxiliary model unavailable in unit test"),
+    ):
         job = context_brief.start_brief_job(SID)
-    assert job["status"] == "running"
-    job_id = job["job_id"]
+        assert job["status"] == "running"
+        job_id = job["job_id"]
 
-    deadline = time.time() + 10
-    while time.time() < deadline:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            snap = context_brief.brief_job_status(job_id)
+            assert snap is not None
+            if snap["status"] != "running":
+                break
+            time.sleep(0.05)
         snap = context_brief.brief_job_status(job_id)
-        if snap["status"] != "running":
-            break
-        time.sleep(0.05)
-    snap = context_brief.brief_job_status(job_id)
+        assert snap is not None
     assert snap["status"] == "done", snap.get("error")
     result = snap["result"]
     # No auxiliary client in the test environment → honest deterministic fallback.
@@ -262,13 +295,70 @@ def test_brief_job_generates_fallback_without_aux_model(tmp_path):
     assert brief["llm_brief"]["stale"] is False
 
 
+def test_manual_brief_refresh_persists_for_archived_session(tmp_path):
+    sess = _make_session(tmp_path)
+    sess.archived = True
+    with _patch_resolution(sess), patch.object(
+        context_brief,
+        "_generate_llm_brief",
+        return_value=("x" * 300, "auxiliary-llm"),
+    ):
+        job = context_brief.start_brief_job(SID, automatic=False)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            snapshot = context_brief.brief_job_status(job["job_id"])
+            assert snapshot is not None
+            if snapshot["status"] != "running":
+                break
+            time.sleep(0.01)
+        snapshot = context_brief.brief_job_status(job["job_id"])
+        assert snapshot is not None
+
+    assert snapshot["status"] == "done", snapshot.get("error")
+    assert snapshot["result"]["persisted"] is True
+
+
+def test_manual_refresh_does_not_persist_after_successor_admission(tmp_path):
+    sess = _make_session(tmp_path)
+    saved = []
+
+    def admit_then_return(*_args, **_kwargs):
+        sess.active_stream_id = "successor"
+        sess.pending_user_message = "next turn"
+        return "manual brief", "auxiliary-llm"
+
+    with _patch_resolution(sess), patch.object(
+        context_brief,
+        "_generate_llm_brief",
+        side_effect=admit_then_return,
+    ), patch.object(
+        context_brief,
+        "_save_llm_brief",
+        side_effect=lambda *_args, **_kwargs: saved.append(True),
+    ):
+        job = context_brief.start_brief_job(SID, automatic=False)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            snapshot = context_brief.brief_job_status(job["job_id"])
+            assert snapshot is not None
+            if snapshot["status"] != "running":
+                break
+            time.sleep(0.01)
+
+    assert snapshot["status"] == "error"
+    assert "resumed" in snapshot["error"]
+    assert saved == []
+
+
 def test_brief_job_refuses_duplicate_and_empty(tmp_path):
+    from api import models
+
     sess = _make_session(tmp_path)
 
     # Force the job to stay running so the duplicate check triggers.
     started = threading_event = __import__("threading").Event()
 
-    def _slow_generate(session, sid, deterministic):
+    def _slow_generate(session, sid, deterministic, **_kwargs):
         started.wait(timeout=5)
         return "x" * 300, "auxiliary-llm"
 
@@ -279,10 +369,20 @@ def test_brief_job_refuses_duplicate_and_empty(tmp_path):
             context_brief.start_brief_job(SID)
         assert excinfo.value.status == 409
         started.set()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            snapshot = context_brief.brief_job_status(job["job_id"])
+            assert snapshot is not None
+            if snapshot["status"] != "running":
+                break
+            time.sleep(0.01)
+        snapshot = context_brief.brief_job_status(job["job_id"])
+        assert snapshot is not None
+        assert snapshot["status"] == "done"
 
     empty_sid = "20260812_120000_empty9"
     empty = _make_session(tmp_path, messages=[])
-    with patch.object(api.models, "get_session", lambda sid, **kw: empty if sid == empty_sid else (_ for _ in ()).throw(KeyError(sid))):
+    with patch.object(models, "get_session", lambda sid, **kw: empty if sid == empty_sid else (_ for _ in ()).throw(KeyError(sid))):
         with pytest.raises(context_brief.BriefError) as excinfo:
             context_brief.start_brief_job(empty_sid)
     assert excinfo.value.status == 400

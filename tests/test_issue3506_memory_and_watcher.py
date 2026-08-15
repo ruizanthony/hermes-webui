@@ -196,11 +196,31 @@ def _add_session(conn, sid, source="telegram", mc=2, started=None, title="Chat")
     conn.commit()
 
 
+def _enable_denormalized_activity(conn):
+    """Upgrade the compact fixture to the current Hermes Agent schema."""
+    conn.execute("ALTER TABLE sessions ADD COLUMN last_activity_at REAL")
+    conn.execute("UPDATE sessions SET last_activity_at = started_at")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_session "
+        "ON messages(session_id, timestamp)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_session_role "
+        "ON messages(session_id, role COLLATE NOCASE)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_webui_fingerprint "
+        "ON sessions(source, id, message_count, last_activity_at)"
+    )
+    conn.commit()
+
+
 def test_cheap_fingerprint_stable_and_sensitive(tmp_path):
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "tg1", "telegram", mc=2)
     _add_session(conn, "dc1", "discord", mc=3)
+    _enable_denormalized_activity(conn)
 
     fp1 = gw._cheap_change_fingerprint(db)
     fp2 = gw._cheap_change_fingerprint(db)
@@ -223,6 +243,7 @@ def test_cheap_fingerprint_ignores_excluded_sources(tmp_path):
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "tg1", "telegram", mc=2)
+    _enable_denormalized_activity(conn)
     fp1 = gw._cheap_change_fingerprint(db)
 
     # A cron session churns heavily — but cron is excluded from the sidebar, so
@@ -243,6 +264,7 @@ def test_cheap_fingerprint_detects_source_change(tmp_path):
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "s1", "telegram", mc=2)
+    _enable_denormalized_activity(conn)
     fp1 = gw._cheap_change_fingerprint(db)
 
     conn.execute("UPDATE sessions SET source = 'discord' WHERE id = 's1'")
@@ -252,12 +274,12 @@ def test_cheap_fingerprint_detects_source_change(tmp_path):
 
 
 def test_cheap_fingerprint_detects_same_count_message_rewrite(tmp_path):
-    """Regression (#3536 review): SessionDB.replace_messages (/retry, /undo,
-    /compress) deletes + reinserts a transcript with NEW timestamps but can leave
-    sessions.message_count UNCHANGED. The projection's last_activity
-    (MAX(messages.timestamp)) moves, so the cheap fingerprint MUST still change
-    even though every sessions-table column is identical — otherwise the watcher
-    skips a re-projection and other tabs show stale last_activity ordering."""
+    """The metadata fallback detects any DB/WAL write on legacy schemas.
+
+    Current indexed schemas rely on Agent-maintained ``last_activity_at`` and a
+    periodic exact parity projection. A legacy schema without that index must
+    still notice same-count rewrites without scanning ``messages``.
+    """
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "s1", "telegram", mc=3)
@@ -282,22 +304,38 @@ def test_cheap_fingerprint_detects_same_count_message_rewrite(tmp_path):
     )
 
 
-def test_cheap_fingerprint_message_aggregate_does_not_read_role_payload(
+def test_legacy_fingerprint_falls_back_to_file_metadata_without_a_table_scan(
     tmp_path, monkeypatch
 ):
-    """The five-second fingerprint must stay on the covering session/timestamp
-    index. Reading ``role`` forces a table lookup for every message row and made
-    a 10 GB state.db fingerprint take tens of seconds even while WebUI was idle.
-    Role-only changes are deliberately handled by the bounded periodic full
-    projection, so this query can stay on the existing covering index.
+    """Missing covering indexes must never re-enable a DB-wide poll scan."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    _add_session(conn, "s1", "telegram", mc=3)
+    opens = []
+
+    def reject_sqlite_scan(path):
+        opens.append(path)
+        raise sqlite3.OperationalError("covering index unavailable")
+
+    monkeypatch.setattr(gw, "open_state_db_readonly", reject_sqlite_scan)
+
+    fp1 = gw._cheap_change_fingerprint(db)
+    assert fp1 is not None and fp1.startswith("stat:")
+    _add_session(conn, "s1", "telegram", mc=4)
+    fp2 = gw._cheap_change_fingerprint(db)
+    assert fp2 != fp1
+    assert len(opens) == 2
+
+
+def test_modern_fingerprint_uses_denormalized_session_activity(tmp_path, monkeypatch):
+    """Current Agent schemas must not scan the multi-GB messages table just
+    to detect sidebar changes. ``last_activity_at`` and ``message_count`` are the
+    authoritative bounded projection maintained by Hermes Agent.
     """
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
-    conn.execute(
-        "CREATE INDEX idx_messages_session ON messages(session_id, timestamp)"
-    )
-    conn.commit()
     _add_session(conn, "s1", "telegram", mc=3)
+    _enable_denormalized_activity(conn)
     statements = []
     real_open = gw.open_state_db_readonly
 
@@ -307,20 +345,88 @@ def test_cheap_fingerprint_message_aggregate_does_not_read_role_payload(
         return traced
 
     monkeypatch.setattr(gw, "open_state_db_readonly", traced_open)
-
-    assert gw._cheap_change_fingerprint(db) is not None
-    aggregate = next(
+    fp1 = gw._cheap_change_fingerprint(db)
+    assert fp1 is not None
+    assert fp1.startswith("idx:")
+    assert not any("JOIN messages" in statement for statement in statements)
+    indexed_query = next(
         statement
         for statement in statements
-        if "LEFT JOIN messages" in statement
+        if "INDEXED BY idx_sessions_webui_fingerprint" in statement
     )
-    assert "m.role" not in aggregate.lower()
-    assert "COUNT(m.id)" in aggregate
-    assert "MAX(m.timestamp)" in aggregate
-    plan = conn.execute("EXPLAIN QUERY PLAN " + aggregate).fetchall()
+    plan = conn.execute("EXPLAIN QUERY PLAN " + indexed_query).fetchall()
     assert any(
-        "COVERING INDEX idx_messages_session" in str(row[3]) for row in plan
+        "COVERING INDEX idx_sessions_webui_fingerprint" in str(row[3])
+        for row in plan
     ), plan
+
+    conn.execute("UPDATE sessions SET last_activity_at = last_activity_at + 1 WHERE id = 's1'")
+    conn.commit()
+    assert gw._cheap_change_fingerprint(db) != fp1
+
+
+def test_modern_projection_bounds_message_index_reads(tmp_path, monkeypatch):
+    """The modern parity projection must not count every historical message.
+
+    The fast fingerprint trusts ``sessions.message_count``. Periodic parity still
+    counts the bounded candidate set through the covering index, caps the user-turn
+    count at two, and reads exact latest timestamps without a fleet-wide join.
+    """
+    sessions = importlib.import_module("api.agent_sessions")
+    db, conn = _make_db(tmp_path)
+    _add_session(conn, "s1", "telegram", mc=3)
+    _enable_denormalized_activity(conn)
+    conn.execute("UPDATE sessions SET message_count = 99 WHERE id = 's1'")
+    conn.execute(
+        "UPDATE messages SET timestamp = timestamp + 500 WHERE session_id = 's1' AND id = ("
+        "SELECT MAX(id) FROM messages WHERE session_id = 's1')"
+    )
+    conn.commit()
+    statements = []
+    real_connect = sessions.sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        traced = real_connect(*args, **kwargs)
+        traced.set_trace_callback(statements.append)
+        return traced
+
+    monkeypatch.setattr(sessions.sqlite3, "connect", traced_connect)
+    rows = sessions.read_importable_agent_session_rows(db, limit=200)
+    assert [row["id"] for row in rows] == ["s1"]
+    projection = next(
+        statement for statement in statements if "actual_user_message_count" in statement
+    )
+    assert "COUNT(*) FROM messages mc INDEXED BY idx_messages_session" in projection
+    assert "LIMIT 2" in projection
+    assert "INDEXED BY idx_messages_session_role" in projection
+    assert "INDEXED BY idx_messages_session" in projection
+    assert "last_activity_at" in projection
+    assert rows[0]["actual_message_count"] == 3
+    assert rows[0]["actual_user_message_count"] == 2
+    assert rows[0]["last_activity"] > rows[0]["started_at"] + 400
+
+
+def test_poll_loop_does_not_touch_db_without_subscribers(tmp_path, monkeypatch):
+    """An idle WebUI must not poll state.db when nobody consumes sidebar SSE."""
+    gw = importlib.import_module("api.gateway_watcher")
+    watcher = gw.GatewayWatcher(state_db_path=tmp_path / "state.db")
+    calls = []
+    monkeypatch.setattr(watcher, "_poll_once", lambda **kwargs: calls.append(True))
+
+    class StopAfterOneIdleIteration:
+        def __init__(self):
+            self.checks = 0
+
+        def is_set(self):
+            self.checks += 1
+            return self.checks > 1
+
+    stop = StopAfterOneIdleIteration()
+    watcher._stop_event = stop
+    watcher._poll_loop()
+
+    assert stop.checks == 2
+    assert not calls
 
 
 def test_periodic_projection_recovers_role_only_sidebar_visibility_change(tmp_path):
@@ -328,10 +434,7 @@ def test_periodic_projection_recovers_role_only_sidebar_visibility_change(tmp_pa
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "cli1", "cli", mc=1, title="Untitled")
-    conn.execute(
-        "CREATE INDEX idx_messages_session ON messages(session_id, timestamp)"
-    )
-    conn.commit()
+    _enable_denormalized_activity(conn)
 
     watcher = gw.GatewayWatcher(state_db_path=db)
     subscriber = watcher.subscribe()
@@ -353,6 +456,48 @@ def test_periodic_projection_recovers_role_only_sidebar_visibility_change(tmp_pa
     event = subscriber.get_nowait()
     assert event["sessions"] == []
     assert subscriber.empty()
+
+
+def test_periodic_projection_publishes_all_constant_cardinality_metadata_changes(
+    tmp_path, monkeypatch
+):
+    """Parity must publish metadata changes even when the cheap fingerprint is stable."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    conn.close()
+    changes = (
+        ("title", "Old title", "New title"),
+        ("model", "old-model", "new-model"),
+        ("source", "telegram", "discord"),
+        ("relationship_type", "root", "compression_continuation"),
+        ("ended_at", None, 12345.0),
+    )
+
+    monkeypatch.setattr(gw, "_cheap_change_fingerprint", lambda _path: "idx:stable")
+    for field, old_value, new_value in changes:
+        projected = {
+            "session_id": "s1",
+            "updated_at": 100.0,
+            "message_count": 2,
+            field: old_value,
+        }
+        monkeypatch.setattr(
+            gw,
+            "_get_agent_sessions_from_db",
+            lambda _path, row=projected: [dict(row)],
+        )
+        watcher = gw.GatewayWatcher(state_db_path=db)
+        subscriber = watcher.subscribe()
+        assert watcher._poll_once(now=1.0) is True
+        assert subscriber.get_nowait()["sessions"][0][field] == old_value
+
+        projected[field] = new_value
+        assert watcher._poll_once(
+            now=1.0 + watcher.PROJECTION_PARITY_INTERVAL
+        ) is True
+        event = subscriber.get_nowait()
+        assert event["sessions"][0][field] == new_value
+        assert watcher._last_sessions[0][field] == new_value
 
 
 def test_initial_missing_db_does_not_publish_an_empty_snapshot(tmp_path):
@@ -510,14 +655,15 @@ def test_cheap_fingerprint_handles_missing_optional_columns(tmp_path):
     assert fp is not None and isinstance(fp, str)
 
 
-def test_cheap_fingerprint_returns_none_without_source_column(tmp_path):
-    """A pre-source-tracking schema must return None (forces safe full read)."""
+def test_cheap_fingerprint_uses_file_metadata_without_source_column(tmp_path):
+    """Ancient schemas stay detectable without opening a table-scan path."""
     gw = importlib.import_module("api.gateway_watcher")
     db = tmp_path / "ancient.db"
     conn = sqlite3.connect(str(db))
     conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, started_at REAL)")
     conn.commit()
-    assert gw._cheap_change_fingerprint(db) is None
+    fingerprint = gw._cheap_change_fingerprint(db)
+    assert fingerprint is not None and fingerprint.startswith("stat:")
 
 
 def test_poll_loop_skips_projection_when_unchanged(tmp_path, monkeypatch):
@@ -525,6 +671,7 @@ def test_poll_loop_skips_projection_when_unchanged(tmp_path, monkeypatch):
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "tg1", "telegram", mc=2)
+    _enable_denormalized_activity(conn)
 
     projected = []
 

@@ -1,4 +1,4 @@
-"""Regression tests for #3887 — defensive index prime for the sidebar scan.
+"""Regression tests for #3887 — missing-index sidebar behaviour.
 
 The sidebar's CLI-session scan (``read_importable_agent_session_rows``) orders
 candidate sessions by a correlated ``MAX(mx.timestamp)`` subquery over the
@@ -9,10 +9,10 @@ reimported db) has no such index and the scan degrades to a full ``messages``
 scan per candidate session — stalling ``/api/sessions`` for seconds on every
 refresh.
 
-These tests assert the intent (the index is primed when missing so the listing
-self-heals) and the cross-cell isolation (the prime is a no-op when the index
-already exists, is skipped when the schema lacks the columns, and degrades
-silently on a read-only db without ever failing the listing).
+The listing path must never build indexes itself: CREATE INDEX can retain the
+SQLite writer lock for minutes on a multi-GiB database. These tests assert that
+missing-index databases remain read-only and degrade to denormalized session
+metadata, while existing covering indexes still enable the exact projection.
 """
 import os
 import sqlite3
@@ -74,38 +74,46 @@ def _messages_indexes(path):
     return {r[0] for r in rows}
 
 
-def test_prime_creates_missing_index(tmp_path):
-    """A db missing idx_messages_session gets it primed on the first scan."""
+def test_listing_does_not_create_missing_indexes(tmp_path, monkeypatch):
+    """A missing index must not turn a sidebar read into a long writer lock."""
     db = tmp_path / "state.db"
     _full_schema_db(db)
     assert "idx_messages_session" not in _messages_indexes(db)
+    connect_calls = []
+    real_connect = agent_sessions.sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(agent_sessions.sqlite3, "connect", recording_connect)
 
     rows = agent_sessions.read_importable_agent_session_rows(
         db, limit=20, exclude_sources=None
     )
+    listing_connect_calls = list(connect_calls)
 
-    # Listing still returns the sessions ...
+    # Listing still returns the sessions from denormalized metadata ...
     assert {r["id"] for r in rows} == {"sess0", "sess1", "sess2"}
-    # ... and the index now exists on (session_id, timestamp).
-    assert "idx_messages_session" in _messages_indexes(db)
-    conn = sqlite3.connect(str(db))
-    try:
-        sql = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE name='idx_messages_session'"
-        ).fetchone()[0]
-    finally:
-        conn.close()
-    assert "session_id" in sql and "timestamp" in sql
+    # ... without mutating schema or opening a write-capable connection.
+    assert "idx_messages_session" not in _messages_indexes(db)
+    assert "idx_messages_session_role" not in _messages_indexes(db)
+    assert len(listing_connect_calls) == 1
+    assert "mode=ro" in str(listing_connect_calls[0][0][0])
+    assert listing_connect_calls[0][1].get("uri") is True
 
 
-def test_prime_is_noop_when_index_exists(tmp_path):
-    """When the agent already created the index, the prime must not duplicate
-    or error — the existing index is reused untouched."""
+def test_existing_indexes_enable_exact_projection_without_mutation(tmp_path):
+    """Existing covering indexes are reused untouched."""
     db = tmp_path / "state.db"
     _full_schema_db(db)
     conn = sqlite3.connect(str(db))
     conn.execute(
         "CREATE INDEX idx_messages_session ON messages(session_id, timestamp)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_messages_session_role "
+        "ON messages(session_id, role COLLATE NOCASE)"
     )
     conn.commit()
     conn.close()
@@ -119,9 +127,43 @@ def test_prime_is_noop_when_index_exists(tmp_path):
     # Index set is unchanged — no duplicate, no error.
     assert _messages_indexes(db) == before
     assert "idx_messages_session" in _messages_indexes(db)
+    assert "idx_messages_session_role" in _messages_indexes(db)
 
 
-def test_prime_skipped_without_timestamp_column(tmp_path):
+@pytest.mark.parametrize(
+    "index_sql",
+    (
+        "CREATE INDEX idx_messages_session "
+        "ON messages(session_id, timestamp) WHERE role = 'user'",
+        "CREATE INDEX idx_messages_session ON messages(timestamp, session_id)",
+        "CREATE INDEX idx_messages_session_role ON messages(session_id, role)",
+        "CREATE INDEX idx_messages_session_role "
+        "ON messages(session_id, role COLLATE NOCASE) WHERE role = 'user'",
+    ),
+)
+def test_malformed_same_name_index_degrades_without_forced_plan(
+    tmp_path, index_sql
+):
+    db = tmp_path / "state.db"
+    _full_schema_db(db)
+    conn = sqlite3.connect(str(db))
+    conn.execute(index_sql)
+    conn.commit()
+    conn.close()
+
+    rows = agent_sessions.read_importable_agent_session_rows(
+        db, limit=20, exclude_sources=None
+    )
+
+    assert {row["id"] for row in rows} == {"sess0", "sess1", "sess2"}
+    assert _messages_indexes(db) == {
+        "idx_messages_session"
+        if "idx_messages_session ON" in index_sql
+        else "idx_messages_session_role"
+    }
+
+
+def test_missing_timestamp_column_does_not_trigger_index_creation(tmp_path):
     """A minimal messages schema (no timestamp column) must not attempt the
     index and must not crash the listing."""
     db = tmp_path / "state.db"
@@ -157,14 +199,9 @@ def test_prime_skipped_without_timestamp_column(tmp_path):
     assert "idx_messages_session" not in _messages_indexes(db)
 
 
-def test_prime_degrades_on_readonly_db(tmp_path):
-    """A read-only db (can't create the index) must not raise — the listing
-    still returns, just without the perf benefit."""
-    # Root bypasses POSIX permission bits, so chmod 0444 doesn't make the file
-    # read-only for root and the prime would succeed — validating the wrong path
-    # and giving false confidence on root-run CI (greptile). Skip under root; the
-    # production handler's `except sqlite3.Error: pass` covers read-only/locked/
-    # corrupted/older-schema regardless, and the other cases pin that contract.
+def test_listing_degrades_on_readonly_db(tmp_path):
+    """A read-only db without indexes still returns denormalized rows."""
+    # Root bypasses chmod; non-root exercises the same always-read-only listing.
     if hasattr(os, "getuid") and os.getuid() == 0:
         pytest.skip("chmod-based read-only test is a no-op under root")
     db = tmp_path / "state.db"
