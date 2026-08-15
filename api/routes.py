@@ -15419,7 +15419,8 @@ def handle_post(handler, parsed) -> bool:
         sidecar_authority = None
         try:
             from api.models import (
-                _fsync_sidecar_directory,
+                SessionDeleteTombstoneError,
+                _delete_session_sidecar_artifacts_locked,
                 _session_sidecar_authority,
             )
 
@@ -15430,23 +15431,18 @@ def handle_post(handler, parsed) -> bool:
                 p.relative_to(SESSION_DIR.resolve())
             except Exception:
                 return bad(handler, "Invalid session_id", 400)
-            if not is_messaging_session:
-                try:
-                    _record_webui_deleted_session_tombstone(sid)
-                except Exception:
-                    logger.warning(
-                        "Failed to durably tombstone deleted WebUI session %s",
-                        sid,
-                        exc_info=True,
-                    )
-                    return bad(handler, "Failed to persist session deletion", 500)
-            with LOCK:
-                SESSIONS.pop(sid, None)
-            backup_path = p.with_suffix('.json.bak')
-            archived_backups = list(p.parent.glob(f'{p.name}.bak.archive-*'))
             try:
-                for session_file in (p, backup_path, *archived_backups):
-                    session_file.unlink(missing_ok=True)
+                _delete_session_sidecar_artifacts_locked(
+                    sid,
+                    record_tombstone=not is_messaging_session,
+                )
+            except SessionDeleteTombstoneError:
+                logger.warning(
+                    "Failed to durably tombstone deleted WebUI session %s",
+                    sid,
+                    exc_info=True,
+                )
+                return bad(handler, "Failed to persist session deletion", 500)
             except Exception:
                 logger.warning(
                     "Failed to delete required session file for %s",
@@ -21876,26 +21872,42 @@ def _handle_memory_read(handler, parsed=None):
 
 def _handle_sessions_cleanup(handler, body, zero_only=False):
     cleaned = 0
-    phase1_removed_ids = set()
+    phase1_delete_candidate_ids = set()
 
     # Phase 1: Clean orphan session files (existing behavior).
     for p in SESSION_DIR.glob("*.json"):
         if p.name.startswith("_"):
             continue
         try:
-            s = Session.load(p.stem)
-            if zero_only:
-                should_delete = s and len(s.messages) == 0
-            else:
-                should_delete = s and s.title == "Untitled" and len(s.messages) == 0
-            if should_delete:
-                with LOCK:
-                    SESSIONS.pop(p.stem, None)
-                p.unlink(missing_ok=True)
+            from api.models import (
+                _delete_session_sidecar_artifacts_locked,
+                _read_sidecar_snapshot,
+                _session_sidecar_authority,
+            )
+
+            sid = p.stem
+            with _session_sidecar_authority(sid):
+                revision, payload = _read_sidecar_snapshot(p, sid)
+                messages = payload.get("messages")
+                if messages is None:
+                    messages = []
+                if not isinstance(messages, list):
+                    continue
+                title = payload.get("title", "Untitled")
+                should_delete = not messages and (
+                    zero_only or title == "Untitled"
+                )
+                if not should_delete:
+                    continue
+                phase1_delete_candidate_ids.add(sid)
+                if not _delete_session_sidecar_artifacts_locked(
+                    sid,
+                    expected_revision=revision,
+                ):
+                    continue
                 cleaned += 1
-                phase1_removed_ids.add(p.stem)
         except Exception:
-            logger.debug("Failed to clean up session file %s", p)
+            logger.debug("Failed to clean up session file %s", p, exc_info=True)
 
     phase1_touched = bool(cleaned)
     phase2_rewrote_index = False
@@ -21934,10 +21946,10 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
                         if not sid or sid in live_ids or sid in in_memory_ids:
                             survivors.append(entry)
                             continue
-                        # Phase 1 already removed the backing file for this
-                        # sid, so the index entry is stale too.  Drop it
-                        # from the index without double-counting.
-                        if sid in phase1_removed_ids:
+                        # Phase 1 already classified this sid for deletion. Drop
+                        # its stale index row, but only a fully durable artifact
+                        # removal contributes to the cleaned count.
+                        if sid in phase1_delete_candidate_ids:
                             continue
                         # Index-only ghost — no backing file, not in memory.
                         cleaned += 1
@@ -22048,22 +22060,13 @@ def _delete_hidden_background_session_sidecar(session_id: str) -> None:
         raise ValueError(f"Unsafe hidden background session_id {session_id!r}")
     with _get_session_agent_lock(session_id):
         from api.models import (
-            _fsync_sidecar_directory,
-            _invalidate_cached_session_generation,
-            _record_webui_deleted_session_tombstone,
+            _delete_session_sidecar_artifacts_locked,
             _session_sidecar_authority,
             delete_cli_session,
         )
 
         with _session_sidecar_authority(session_id):
-            _record_webui_deleted_session_tombstone(session_id)
-            _invalidate_cached_session_generation(session_id)
-            path = SESSION_DIR / f"{session_id}.json"
-            path.unlink(missing_ok=True)
-            path.with_suffix(".json.bak").unlink(missing_ok=True)
-            for archived_backup in path.parent.glob(f"{path.name}.bak.archive-*"):
-                archived_backup.unlink(missing_ok=True)
-            _fsync_sidecar_directory(path.parent)
+            _delete_session_sidecar_artifacts_locked(session_id)
         if not delete_cli_session(session_id):
             logger.warning(
                 "Hidden background session %s remains in state.db; durable tombstone prevents recovery",
