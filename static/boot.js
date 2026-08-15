@@ -2245,6 +2245,9 @@ function _applySessionContextMetadataUpdate(data){
       last_prompt_tokens:_pick(u.last_prompt_tokens,S.session.last_prompt_tokens),
       post_compression_context_tokens_estimate:S.session.post_compression_context_tokens_estimate,
       threshold_tokens:S.session.threshold_tokens||0,
+      threshold_percent_configured:data.session.threshold_percent_configured??u.threshold_percent_configured??null,
+      threshold_percent_effective:data.session.threshold_percent_effective??u.threshold_percent_effective??null,
+      threshold_floor_applied:data.session.threshold_floor_applied??u.threshold_floor_applied??null,
     });
   }
 }
