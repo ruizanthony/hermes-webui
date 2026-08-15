@@ -22153,6 +22153,44 @@ def _agent_runtime_barrier_response(
     return None
 
 
+def _start_worker_thread_with_maintenance_handoff(
+    worker_target,
+    *,
+    args,
+    kwargs,
+    maintenance_handoff=None,
+):
+    """Start a worker while transferring the caller's shared maintenance lease."""
+
+    target = worker_target
+    if maintenance_handoff is not None:
+
+        def target(*worker_args, **worker_kwargs):
+            try:
+                return worker_target(*worker_args, **worker_kwargs)
+            finally:
+                maintenance_handoff.release()
+
+    thread = threading.Thread(
+        target=target,
+        args=args,
+        kwargs=kwargs,
+        daemon=True,
+    )
+    if maintenance_handoff is not None:
+        # Transfer after construction but before ``start`` so constructor
+        # failure leaves ownership with the caller, while a very short worker
+        # still cannot release before ownership is marked.
+        maintenance_handoff.transfer_to_worker()
+    try:
+        thread.start()
+    except Exception:
+        if maintenance_handoff is not None:
+            maintenance_handoff.release()
+        raise
+    return thread
+
+
 def _start_chat_stream_for_session(
     s,
     *,
@@ -22168,6 +22206,7 @@ def _start_chat_stream_for_session(
     moa_config=None,
     external_runtime_owned: bool | None = None,
     continuation_claim_id: str | None = None,
+    maintenance_handoff=None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     if external_runtime_owned is None:
@@ -22349,14 +22388,13 @@ def _start_chat_stream_for_session(
     if backend_is_gateway:
         from api.gateway_chat import _mark_gateway_run_starting
         _mark_gateway_run_starting(stream_id)
-    thr = threading.Thread(
-        target=worker_target,
-        args=(s.session_id, msg, model, workspace, stream_id, attachments),
-        kwargs=worker_kwargs,
-        daemon=True,
-    )
     try:
-        thr.start()
+        _start_worker_thread_with_maintenance_handoff(
+            worker_target,
+            args=(s.session_id, msg, model, workspace, stream_id, attachments),
+            kwargs=worker_kwargs,
+            maintenance_handoff=maintenance_handoff,
+        )
     except Exception:
         if backend_is_gateway:
             try:
@@ -22470,6 +22508,7 @@ def _start_run(
     gateway_chat_enabled: bool | None = None,
     goal_related: bool = False,
     continuation_claim_id: str | None = None,
+    maintenance_handoff=None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -22512,6 +22551,7 @@ def _start_run(
             external_runtime_owned=gateway_chat_enabled,
             goal_related=goal_related,
             continuation_claim_id=continuation_claim_id,
+            maintenance_handoff=maintenance_handoff,
         )
 
     # A runner-owned continuation must stay with the WebUI scheduler.  The
@@ -22542,6 +22582,7 @@ def _start_run(
                 moa_config=moa_config,
                 external_runtime_owned=gateway_chat_enabled,
                 continuation_claim_id=continuation_claim_id,
+                maintenance_handoff=maintenance_handoff,
             )
 
         def _legacy_adapter_factory():
@@ -22588,6 +22629,7 @@ def _start_run(
         moa_config=moa_config,
         external_runtime_owned=gateway_chat_enabled,
         continuation_claim_id=continuation_claim_id,
+        maintenance_handoff=maintenance_handoff,
     )
 
 
@@ -22663,12 +22705,13 @@ def start_session_turn(
     )
 
     try:
-        with webui_server_turn_admission():
+        with webui_server_turn_admission() as maintenance_handoff:
             return _start_session_turn_impl(
                 session_id,
                 message,
                 source=source,
                 continuation_claim_id=continuation_claim_id,
+                _maintenance_handoff=maintenance_handoff,
             )
     except WebUIMaintenanceInProgress:
         return {
@@ -22684,6 +22727,7 @@ def _start_session_turn_impl(
     *,
     source: str = "process_wakeup",
     continuation_claim_id: str | None = None,
+    _maintenance_handoff=None,
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
 
@@ -22885,6 +22929,7 @@ def _start_session_turn_impl(
         route="start_session_turn",
         goal_related=(turn_source == "goal_continuation"),
         continuation_claim_id=continuation_claim_id,
+        maintenance_handoff=_maintenance_handoff,
     )
 
     # ── Defect B: live-view of server-initiated turns ──────────────────────
