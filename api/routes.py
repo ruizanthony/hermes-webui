@@ -13212,6 +13212,25 @@ def handle_get(handler, parsed) -> bool:
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
             }
+            # Effective-vs-configured compression threshold: resolve with the
+            # SAME rules the agent's compressor applies (per-model overrides,
+            # codex autoraise, 75% small-window floor) so the context tooltip
+            # names the trigger actually in force instead of the configured
+            # value (the 2026-08-15 incident displayed as if 45% applied
+            # while the backend compressed at the 75% floor).
+            try:
+                from api.compression_threshold import effective_threshold_percent_info
+
+                _threshold_info = effective_threshold_percent_info(
+                    model=(effective_model or getattr(s, "model", "") or ""),
+                    context_length=_persisted_cl or getattr(s, "context_length", None),
+                    config_data=get_config() or {},
+                )
+                raw["threshold_percent_configured"] = _threshold_info["configured_percent"]
+                raw["threshold_percent_effective"] = _threshold_info["effective_percent"]
+                raw["threshold_floor_applied"] = _threshold_info["floor_applied"]
+            except Exception:
+                pass
             if original_stream_id:
                 try:
                     journal = find_run_summary(original_stream_id)

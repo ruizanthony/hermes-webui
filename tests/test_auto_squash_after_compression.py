@@ -61,6 +61,8 @@ def _snapshot_session(tmp_path):
         compaction_generation=None,
         truncation_watermark=None,
         truncation_boundary=None,
+        last_prompt_tokens=0,
+        post_compression_context_tokens_estimate=None,
         read_only=False,
         profile="default",
         path=path,
@@ -78,7 +80,8 @@ def _snapshot_session(tmp_path):
                 "anchor_activity_scenes", "compression_anchor_visible_idx",
                 "compression_anchor_message_key", "compression_anchor_summary",
                 "compression_anchor_mode", "compaction_generation", "truncation_watermark",
-                "truncation_boundary", "read_only", "profile",
+                "truncation_boundary", "last_prompt_tokens",
+                "post_compression_context_tokens_estimate", "read_only", "profile",
             )
         }
         payload["message_count"] = len(session.messages)

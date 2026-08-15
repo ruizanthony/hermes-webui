@@ -6465,6 +6465,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       let d={};
       try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
       if(d.session_id&&d.session_id!==activeSid) return;
+      // Authoritative usage snapshot: the backend publishes the exact
+      // context_length / threshold / prompt values its preflight decision was
+      // made on. Apply them to the gauge BEFORE the "Compressing context"
+      // divider renders, so the displayed percentage matches the trigger the
+      // user is about to read about (2026-08-15 incident: 29% shown while the
+      // backend compressed at 78%).
+      if(d.usage&&typeof d.usage==='object'){
+        S.lastUsage=typeof _mergeUsageForCtxIndicator==='function'
+          ? _mergeUsageForCtxIndicator(d.usage,S.lastUsage||{})
+          : {...(S.lastUsage||{}),...d.usage};
+        if(typeof _syncCtxIndicator==='function') _syncCtxIndicator(S.lastUsage);
+      }
       _applyToAnchor('compressing',d,e);
       const state={
         sessionId:activeSid,

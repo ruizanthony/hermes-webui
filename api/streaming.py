@@ -5793,6 +5793,158 @@ def _estimate_post_compression_context_tokens(agent, context_messages, system_me
         return None
 
 
+def _threshold_percent_usage_fields(agent) -> dict:
+    """Authoritative effective-vs-configured threshold fields for usage payloads.
+
+    Mirrors the agent-side compressor's own state (configured percent,
+    floor-applied percent) so the gauge, the preflight decision, and the
+    "Compressing context" event all name the SAME numbers. The 2026-08-15
+    incident displayed 29% against a 75% effective trigger while the docs and
+    the configured 45% implied a different threshold applied.
+    """
+    compressor = getattr(agent, "context_compressor", None) if agent is not None else None
+    try:
+        from api.compression_threshold import threshold_percent_fields_for_compressor
+
+        return threshold_percent_fields_for_compressor(compressor)
+    except Exception:
+        return {}
+
+
+def _compression_start_event_payload(session_id: str, agent) -> dict:
+    """Build the SSE 'compressing' event with an authoritative usage snapshot.
+
+    The agent's preflight compression decision is made on its compressor's
+    (context_length, threshold_tokens, last_prompt_tokens). Publishing those
+    exact values with the event means the gauge refreshes to the backend's
+    own input BEFORE the "Compressing context" divider renders — the 2026-08-15
+    incident showed 29% in the gauge at the moment the backend was compressing
+    at 78%.
+    """
+    payload: dict = {"session_id": session_id, "message": "Compressing context", "usage": {}}
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return payload
+    usage: dict = {}
+    for field in ("context_length", "threshold_tokens", "last_prompt_tokens"):
+        value = getattr(compressor, field, None)
+        if isinstance(value, (int, float)) and value > 0:
+            usage[field] = int(value)
+    usage.update(_threshold_percent_usage_fields(agent))
+    payload["usage"] = usage
+    return payload
+
+
+def _publish_pre_turn_usage_snapshot(session_id: str, session, agent, put) -> None:
+    """Publish the authoritative context usage before run_conversation().
+
+    The preflight compression check runs INSIDE run_conversation(); when it
+    decides to compress, the "Compressing context" status fires before the
+    first model call. Without a pre-turn publication the gauge keeps the stale
+    pre-turn numbers (the 2026-08-15 incident: 79,814 tokens / 29% displayed
+    while preflight evaluated ~212K / 78%). Publishing the session's current
+    counters plus the compressor's threshold fields right before the run makes
+    the displayed percentage the same value the backend uses for its decision.
+
+    Fail-open: any error leaves the turn untouched.
+    """
+    try:
+        usage: dict = {}
+        for field in (
+            "context_length",
+            "threshold_tokens",
+            "last_prompt_tokens",
+            "input_tokens",
+            "output_tokens",
+            "estimated_cost",
+            "cache_read_tokens",
+            "cache_write_tokens",
+        ):
+            value = getattr(session, field, None)
+            if isinstance(value, (int, float)) and value > 0:
+                usage[field] = int(value) if field != "estimated_cost" else value
+        estimate = getattr(session, "post_compression_context_tokens_estimate", None)
+        if isinstance(estimate, int) and estimate > 0:
+            usage["post_compression_context_tokens_estimate"] = estimate
+        usage.update(_threshold_percent_usage_fields(agent))
+        put("metering", {
+            "session_id": session_id,
+            "usage": usage,
+            "estimated": True,
+            "pre_turn": True,
+        })
+    except Exception:
+        logger.debug("pre-turn usage snapshot failed for %s", session_id, exc_info=True)
+
+
+def _squash_detach_eligible(session) -> bool:
+    """Verified manual-squash state check, shared with session_squash.
+
+    The durable, squash-specific marker is ``_squash_summary`` on the first
+    transcript message: only a squash (in-process job or skill script) sets
+    it, and it survives post-squash turns (the summary stays the first
+    message). Checking watermark == boundary alone would miss legacy squashed
+    sessions that already ran a turn after the squash — exactly the
+    2026-08-15 session, whose watermark advanced past the boundary during
+    that turn while the state.db row kept ``end_reason='compression'``.
+    """
+    try:
+        from api.session_squash import is_verified_manual_squash_state
+
+        return is_verified_manual_squash_state(session)
+    except Exception:
+        return False
+
+
+def _detach_rotated_lineage_for_squashed_session(session) -> None:
+    """Turn-start repair for sessions squashed before the lineage detach existed.
+
+    Squashes applied before this fix compacted the sidecar but left the
+    state.db sessions row marked ``end_reason='compression'``; the agent's
+    turn-start recovery then re-injected the archived lineage (2026-08-15
+    incident). This guard reopens such rows lazily — fail-open, idempotent
+    (a reopened row no longer matches the compression check).
+    """
+    if session is None or not _squash_detach_eligible(session):
+        return
+    sid = str(getattr(session, "session_id", None) or "").strip()
+    if not sid:
+        return
+    try:
+        from api.session_squash import detach_state_db_compression_lineage
+
+        detach_state_db_compression_lineage(
+            sid, profile=getattr(session, "profile", None)
+        )
+    except Exception:
+        logger.debug("turn-start squash lineage detach failed for %s", sid, exc_info=True)
+
+
+def _repair_corrupted_squashed_context(session) -> None:
+    """Turn-start repair of context_messages re-injected before this fix.
+
+    The 2026-08-15 incident persisted 90 pre-squash rows back into
+    ``context_messages`` of a squashed session. The lineage detach prevents
+    NEW re-injections, but sessions already corrupted need their foreign rows
+    pruned — they carry timestamps strictly before the squash boundary, which
+    no legitimate post-squash content can have. Runs BEFORE the turn's
+    reconciliation so the repaired context is what reaches the agent and the
+    usage snapshot. Fail-open.
+    """
+    if session is None or not _squash_detach_eligible(session):
+        return
+    try:
+        from api.session_squash import repair_reinjected_pre_squash_context
+
+        repair_reinjected_pre_squash_context(session)
+    except Exception:
+        logger.debug(
+            "turn-start squash context repair failed for %s",
+            getattr(session, "session_id", None),
+            exc_info=True,
+        )
+
+
 def _restore_reasoning_metadata(previous_messages, updated_messages):
     """Carry forward display-only metadata lost during API-safe history sanitization.
 
@@ -8799,6 +8951,15 @@ def _run_agent_streaming(
                         _usage['context_length'] = _cc_cl_u
                         _usage['threshold_tokens'] = getattr(_cc, 'threshold_tokens', 0) or 0
                         _usage['last_prompt_tokens'] = getattr(_cc, 'last_prompt_tokens', 0) or 0
+                    # Effective-vs-configured threshold triple: the same values
+                    # the preflight decision uses, so the gauge tooltip never
+                    # implies the configured 45-50% applies while the 75%
+                    # small-window floor is actually triggering (2026-08-15).
+                    try:
+                        from api.compression_threshold import threshold_percent_fields_for_compressor
+                        _usage.update(threshold_percent_fields_for_compressor(_cc))
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -8927,10 +9088,7 @@ def _run_agent_streaming(
         ):
             _captured_terminal_error[0] = _message
         if _is_agent_compression_start_status(_kind, _message):
-            put('compressing', {
-                'session_id': session_id,
-                'message': 'Compressing context',
-            })
+            put('compressing', _compression_start_event_payload(session_id, agent))
             return
         # Pass through rate-limit and fallback messages so the frontend can
         # show them as warnings via the existing messages.js 'warning' listener.
@@ -10375,6 +10533,17 @@ def _run_agent_streaming(
             # or has been zeroed out (e.g. via a buggy migration / manual file edit).
             # Truthy-check covers None, missing-attr, and 0 uniformly.
             _turn_started_at = _pending_started_at if _pending_started_at else time.time()
+            # Legacy sessions squashed before the state.db lineage detach
+            # existed can still carry end_reason='compression'; the agent's
+            # turn-start recovery would otherwise re-inject the archived
+            # history (2026-08-15 incident). The companion repair prunes
+            # already re-injected pre-squash rows from context_messages.
+            # Both run BEFORE reconciliation so the repaired context is what
+            # reaches the agent and the pre-turn usage snapshot. Fail-open,
+            # idempotent.
+            with _agent_lock:
+                _detach_rotated_lineage_for_squashed_session(s)
+                _repair_corrupted_squashed_context(s)
             _external_state_messages = get_state_db_session_messages(getattr(s, 'session_id', None))
             _previous_messages = list(
                 reconciled_state_db_messages_for_session(
@@ -10506,6 +10675,12 @@ def _run_agent_streaming(
                     requested_provider=(_session_requested_provider or ""),
                 )
                 _run_conversation_kwargs["user_message"] = user_message
+            # Publish the authoritative usage snapshot BEFORE
+            # run_conversation(): the preflight compression decision happens
+            # inside it, and the gauge must already show the backend's input
+            # when "Compressing context" renders (2026-08-15 incident: 29%
+            # displayed while preflight compressed at 78%).
+            _publish_pre_turn_usage_snapshot(session_id, s, agent, put)
             result = agent.run_conversation(**_run_conversation_kwargs)
             _active_turn_identity = _resolve_active_turn_authority(
                 _active_turn_identity,

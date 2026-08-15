@@ -6897,6 +6897,14 @@ function _mergeUsageForCtxIndicator(latest, fallback){
       merged[field]=fallbackObj[field];
     }
   }
+  // Threshold-percent triple (effective vs configured + floor flag): keep the
+  // freshest non-null value from either side so a payload that omits the
+  // fields never wipes an already-explained effective threshold.
+  for(const field of ['threshold_percent_configured','threshold_percent_effective','threshold_floor_applied']){
+    if(merged[field]==null&&fallbackObj[field]!=null){
+      merged[field]=fallbackObj[field];
+    }
+  }
   if(!Object.hasOwn(latestObj,'post_compression_context_tokens_estimate')&&fallbackObj.post_compression_context_tokens_estimate!=null){
     merged.post_compression_context_tokens_estimate=fallbackObj.post_compression_context_tokens_estimate;
   }
@@ -6988,6 +6996,17 @@ function _syncCtxIndicator(usage){
   if(thresholdLine){
     if(threshold&&ctxWindow){
       thresholdText=`Auto-compress at ${_fmtTokens(threshold)} (${Math.round(threshold/ctxWindow*100)}%)`;
+      // Effective-vs-configured threshold explanation: the agent applies a
+      // 75% small-window floor (raise-only) for models under 512K, so the
+      // trigger in force can legitimately exceed the configured value.
+      // Name both numbers instead of letting the reader assume the
+      // configured 45-50% applies (2026-08-15 incident).
+      const floorApplied=usage.threshold_floor_applied===true;
+      const configuredPct=Number(usage.threshold_percent_configured)||0;
+      const effectivePct=Number(usage.threshold_percent_effective)||0;
+      if(floorApplied&&configuredPct>0&&effectivePct>0&&effectivePct>configuredPct){
+        thresholdText+=` \u2014 ${t('ctx_threshold_floor_note', Math.round(effectivePct*100), Math.round(configuredPct*100))}`;
+      }
       thresholdLine.style.display='';
       thresholdLine.textContent=thresholdText;
     }else{
