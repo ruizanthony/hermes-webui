@@ -468,13 +468,32 @@ def inspect_session_recovery_status(session_path: Path) -> dict:
     }
 
 
-def recover_session(
-    session_path: Path,
-    *,
-    state_db_path: Path | None = None,
-) -> dict:
-    """Restore from .bak without superseding a newer sidecar generation."""
-    from api.models import _session_sidecar_authority
+def _recovery_source_identity(models, session_path: Path):
+    """Return a CAS token for a valid or malformed live sidecar.
+
+    Recovery must be able to replace malformed JSON, but it must not turn a
+    parse failure into an unfenced write. Valid sidecars retain their complete
+    generation/epoch/digest revision; malformed bytes use a tagged raw digest
+    that is re-read immediately before publication under the same SID
+    authority.
+    """
+    try:
+        revision = models._read_sidecar_revision(session_path)
+    except RuntimeError:
+        if not session_path.exists():
+            return None
+        try:
+            return ('malformed', models._sidecar_content_digest(session_path))
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(
+                f'Cannot verify recovery source for {session_path.name!r}'
+            ) from exc
+    return ('valid', revision) if revision is not None else None
+
+
+def recover_session(session_path: Path) -> dict:
+    """CAS-restore one sidecar while sharing the runtime SID authority."""
+    from api import models
 
     with _session_sidecar_authority(
         session_path.stem,
@@ -583,7 +602,13 @@ def _recover_session_owned(
         if status["recommend"] != "restore":
             return {**status, "restored": False}
 
-        revision_before = models._read_sidecar_revision(session_path)
+        source_identity_before = _recovery_source_identity(models, session_path)
+        revision_before = (
+            source_identity_before[1]
+            if source_identity_before is not None
+            and source_identity_before[0] == 'valid'
+            else None
+        )
         tmp_path = None
         try:
             backup_payload = json.loads(bak_path.read_text(encoding='utf-8'))
@@ -629,7 +654,10 @@ def _recover_session_owned(
                 handle.write(serialized)
                 handle.flush()
                 os.fsync(handle.fileno())
-            if models._read_sidecar_revision(session_path) != revision_before:
+            if (
+                _recovery_source_identity(models, session_path)
+                != source_identity_before
+            ):
                 raise RuntimeError('session changed during recovery preparation')
             if models._webui_deleted_session_is_tombstoned(
                 sid,
@@ -637,7 +665,7 @@ def _recover_session_owned(
                 strict=True,
             ):
                 raise RuntimeError('session was deleted during recovery')
-            if revision_before is None:
+            if source_identity_before is None:
                 os.link(str(tmp_path), str(session_path))
                 models._fsync_sidecar_directory(session_path.parent)
                 tmp_path.unlink(missing_ok=True)
