@@ -15627,7 +15627,18 @@ def handle_post(handler, parsed) -> bool:
                 )
             except (OSError, json.JSONDecodeError, ValueError):
                 logger.warning("session clear could not verify persisted empty state for %s", sid, exc_info=True)
-            if had_sidecar_messages and persisted_clear:
+            # Clearing an already-empty live session is not a destructive
+            # transition. Keep any older, still-recoverable backup: it may be
+            # the only durable copy after an earlier live-sidecar loss. When
+            # this request actually removed messages, however, the pre-clear
+            # backup must be retired so startup recovery cannot resurrect the
+            # history the user just cleared.
+            if persisted_clear and had_sidecar_messages:
+                live_revision = (
+                    s._sidecar_revision_v1
+                    if getattr(s, '_sidecar_revision_session_id_v1', None) == sid
+                    else _read_sidecar_revision(s.path)
+                )
                 try:
                     _retire_backup_if_owned(
                         sid,
@@ -21571,10 +21582,11 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
     cleaned = 0
     phase1_delete_candidate_ids = set()
 
-    # Phase 1: Clean orphan session files (existing behavior).
+    # Phase 1: classify and delete under the same SID authority as writers.
     for p in SESSION_DIR.glob("*.json"):
-        if p.name.startswith("_"):
+        if p.name.startswith("_") or not is_safe_session_id(p.stem):
             continue
+        sid = p.stem
         try:
             from api.models import (
                 _delete_session_sidecar_artifacts_locked,
@@ -21835,10 +21847,10 @@ def _handle_background(handler, body):
                 model_provider=model_provider,
             )
             # Reload the bg session from disk and extract the final assistant reply.
+            _answer = ""
             try:
                 from api.models import Session as _Session
                 reloaded = _Session.load(bg_sid)
-                _answer = ""
                 for _m in reversed((reloaded.messages if reloaded else None) or []):
                     if not isinstance(_m, dict) or _m.get("role") != "assistant":
                         continue
@@ -21848,16 +21860,25 @@ def _handle_background(handler, body):
                     if _content:
                         _answer = _content
                         break
-                complete_background(parent_sid, task_id, _answer or "(no answer produced)")
             except Exception:
-                complete_background(parent_sid, task_id, "(background task failed)")
-            # Best-effort cleanup of the hidden bg session file so it doesn't
-            # clutter the sidebar or SESSION_DIR. The index is pruned on the
-            # next rebuild via _index_entry_exists().
+                _answer = "(background task failed)"
+            # Do not acknowledge success until the hidden transcript and every
+            # recovery artifact are durably fenced and removed.
             try:
                 _delete_hidden_background_session_sidecar(bg_sid)
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to durably delete hidden background session %s",
+                    bg_sid,
+                    exc_info=True,
+                )
+                complete_background(
+                    parent_sid,
+                    task_id,
+                    "(background task cleanup failed)",
+                )
+                return
+            complete_background(parent_sid, task_id, _answer or "(no answer produced)")
         except Exception:
             try:
                 complete_background(parent_sid, task_id, "(background task failed)")

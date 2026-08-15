@@ -191,12 +191,33 @@ def _set_file_descriptor_mode(descriptor: int, mode: int) -> None:
         fchmod(descriptor, mode)
 
 
+def _fsync_sidecar_directory(directory: Path) -> None:
+    """Durably publish sidecar directory entry changes where supported."""
+    if os.name == 'nt':
+        return
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+    descriptor = os.open(Path(directory), flags)
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                raise
+    finally:
+        os.close(descriptor)
+
+
 # Serializes index writers so concurrent Session.save() calls cannot race on
 # stale baselines while still allowing LOCK to be released before disk I/O.
 _INDEX_WRITE_LOCK = threading.RLock()
 _SESSION_SAVE_AUTHORITIES_LOCK = threading.Lock()
 _SESSION_SAVE_AUTHORITIES: "weakref.WeakValueDictionary[str, threading.RLock]" = weakref.WeakValueDictionary()
 _INLINE_REPLAY_REPAIR_MAX_BYTES = 128 * 1024 * 1024
+_SESSION_SAVE_AUTHORITIES_LOCK = threading.Lock()
+_SESSION_SAVE_AUTHORITIES: "weakref.WeakValueDictionary[str, threading.RLock]" = weakref.WeakValueDictionary()
+_WORKSPACE_BINDING_REVISION_RECEIPTS_LOCK = threading.Lock()
+_WORKSPACE_BINDING_REVISION_RECEIPTS: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_WORKSPACE_BINDING_REVISION_RECEIPTS_MAX = 2000
 _SESSION_INDEX_REBUILD_LOCK = threading.Lock()
 _SESSION_INDEX_REBUILD_THREAD = None
 _SESSION_INDEX_REBUILD_THREAD_TARGET: tuple[Path, Path] | None = None
@@ -832,38 +853,34 @@ def is_safe_session_id(sid) -> bool:
     return all(c in _SAFE_SID_CHARS for c in sid)
 
 
-def _delete_offline_replay_artifacts(sidecar: Path) -> int:
-    """Remove plaintext backup/manifest/temp artifacts owned by one sidecar."""
+def _offline_replay_artifact_paths(sidecar: Path):
+    """Yield replay-v10 artifacts owned by one safe session sidecar."""
     sidecar = Path(sidecar)
     if sidecar.suffix != '.json' or not is_safe_session_id(sidecar.stem):
         raise ValueError(f'Unsafe session sidecar path: {sidecar}')
     name = sidecar.name
+    patterns = (
+        f'{name}.replay-v10.*.bak',
+        f'_replay-v10.{name}.*.manifest.json',
+        f'.{name}.replay-v10.tmp.*',
+        f'.{name}.replay-v10.restore.*',
+        f'._replay-v10.{name}.*.manifest.json.tmp.*',
+    )
+    seen = set()
+    for pattern in patterns:
+        for candidate in sidecar.parent.glob(pattern):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.is_file() or candidate.is_symlink():
+                yield candidate
 
-    def is_owned_artifact(candidate_name: str) -> bool:
-        return bool(
-            (
-                candidate_name.startswith(f'{name}.replay-v10.')
-                and candidate_name.endswith('.bak')
-            )
-            or (
-                candidate_name.startswith(f'_replay-v10.{name}.')
-                and candidate_name.endswith('.manifest.json')
-            )
-            or candidate_name.startswith(f'.{name}.replay-v10.tmp.')
-            or candidate_name.startswith(f'.{name}.replay-v10.restore.')
-            or (
-                candidate_name.startswith(f'._replay-v10.{name}.')
-                and '.manifest.json.tmp.' in candidate_name
-            )
-        )
 
+def _delete_offline_replay_artifacts(sidecar: Path) -> int:
+    """Remove all plaintext replay artifacts owned by one sidecar."""
     removed = 0
     first_error = None
-    for candidate in sidecar.parent.iterdir():
-        if not is_owned_artifact(candidate.name):
-            continue
-        if not (candidate.is_file() or candidate.is_symlink()):
-            continue
+    for candidate in _offline_replay_artifact_paths(sidecar):
         try:
             candidate.unlink()
             removed += 1
@@ -873,6 +890,109 @@ def _delete_offline_replay_artifacts(sidecar: Path) -> int:
     if first_error is not None:
         raise first_error
     return removed
+
+
+def _invalidate_cached_session_generation(session_id: str) -> None:
+    """Evict and poison a cached alias after an out-of-band mutation."""
+    with LOCK:
+        cached = SESSIONS.pop(session_id, None)
+        if cached is not None:
+            cached._sidecar_revision_session_id_v1 = session_id
+            cached._sidecar_revision_v1 = (-1, None, None)
+
+
+def _delete_session_recovery_artifacts_locked(
+    sid: str,
+    *,
+    session_dir: Path | None = None,
+    expected_live_revision=None,
+) -> bool:
+    """Delete backup/manifest/temp artifacts without deleting the live sidecar."""
+    if not is_safe_session_id(sid):
+        raise ValueError(f"Unsafe session_id {sid!r}")
+    directory = Path(session_dir or SESSION_DIR)
+    sidecar = directory / f'{sid}.json'
+    if (
+        expected_live_revision is not None
+        and _read_sidecar_revision(sidecar) != expected_live_revision
+    ):
+        return False
+    failures = []
+    backup = sidecar.with_suffix('.json.bak')
+    recovery_paths = [backup]
+    recovery_paths.extend(directory.glob(f'{sidecar.name}.bak.archive-*'))
+    for artifact in recovery_paths:
+        try:
+            artifact.unlink(missing_ok=True)
+        except Exception as exc:
+            failures.append(exc)
+    try:
+        _delete_offline_replay_artifacts(sidecar)
+    except Exception as exc:
+        failures.append(exc)
+    remaining = any(path.exists() for path in recovery_paths)
+    remaining = remaining or any(_offline_replay_artifact_paths(sidecar))
+    remaining = remaining or any(directory.glob(f'{sidecar.name}.bak.archive-*'))
+    _fsync_sidecar_directory(directory)
+    if failures or remaining:
+        cause = failures[0] if failures else None
+        raise RuntimeError(
+            f"Failed to delete required recovery artifacts for {sid!r}"
+        ) from cause
+    return True
+
+
+class SessionDeleteTombstoneError(RuntimeError):
+    """A sidecar delete could not durably fence stale writers."""
+
+
+def _delete_session_sidecar_artifacts_locked(
+    sid: str,
+    *,
+    session_dir: Path | None = None,
+    expected_revision=None,
+    record_tombstone: bool = True,
+) -> bool:
+    """Delete one SID's complete sidecar family while its authority is held."""
+    if not is_safe_session_id(sid):
+        raise ValueError(f"Unsafe session_id {sid!r}")
+    directory = Path(session_dir or SESSION_DIR)
+    sidecar = directory / f'{sid}.json'
+    if expected_revision is not None:
+        if _read_sidecar_revision(sidecar) != expected_revision:
+            return False
+    if record_tombstone:
+        try:
+            _record_webui_deleted_session_tombstone(sid)
+        except Exception as exc:
+            raise SessionDeleteTombstoneError(
+                f"Failed to durably tombstone deleted WebUI session {sid!r}"
+            ) from exc
+
+    _invalidate_cached_session_generation(sid)
+    failures = []
+    required = [sidecar, sidecar.with_suffix('.json.bak')]
+    required.extend(directory.glob(f'{sidecar.name}.bak.archive-*'))
+    for artifact in required:
+        try:
+            artifact.unlink(missing_ok=True)
+        except Exception as exc:
+            failures.append(exc)
+    try:
+        _delete_offline_replay_artifacts(sidecar)
+    except Exception as exc:
+        failures.append(exc)
+
+    remaining = any(path.exists() for path in required)
+    remaining = remaining or any(_offline_replay_artifact_paths(sidecar))
+    remaining = remaining or any(directory.glob(f'{sidecar.name}.bak.archive-*'))
+    _fsync_sidecar_directory(directory)
+    if failures or remaining:
+        cause = failures[0] if failures else None
+        raise RuntimeError(
+            f"Failed to delete required sidecar artifacts for {sid!r}"
+        ) from cause
+    return True
 
 
 def _file_contains_bytes(path: Path, needle: bytes) -> bool:
@@ -1420,31 +1540,66 @@ def _clear_webui_zero_message_orphan_tombstone(sid: str) -> None:
             )
 
 
-def _webui_deleted_session_tombstone_file() -> "Path":
-    return SESSION_DIR / "_deleted_webui_sessions.json"
+def _webui_deleted_session_tombstone_file(
+    session_dir: Path | None = None,
+) -> "Path":
+    return Path(session_dir or SESSION_DIR) / "_deleted_webui_sessions.json"
 
 
-def _load_webui_deleted_session_tombstone() -> frozenset[str]:
-    p = _webui_deleted_session_tombstone_file()
+def _load_webui_deleted_session_tombstone_ids(
+    *,
+    session_dir: Path | None = None,
+    strict: bool = False,
+) -> list[str]:
+    p = _webui_deleted_session_tombstone_file(session_dir)
     if not p.exists():
-        return frozenset()
+        return []
     try:
         raw = json.loads(p.read_text(encoding='utf-8'))
+        if not isinstance(raw, dict):
+            raise ValueError('deleted-session tombstone must be an object')
+        if int(raw.get('version', 0)) != WEBUI_DELETED_SESSION_TOMBSTONE_VERSION:
+            raise ValueError('unsupported deleted-session tombstone version')
+        ids = raw.get('ids', [])
+        if not isinstance(ids, list):
+            raise ValueError('deleted-session tombstone ids must be a list')
     except Exception:
+        if strict:
+            raise
         logger.debug("Failed to load webui deleted-session tombstone", exc_info=True)
-        return frozenset()
-    if not isinstance(raw, dict):
-        return frozenset()
-    try:
-        if int(raw.get("version", 0)) != WEBUI_DELETED_SESSION_TOMBSTONE_VERSION:
-            return frozenset()
-    except (TypeError, ValueError):
-        return frozenset()
-    ids = raw.get("ids", [])
-    if not isinstance(ids, list):
-        return frozenset()
+        return []
+    ordered = []
+    seen = set()
+    for value in ids:
+        sid = str(value or '').strip()
+        if sid and sid not in seen:
+            seen.add(sid)
+            ordered.append(sid)
+    return ordered
+
+
+def _load_webui_deleted_session_tombstone(
+    *,
+    session_dir: Path | None = None,
+    strict: bool = False,
+) -> frozenset[str]:
     return frozenset(
-        str(sid).strip() for sid in ids if str(sid or "").strip()
+        _load_webui_deleted_session_tombstone_ids(
+            session_dir=session_dir,
+            strict=strict,
+        )
+    )
+
+
+def _webui_deleted_session_is_tombstoned(
+    sid: str,
+    *,
+    session_dir: Path | None = None,
+    strict: bool = False,
+) -> bool:
+    return sid in _load_webui_deleted_session_tombstone_ids(
+        session_dir=session_dir,
+        strict=strict,
     )
 
 
@@ -1476,7 +1631,7 @@ def _save_webui_deleted_session_tombstone(
             sorted_ids = sorted_ids[-WEBUI_DELETED_SESSION_TOMBSTONE_CAP:]
     payload = {
         "version": WEBUI_DELETED_SESSION_TOMBSTONE_VERSION,
-        "ids": sorted_ids,
+        "ids": ordered_ids,
     }
     p = _webui_deleted_session_tombstone_file()
     _tmp = None
@@ -1486,6 +1641,7 @@ def _save_webui_deleted_session_tombstone(
             f'.tmp.{os.getpid()}.{threading.current_thread().ident}'
         )
         with open(_tmp, 'w', encoding='utf-8') as f:
+            _set_file_descriptor_mode(f.fileno(), 0o600)
             json.dump(payload, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
@@ -1526,12 +1682,18 @@ def _clear_webui_deleted_session_tombstone(sid: str) -> None:
         current = set(_load_webui_deleted_session_tombstone())
         if sid not in current:
             return
-        current.discard(sid)
-        if current:
-            _save_webui_deleted_session_tombstone(current)
+        ordered = [
+            current_sid
+            for current_sid in _load_webui_deleted_session_tombstone_ids(strict=True)
+            if current_sid != sid
+        ]
+        if ordered:
+            _save_webui_deleted_session_tombstone(ordered)
             return
         try:
-            _webui_deleted_session_tombstone_file().unlink(missing_ok=True)
+            p = _webui_deleted_session_tombstone_file()
+            p.unlink(missing_ok=True)
+            _fsync_sidecar_directory(p.parent)
         except Exception:
             logger.debug("Failed to remove empty webui deleted-session tombstone", exc_info=True)
 
@@ -7397,14 +7559,7 @@ def persist_recovered_workspace_binding(
     *,
     expected_workspace=_EXPECTED_WORKSPACE_UNSET,
 ):
-    """Atomically persist only a recovered session's workspace binding.
-
-    Existing sidecars are patched as raw JSON so metadata-only callers never
-    reserialize (or otherwise clobber) the transcript. Missing sidecars fail
-    closed so recovery cannot resurrect a concurrently deleted session. The
-    per-session mutation lock keeps compare-and-replace ordered with other
-    compliant session writers.
-    """
+    """CAS-patch a recovered workspace without reserializing a stale Session."""
     sid = str(getattr(session, "session_id", "") or "").strip()
     if not sid or not is_safe_session_id(sid):
         raise WorkspaceBindingPersistenceError(

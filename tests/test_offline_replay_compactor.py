@@ -210,13 +210,21 @@ def test_compactor_rejects_session_id_too_long_for_artifact_names(tmp_path):
     assert not list(tmp_path.glob("*replay-v10*"))
 
 
-def test_offline_compactor_uses_shared_partial_identity(tmp_path):
+def test_offline_compactor_preserves_distinct_strict_partials(
+    tmp_path,
+    monkeypatch,
+):
     from api import models
     from scripts import compact_session_replays as compactor
 
     assert (
         compactor._repo_partial_message_signature
         is models._partial_message_signature
+    )
+    monkeypatch.setattr(
+        compactor,
+        "_repo_partial_message_signature",
+        compactor._message_digest,
     )
 
     sidecar = tmp_path / "partial-replays.json"
@@ -245,6 +253,7 @@ def test_offline_compactor_uses_shared_partial_identity(tmp_path):
         "model": "provider-b/model",
         "request_id": "request-b",
     }
+    assert type(compactor._message_digest(first)) is bytes
     sidecar.write_text(
         json.dumps(
             {
@@ -265,6 +274,59 @@ def test_offline_compactor_uses_shared_partial_identity(tmp_path):
         "removed": 0,
     }
     assert repaired["messages"] == [first, second]
+
+
+def test_offline_compactor_collapses_identical_partials_with_bytes_signature(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import compact_session_replays as compactor
+
+    monkeypatch.setattr(
+        compactor,
+        "_repo_partial_message_signature",
+        compactor._message_digest,
+    )
+    sidecar = tmp_path / "identical-partial-replays.json"
+    partial = {
+        "role": "assistant",
+        "content": "partial answer",
+        "reasoning": "same reasoning",
+        "_partial": True,
+        "timestamp": 1000,
+        "model": "provider-a/model",
+        "request_id": "request-a",
+        "_partial_tool_calls": [
+            {
+                "name": "lookup",
+                "args": {"query": "same"},
+                "done": False,
+            }
+        ],
+    }
+    duplicate = json.loads(json.dumps(partial))
+    assert type(compactor._message_digest(partial)) is bytes
+    sidecar.write_text(
+        json.dumps(
+            {
+                "session_id": "identical-partial-replays",
+                "messages": [partial, duplicate],
+                "context_messages": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = compactor.compact_sidecar(sidecar)
+    repaired = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    assert result["status"] == "compacted"
+    assert result["arrays"]["messages"] == {
+        "input": 2,
+        "output": 1,
+        "removed": 1,
+    }
+    assert repaired["messages"] == [partial]
 
 
 def test_offline_compactor_memory_is_bounded_for_many_replays(tmp_path):
@@ -621,6 +683,54 @@ def test_runtime_save_preserves_and_advances_sidecar_generation(tmp_path, monkey
     assert persisted["_sidecar_generation_v1"] == 8
 
 
+def test_fresh_runtime_writer_adopts_existing_sidecar_revision(tmp_path, monkeypatch):
+    from api import models
+
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", tmp_path / "_index.json")
+    original = models.Session(session_id="fresh-writer")
+    original.messages = [{"role": "user", "content": "original"}]
+    original.save(skip_index=True)
+    original_payload = json.loads(original.path.read_text(encoding="utf-8"))
+
+    replacement = models.Session(
+        session_id="fresh-writer",
+        title="replacement",
+        messages=[{"role": "user", "content": "replacement"}],
+    )
+    assert replacement._sidecar_revision_v1 is None
+
+    replacement.save(skip_index=True)
+
+    persisted = json.loads(replacement.path.read_text(encoding="utf-8"))
+    assert persisted["title"] == "replacement"
+    assert persisted["messages"] == replacement.messages
+    assert persisted["_sidecar_generation_v1"] == 2
+    assert persisted["_sidecar_epoch_v1"] == original_payload["_sidecar_epoch_v1"]
+
+
+def test_sidecar_revision_is_scoped_to_the_observed_session_id(tmp_path, monkeypatch):
+    from api import models
+
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", tmp_path / "_index.json")
+    session = models.Session(session_id="rotation-source")
+    session.messages = [{"role": "user", "content": "keep"}]
+    session.save(skip_index=True)
+    source_epoch = json.loads(session.path.read_text(encoding="utf-8"))[
+        "_sidecar_epoch_v1"
+    ]
+
+    session.session_id = "rotation-continuation"
+    session.save(skip_index=True)
+
+    continuation = json.loads(session.path.read_text(encoding="utf-8"))
+    assert continuation["session_id"] == "rotation-continuation"
+    assert continuation["messages"] == session.messages
+    assert continuation["_sidecar_generation_v1"] == 1
+    assert continuation["_sidecar_epoch_v1"] != source_epoch
+
+
 def test_runtime_save_rejects_owner_loaded_before_offline_compaction(
     tmp_path,
     monkeypatch,
@@ -973,7 +1083,7 @@ def test_webui_session_delete_routes_replay_v10_cleanup():
     start = routes_source.index('parsed.path == "/api/session/delete"')
     end = routes_source.index('parsed.path == "/api/session/clear"', start)
 
-    assert "_delete_offline_replay_artifacts(p)" in routes_source[start:end]
+    assert "_delete_session_sidecar_artifacts_locked(" in routes_source[start:end]
 
 
 def test_large_index_rebuild_uses_metadata_prefix(tmp_path, monkeypatch):

@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import sqlite3
+import stat as stat_module
 import threading
 import uuid
 from contextlib import closing
@@ -835,7 +836,7 @@ def recover_missing_sidecars_from_state_db(session_dir: Path, state_db_path: Pat
     session_dir.mkdir(parents=True, exist_ok=True)
     for row in rows:
         sid = str(row.get('id') or '').strip()
-        if not sid:
+        if not sid or not models.is_safe_session_id(sid):
             continue
         target = session_dir / f"{sid}.json"
         if target.exists():
@@ -900,6 +901,9 @@ def recover_missing_sidecars_from_state_db(session_dir: Path, state_db_path: Pat
             # Live sidecar appeared between the check and the link — keep it.
             pass
         except OSError as exc:
+            details.append({'session_id': sid, 'materialized': False, 'error': str(exc)})
+            detail_recorded = True
+        except Exception as exc:
             details.append({'session_id': sid, 'materialized': False, 'error': str(exc)})
             detail_recorded = True
         finally:
