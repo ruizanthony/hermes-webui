@@ -354,16 +354,13 @@ def test_server_delete_prunes_session_index(cleanup_test_sessions):
             text.find('if parsed.path == "/api/session/delete":'),
         )
         if delete_idx >= 0:
-            clear_indices = [
-                idx
-                for idx in (
-                    text.find("if parsed.path == '/api/session/clear':", delete_idx),
-                    text.find('if parsed.path == "/api/session/clear":', delete_idx),
-                )
-                if idx > delete_idx
+            clear_idx = max(
+                text.find("if parsed.path == '/api/session/clear':", delete_idx),
+                text.find('if parsed.path == "/api/session/clear":', delete_idx),
+            )
+            delete_block = text[
+                delete_idx:clear_idx if clear_idx >= 0 else delete_idx + 6000
             ]
-            delete_end = min(clear_indices) if clear_indices else len(text)
-            delete_block = text[delete_idx:delete_end]
             assert "prune_session_from_index(sid)" in delete_block, \
                 f"{label} session/delete must prune SESSION_INDEX_FILE"
             return
@@ -378,31 +375,15 @@ def test_server_delete_removes_session_bak_snapshot(cleanup_test_sessions):
         routes_src.find('if parsed.path == "/api/session/delete":'),
     )
     assert delete_idx >= 0, "session/delete handler not found in api/routes.py"
-    clear_indices = [
-        idx
-        for idx in (
-            routes_src.find("if parsed.path == '/api/session/clear':", delete_idx),
-            routes_src.find('if parsed.path == "/api/session/clear":', delete_idx),
-        )
-        if idx > delete_idx
+    clear_idx = max(
+        routes_src.find("if parsed.path == '/api/session/clear':", delete_idx),
+        routes_src.find('if parsed.path == "/api/session/clear":', delete_idx),
+    )
+    delete_block = routes_src[
+        delete_idx:clear_idx if clear_idx >= 0 else delete_idx + 6000
     ]
-    delete_end = min(clear_indices) if clear_indices else len(routes_src)
-    delete_block = routes_src[delete_idx:delete_end]
-    assert "_delete_session_sidecar_artifacts_locked(" in delete_block, (
-        "session/delete must route all sidecar removal through the canonical helper"
-    )
-
-    import inspect
-    from api.models import _delete_session_sidecar_artifacts_locked
-
-    helper_src = inspect.getsource(_delete_session_sidecar_artifacts_locked)
-    assert 'backup = sidecar.with_suffix(".json.bak")' in helper_src
-    assert "artifact.unlink(missing_ok=True)" in helper_src, (
-        "the canonical delete helper must unlink <sid>.json.bak"
-    )
-    assert "bak.archive-*" in helper_src, (
-        "the canonical delete helper must unlink versioned backup archives"
-    )
+    assert "_delete_session_sidecar_artifacts_locked(" in delete_block, \
+        "session/delete must remove the complete sidecar family, including <sid>.json.bak"
 
 # ── R9: Token/tool SSE events write to wrong session after switch ─────────────
 

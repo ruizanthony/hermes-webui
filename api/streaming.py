@@ -79,6 +79,10 @@ from api.models import (
     _message_has_structured_replay_fields,
     _partial_message_signature as _durable_partial_message_signature,
     _strict_incomplete_message_id_key,
+    _delete_session_sidecar_artifacts_locked,
+    _is_empty_partial_activity_message,
+    _read_sidecar_revision,
+    _session_sidecar_authority,
     _evict_sessions_over_cap,
     clear_process_wakeup_pause,
     get_state_db_session_messages,
@@ -2648,6 +2652,32 @@ def _persist_cancelled_turn(session, *, message: str = 'Task cancelled.') -> Non
 
 def _clear_ephemeral_turn_state(session) -> None:
     """Clear transient stream fields on an in-memory hidden session."""
+def _cleanup_ephemeral_session_sidecar_locked(session, *, outcome: str) -> bool:
+    """Durably remove one hidden /btw sidecar without deleting a reincarnation."""
+    sid = str(getattr(session, 'session_id', '') or '').strip()
+    expected_path = SESSION_DIR / f'{sid}.json'
+    if Path(session.path).resolve() != expected_path.resolve():
+        raise ValueError(f"Ephemeral session path does not match SID {sid!r}")
+    expected_revision = None
+    if getattr(session, '_sidecar_revision_session_id_v1', None) == sid:
+        expected_revision = getattr(session, '_sidecar_revision_v1', None)
+    with _get_session_agent_lock(sid):
+        with _session_sidecar_authority(sid):
+            if expected_revision is None:
+                expected_revision = _read_sidecar_revision(expected_path)
+            deleted = _delete_session_sidecar_artifacts_locked(
+                sid,
+                expected_revision=expected_revision,
+            )
+    if not deleted:
+        raise RuntimeError(
+            f'Ephemeral session {sid!r} changed before {outcome} cleanup'
+        )
+    return True
+
+
+def _cleanup_ephemeral_cancelled_turn(session) -> None:
+    """Remove transient /btw session state after a cancel without saving it."""
     session.active_stream_id = None
     session.pending_user_message = None
     session.pending_attachments = []
@@ -2720,6 +2750,7 @@ def _cleanup_ephemeral_session_sidecar_locked(session, *, outcome: str) -> bool:
             exc_info=True,
         )
         return False
+    _cleanup_ephemeral_session_sidecar_locked(session, outcome='cancelled')
 
 
 def _resolve_current_session_for_write(session):
@@ -11443,6 +11474,7 @@ def _run_agent_streaming(
                     )
                     if _ephemeral_deleted:
                         _clear_ephemeral_turn_state(s)
+                _cleanup_ephemeral_session_sidecar_locked(s, outcome='completed')
                 return  # skip all normal persistence for ephemeral sessions
             if _checkpoint_stop is not None:
                 _checkpoint_stop.set()

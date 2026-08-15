@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import sqlite3
+import stat as stat_module
 import threading
 import uuid
 from contextlib import closing
@@ -567,10 +568,96 @@ def _recover_session_owned(
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         logger.warning("recover_session: copy failed for %s: %s", session_path, exc)
         try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return {**status, "restored": False, "error": str(exc)}
+            if models._webui_deleted_session_is_tombstoned(
+                sid,
+                session_dir=session_path.parent,
+                strict=True,
+            ):
+                return {**status, 'restored': False, 'deleted': True}
+        except Exception as exc:
+            return {
+                **status,
+                'restored': False,
+                'error': f'cannot verify delete tombstone: {exc}',
+            }
+        if status["recommend"] != "restore":
+            return {**status, "restored": False}
+
+        revision_before = models._read_sidecar_revision(session_path)
+        tmp_path = None
+        try:
+            backup_payload = json.loads(bak_path.read_text(encoding='utf-8'))
+            if not isinstance(backup_payload, dict):
+                raise ValueError('backup payload is not a session object')
+            backup_sid = backup_payload.get('session_id')
+            if backup_sid not in (None, sid):
+                raise ValueError('backup session id does not match target')
+            backup_generation = backup_payload.get('_sidecar_generation_v1', 0)
+            if type(backup_generation) is not int or backup_generation < 0:
+                raise ValueError('backup generation is invalid')
+            base_generation = (
+                revision_before[0]
+                if revision_before is not None
+                else backup_generation
+            )
+            epoch = revision_before[1] if revision_before is not None else None
+            if epoch is None:
+                backup_epoch = backup_payload.get('_sidecar_epoch_v1')
+                epoch = (
+                    backup_epoch
+                    if isinstance(backup_epoch, str)
+                    and len(backup_epoch) == 32
+                    and all(char in '0123456789abcdef' for char in backup_epoch)
+                    else uuid.uuid4().hex
+                )
+            backup_payload['session_id'] = sid
+            backup_payload['_sidecar_generation_v1'] = base_generation + 1
+            backup_payload['_sidecar_epoch_v1'] = epoch
+            serialized = json.dumps(
+                backup_payload,
+                ensure_ascii=False,
+                indent=2,
+            ).encode('utf-8')
+            tmp_path = session_path.with_suffix(
+                f'.json.recover.tmp.{os.getpid()}.{threading.current_thread().ident}'
+            )
+            source_mode = stat_module.S_IMODE(
+                (session_path if session_path.exists() else bak_path).stat().st_mode
+            )
+            with open(tmp_path, 'xb') as handle:
+                models._set_file_descriptor_mode(handle.fileno(), source_mode)
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if models._read_sidecar_revision(session_path) != revision_before:
+                raise RuntimeError('session changed during recovery preparation')
+            if models._webui_deleted_session_is_tombstoned(
+                sid,
+                session_dir=session_path.parent,
+                strict=True,
+            ):
+                raise RuntimeError('session was deleted during recovery')
+            if revision_before is None:
+                os.link(str(tmp_path), str(session_path))
+                models._fsync_sidecar_directory(session_path.parent)
+                tmp_path.unlink(missing_ok=True)
+            else:
+                os.replace(tmp_path, session_path)
+                models._fsync_sidecar_directory(session_path.parent)
+            models._invalidate_cached_session_generation(sid)
+        except Exception as exc:
+            logger.warning("recover_session: restore failed for %s: %s", session_path, exc)
+            try:
+                if tmp_path is not None:
+                    tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return {
+                **status,
+                "restored": False,
+                "stale_generation": isinstance(exc, (FileExistsError, RuntimeError)),
+                "error": str(exc),
+            }
     logger.warning(
         "recover_session: restored %s from .bak (live=%d → bak=%d messages). "
         "See #1558 for the data-loss class this guards against.",
@@ -828,7 +915,7 @@ def recover_missing_sidecars_from_state_db(session_dir: Path, state_db_path: Pat
     session_dir.mkdir(parents=True, exist_ok=True)
     for row in rows:
         sid = str(row.get('id') or '').strip()
-        if not sid:
+        if not sid or not models.is_safe_session_id(sid):
             continue
         target = session_dir / f"{sid}.json"
         if target.exists():
@@ -893,6 +980,9 @@ def recover_missing_sidecars_from_state_db(session_dir: Path, state_db_path: Pat
             # Live sidecar appeared between the check and the link — keep it.
             pass
         except OSError as exc:
+            details.append({'session_id': sid, 'materialized': False, 'error': str(exc)})
+            detail_recorded = True
+        except Exception as exc:
             details.append({'session_id': sid, 'materialized': False, 'error': str(exc)})
             detail_recorded = True
         finally:
