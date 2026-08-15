@@ -26,7 +26,6 @@ def _read(rel_path: str) -> str:
 class _DummySession:
     def __init__(self, path: str = '', session_id: str = ''):
         self.path = path
-        self.session_id = session_id
         self.messages = []
         self.active_stream_id = 'stream-1'
         self.pending_user_message = 'hello'
