@@ -1631,7 +1631,7 @@ def _save_webui_deleted_session_tombstone(
             sorted_ids = sorted_ids[-WEBUI_DELETED_SESSION_TOMBSTONE_CAP:]
     payload = {
         "version": WEBUI_DELETED_SESSION_TOMBSTONE_VERSION,
-        "ids": ordered_ids,
+        "ids": sorted_ids,
     }
     p = _webui_deleted_session_tombstone_file()
     _tmp = None

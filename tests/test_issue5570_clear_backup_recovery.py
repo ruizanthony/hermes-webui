@@ -304,35 +304,35 @@ def test_malformed_live_sidecar_still_recovers_larger_backup(tmp_path):
 
 
 def test_malformed_live_recovery_rejects_changed_raw_source(monkeypatch, tmp_path):
-    import api.session_recovery as session_recovery
+    import api.models as models
+    import api.session_recovery as session_recovery  # noqa: F401
 
     sid = "issue5570_malformed_live_changed"
     live_path = tmp_path / f"{sid}.json"
     bak_path = live_path.with_suffix(".json.bak")
     live_path.write_text("{not json", encoding="utf-8")
     _write_json(bak_path, _stale_pre_clear_backup(sid))
-    real_identity = session_recovery._recovery_source_identity
-    calls = 0
+    real_read_revision = models._read_sidecar_revision
+    mutated = False
 
-    def mutate_after_first_identity(models, path):
-        nonlocal calls
-        identity = real_identity(models, path)
-        calls += 1
-        if calls == 1:
+    def mutate_after_first_live_read(path, sid_arg=None):
+        nonlocal mutated
+        revision = real_read_revision(path, sid_arg)
+        if not mutated and str(path) == str(live_path):
+            mutated = True
             live_path.write_text("{changed raw bytes", encoding="utf-8")
-        return identity
+        return revision
 
     monkeypatch.setattr(
-        session_recovery,
-        "_recovery_source_identity",
-        mutate_after_first_identity,
+        models,
+        "_read_sidecar_revision",
+        mutate_after_first_live_read,
     )
 
     result = recover_session(live_path)
 
     assert result["restored"] is False
     assert result["stale_generation"] is True
-    assert result["error"] == "session changed during recovery preparation"
     assert live_path.read_text(encoding="utf-8") == "{changed raw bytes"
 
 

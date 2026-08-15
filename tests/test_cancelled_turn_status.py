@@ -27,7 +27,6 @@ class _DummySession:
     def __init__(self, path: str = ''):
         self.session_id = 'ephemeral-cancel-probe'
         self.path = path
-        self.session_id = session_id
         self.messages = []
         self.active_stream_id = 'stream-1'
         self.pending_user_message = 'hello'
