@@ -10,6 +10,7 @@ Validates:
 import json
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -278,41 +279,54 @@ class TestIssue765FollowupHardening:
     """
 
     def test_same_session_concurrent_saves_are_serialized_with_distinct_temp_files(
-        self,
-        monkeypatch,
+        self, monkeypatch
     ):
-        """Same-session saves serialize and never collide on one tmp path.
+        """Two same-session saves serialize and never collide on one tmp path.
 
-        Each call must reach os.replace() with a distinct source tmp path, but the
-        sidecar authority must prevent simultaneous publication for the same SID.
+        The first replace is held behind an explicit gate. The second save must
+        attempt while that gate is held but cannot reach replace until release.
+        Each serialized call must still use its own source temp path.
         """
         s = _make_session("same_sid")
         s.save(skip_index=True)  # seed the file on disk
 
         original_replace = models.os.replace
+        original_authority = models._session_sidecar_authority
+        first_at_replace = threading.Event()
+        release_first = threading.Event()
+        second_attempted_authority = threading.Event()
+        second_at_replace = threading.Event()
+        authority_lock = threading.Lock()
+        authority_calls = 0
+        replace_lock = threading.Lock()
         replace_sources = []
         errors = []
-        publication_lock = threading.Lock()
-        active_publications = 0
-        max_active_publications = 0
 
-        def _tracked_replace(src, dst):
-            nonlocal active_publications, max_active_publications
-            with publication_lock:
+        @contextmanager
+        def _tracked_authority(session_id):
+            nonlocal authority_calls
+            with authority_lock:
+                authority_calls += 1
+                call_number = authority_calls
+            if call_number == 2:
+                second_attempted_authority.set()
+            with original_authority(session_id):
+                yield
+
+        def _replace_with_gate(src, dst):
+            with replace_lock:
                 replace_sources.append(str(src))
-                active_publications += 1
-                max_active_publications = max(
-                    max_active_publications,
-                    active_publications,
-                )
-            try:
-                time.sleep(0.05)
-                return original_replace(src, dst)
-            finally:
-                with publication_lock:
-                    active_publications -= 1
+                call_number = len(replace_sources)
+            if call_number == 1:
+                first_at_replace.set()
+                if not release_first.wait(timeout=5):
+                    raise AssertionError("timed out waiting to release first replace")
+            else:
+                second_at_replace.set()
+            return original_replace(src, dst)
 
-        monkeypatch.setattr(models.os, "replace", _tracked_replace)
+        monkeypatch.setattr(models, "_session_sidecar_authority", _tracked_authority)
+        monkeypatch.setattr(models.os, "replace", _replace_with_gate)
 
         def _save_worker():
             try:
@@ -321,19 +335,29 @@ class TestIssue765FollowupHardening:
                 errors.append(e)
 
         t1 = threading.Thread(target=_save_worker)
-        t2 = threading.Thread(target=_save_worker)
         t1.start()
+        assert first_at_replace.wait(timeout=5), "first save never reached replace"
+        t2 = threading.Thread(target=_save_worker)
         t2.start()
+        assert second_attempted_authority.wait(timeout=5), (
+            "second save never attempted SID authority"
+        )
+        try:
+            assert not second_at_replace.wait(timeout=0.2), (
+                "second same-session save reached replace before first release"
+            )
+        finally:
+            release_first.set()
         t1.join(timeout=5)
         t2.join(timeout=5)
 
+        assert not t1.is_alive() and not t2.is_alive()
         assert not errors, f"Concurrent same-session saves should not fail: {errors}"
         assert len(replace_sources) >= 2, f"Expected replace calls, got {replace_sources}"
         assert len(set(replace_sources)) == 2, (
             "Concurrent same-session saves must use distinct temp files; "
             f"got {replace_sources}"
         )
-        assert max_active_publications == 1
         data = json.loads(s.path.read_text(encoding="utf-8"))
         assert data["session_id"] == "same_sid"
 

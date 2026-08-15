@@ -108,12 +108,42 @@ def test_share_revoke_makes_link_unavailable():
         created, _ = post("/api/share/create", {"session_id": sid})
         token = created["share"]["token"]
         revoked, status = post("/api/share/revoke", {"session_id": sid})
-        assert status == 200
+        assert status == 200, revoked
         assert revoked["ok"] is True
         missing, status, _ = get(f"/api/share/{token}")
         assert status == 404
         assert missing["error"] == "Shared conversation not found"
     finally:
+        post("/api/session/delete", {"session_id": sid})
+
+
+def test_session_delete_removes_offline_replay_plaintext_artifacts():
+    from api.models import SESSION_DIR
+
+    sid = _make_session_with_messages()
+    sidecar = SESSION_DIR / f"{sid}.json"
+    artifacts = [
+        sidecar.with_name(f"{sidecar.name}.replay-v10.abcdef0123456789.bak"),
+        sidecar.with_name(
+            f"_replay-v10.{sidecar.name}.abcdef0123456789.manifest.json"
+        ),
+        sidecar.with_name(f".{sidecar.name}.replay-v10.tmp.123"),
+        sidecar.with_name(f".{sidecar.name}.replay-v10.restore.123"),
+        sidecar.with_name(
+            f"._replay-v10.{sidecar.name}.abcdef0123456789.manifest.json.tmp.123"
+        ),
+    ]
+    try:
+        for artifact in artifacts:
+            artifact.write_text("plaintext transcript", encoding="utf-8")
+
+        payload, status = post("/api/session/delete", {"session_id": sid})
+
+        assert status == 200, payload
+        assert not any(artifact.exists() for artifact in artifacts)
+    finally:
+        for artifact in artifacts:
+            artifact.unlink(missing_ok=True)
         post("/api/session/delete", {"session_id": sid})
 
 

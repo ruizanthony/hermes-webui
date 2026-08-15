@@ -671,7 +671,11 @@ def _guard_request_session_visibility(handler, parsed, body=None, method="GET") 
 
 def _request_worktree_ownership_exempt(method: str, path: str | None) -> bool:
     """Return whether a request mutates session metadata but not its worktree."""
-    return method == "POST" and path == "/api/session/archive"
+    return method == "POST" and path in {
+        "/api/session/archive",
+        "/api/share/create",
+        "/api/share/revoke",
+    }
 
 
 def _guard_request_worktree_ownership(handler, body=None, *, method="POST", path=None) -> bool:
@@ -9734,6 +9738,7 @@ from api.models import (
     _clear_webui_zero_message_orphan_tombstone,
     _load_webui_deleted_session_tombstone,
     _record_webui_deleted_session_tombstone,
+    _delete_offline_replay_artifacts,
     ensure_cron_project,
     _profile_has_user_projects,
     is_cron_session,
@@ -15382,6 +15387,14 @@ def handle_post(handler, parsed) -> bool:
                     exc_info=True,
                 )
                 return bad(handler, "Failed to durably delete session files", 500)
+            try:
+                _delete_offline_replay_artifacts(p)
+            except Exception:
+                logger.debug(
+                    "Failed to unlink offline replay artifacts for %s",
+                    p,
+                    exc_info=True,
+                )
         finally:
             if sidecar_authority is not None:
                 sidecar_authority.__exit__(None, None, None)
