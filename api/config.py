@@ -1128,7 +1128,10 @@ _FALLBACK_MODELS = [
     # OpenAI
     {"provider": "OpenAI",    "id": "openai/gpt-5.4-mini",                "label": "GPT-5.4 Mini"},
     {"provider": "OpenAI",    "id": "openai/gpt-5.4",                     "label": "GPT-5.4"},
-    # Anthropic — 4.6 flagship + 4.5 generation
+    # Anthropic — 5 generation + 4.6 flagship
+    {"provider": "Anthropic", "id": "anthropic/claude-opus-5",            "label": "Claude Opus 5"},
+    {"provider": "Anthropic", "id": "anthropic/claude-sonnet-5",          "label": "Claude Sonnet 5"},
+    {"provider": "Anthropic", "id": "anthropic/claude-fable-5",           "label": "Claude Fable 5"},
     {"provider": "Anthropic", "id": "anthropic/claude-opus-4.7",          "label": "Claude Opus 4.7"},
     {"provider": "Anthropic", "id": "anthropic/claude-opus-4.6",          "label": "Claude Opus 4.6"},
     {"provider": "Anthropic", "id": "anthropic/claude-sonnet-4.6",        "label": "Claude Sonnet 4.6"},
@@ -1693,6 +1696,9 @@ def _provider_is_known_or_configured(
 # Well-known models per provider (used to populate dropdown for direct API providers)
 _PROVIDER_MODELS = {
     "anthropic": [
+        {"id": "claude-opus-5", "label": "Claude Opus 5"},
+        {"id": "claude-sonnet-5", "label": "Claude Sonnet 5"},
+        {"id": "claude-fable-5", "label": "Claude Fable 5"},
         {"id": "claude-opus-4.7", "label": "Claude Opus 4.7"},
         {"id": "claude-opus-4.6", "label": "Claude Opus 4.6"},
         {"id": "claude-sonnet-4.6", "label": "Claude Sonnet 4.6"},
