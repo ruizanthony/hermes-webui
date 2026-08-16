@@ -372,6 +372,11 @@ let _releaseApi;
 const _apiResult = new Promise((res) => {{ _releaseApi = res; }});
 let _apiCalled = false;
 async function api(url) {{ _apiCalled = true; return _apiResult; }}
+// #fastnav: _ensureMessagesLoaded ne consomme plus api() directement mais
+// _apiSessionNav(sid, url, opts), qui sert d'abord une promesse prefetchee puis
+// retombe sur api(). Le harnais n'amorce aucun cache de navigation, donc ce
+// stub reproduit exactement la branche de repli reelle (sessions.js).
+function _apiSessionNav(sid, url, apiOpts) {{ return api(url, apiOpts); }}
 
 {get_counts}
 {save_counts}
