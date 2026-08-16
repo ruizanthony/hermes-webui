@@ -439,6 +439,36 @@ def test_pre_compression_snapshot_is_durable_false_when_lookup_fails(monkeypatch
     assert _pre_compression_snapshot_is_durable("missing-sid") is False
 
 
+def test_tail_reduced_sse_event_emitted_when_reduction_applied():
+    """Plan Option A, C1 contract pin: a dedicated 'tail_reduced' SSE event
+    must be emitted at the exact point the active-session reduction is
+    applied, carrying the fields the client needs to prune the DOM without
+    waiting for the terminal 'done' event (session_id, dropped_count,
+    anchor_message_key). Kept as a source-text pin (like the sibling
+    #3306-style tests) rather than a full streaming-harness test, since
+    api/streaming.py's put()/SSE plumbing has no existing unit-test seam.
+    """
+    import inspect
+
+    src = inspect.getsource(streaming)
+    assert "put('tail_reduced', {" in src, (
+        "expected a dedicated 'tail_reduced' SSE event at the tail-reduction "
+        "call site — see plan Option A step C1"
+    )
+    marker = src.index("put('tail_reduced', {")
+    block = src[marker:marker + 400]
+    assert "'session_id':" in block
+    assert "'dropped_count':" in block
+    assert "'anchor_message_key':" in block
+    # Must live in the branch guarded by _should_apply_active_session_tail_reduction
+    # (i.e. after _compacted_tail_this_turn = True), not unconditionally.
+    guard_idx = src.index("_compacted_tail_this_turn = True")
+    assert guard_idx < marker < guard_idx + 800, (
+        "'tail_reduced' must be emitted only when the reduction was actually "
+        "applied — found it outside the guarded branch"
+    )
+
+
 def test_tool_call_summaries_drop_archived_prefix_and_rebase_indices():
     summaries = [
         {"tid": "old", "assistant_msg_idx": 4, "snippet": "archived"},
