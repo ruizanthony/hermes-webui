@@ -69,11 +69,11 @@ def test_inflight_marker_write_handles_quota_by_dropping_recovery_snapshots():
     mark_body = _function_body(UI_JS, "markInflight")
 
     assert "try{" in mark_body
-    assert "localStorage.setItem(INFLIGHT_KEY, payload);" in mark_body
+    assert "localStorage.setItem(_inflightKey(), payload);" in mark_body
     assert "_isStorageQuotaError(err)" in mark_body
-    assert "localStorage.removeItem(INFLIGHT_STATE_KEY);" in mark_body
-    assert mark_body.index("localStorage.removeItem(INFLIGHT_STATE_KEY);") < mark_body.rindex(
-        "localStorage.setItem(INFLIGHT_KEY, payload);"
+    assert "localStorage.removeItem(_inflightStateKey());" in mark_body
+    assert mark_body.index("localStorage.removeItem(_inflightStateKey());") < mark_body.rindex(
+        "localStorage.setItem(_inflightKey(), payload);"
     )
 
 
@@ -83,5 +83,5 @@ def test_save_inflight_state_clears_snapshots_when_quota_retry_fails():
 
     assert "catch(err)" in save_body
     assert "if(!_isStorageQuotaError(err)) return;" in save_body
-    assert "localStorage.removeItem(INFLIGHT_STATE_KEY);" in save_body
+    assert "localStorage.removeItem(_inflightStateKey());" in save_body
     assert "_writeInflightStateMap({[sid]:entry});" in save_body
