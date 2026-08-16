@@ -16002,13 +16002,13 @@ def handle_post(handler, parsed) -> bool:
         return _handle_bg_task_complete_ack(handler, body)
 
     if parsed.path == "/api/chat/start":
-        try:
-            sid = str(body.get("session_id") or "")
-            if sid:
-                from api.worktree_authority import assert_session_owner
-                assert_session_owner(get_session(sid, metadata_only=True))
-        except Exception as e:
-            return bad(handler, f"Worktree write refused: {e}", status=409)
+        # Worktree ownership is enforced for every POST by the canonical
+        # chokepoint _guard_request_worktree_ownership() above.  Do not add a
+        # local copy here: an inline probe that calls get_session() directly
+        # also catches the KeyError raised for a *missing sidecar* and reports
+        # it as "Worktree write refused: <sid>", which permanently blocks a
+        # session whose transcript is still recoverable from state.db.
+        # _handle_chat_start() owns that case (_claim_or_synthesize_cli_session).
         return _handle_chat_start(handler, body, diag=diag)
 
     if parsed.path == "/api/chat":
@@ -16019,13 +16019,9 @@ def handle_post(handler, parsed) -> bool:
         return _handle_chat_steer(handler, body)
 
     if parsed.path == "/api/terminal/start":
-        try:
-            sid = str(body.get("session_id") or "")
-            if sid:
-                from api.worktree_authority import assert_session_owner
-                assert_session_owner(get_session(sid, metadata_only=True))
-        except Exception as e:
-            return bad(handler, f"Worktree terminal refused: {e}", status=409)
+        # Same rule as /api/chat/start above: ownership is already enforced by
+        # the canonical POST chokepoint.  A local copy would refuse a session
+        # whose sidecar is merely missing.
         return _handle_terminal_start(handler, body)
 
     if parsed.path == "/api/terminal/input":
