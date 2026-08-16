@@ -9352,8 +9352,26 @@ function _readTabClaims(){
   }
   return claims;
 }
-function _writeTabClaims(claims){
-  try{ localStorage.setItem(TAB_ID_CLAIM_KEY, JSON.stringify(claims)); }catch(_){}
+// Registry updates are read-modify-write on a single localStorage key, and two
+// tabs can interleave between the read and the write (localStorage offers no
+// transaction). A blind whole-object write would drop the claim/seen record a
+// concurrent tab just added, letting a LIVE tab's id be reused or its scoped
+// keys garbage collected. Both registries are therefore updated through this
+// helper, which re-reads immediately before writing and only ever touches the
+// caller's OWN id; every other tab's entry is carried over untouched.
+function _updateTabRegistry(key, id, ttlMs, drop){
+  if(!id) return;
+  try{
+    let reg={};
+    try{ reg=JSON.parse(localStorage.getItem(key)||'{}')||{}; }catch(_){ reg={}; }
+    if(typeof reg!=='object'||!reg) reg={};
+    const now=Date.now();
+    for(const [k,v] of Object.entries(reg)){
+      if(!v||typeof v!=='number'||(now-v)>ttlMs) delete reg[k];
+    }
+    if(drop) delete reg[id]; else reg[id]=now;
+    localStorage.setItem(key, JSON.stringify(reg));
+  }catch(_){}
 }
 // "Seen" registry: unlike claims (a short-lived liveness lock released on
 // pagehide), this records the last time a tab id was active so that closed
@@ -9363,19 +9381,17 @@ function _readTabSeen(){
   let seen={};
   try{ seen=JSON.parse(localStorage.getItem(TAB_ID_SEEN_KEY)||'{}')||{}; }catch(_){ seen={}; }
   if(typeof seen!=='object'||!seen) seen={};
+  // Drop entries older than the TTL so _gcOrphanTabKeys() can actually reclaim
+  // the per-tab keys of tabs that are gone for good. Without this filter every
+  // tab id stays "seen" forever and the registry only ever grows (#2386 quota).
+  const now=Date.now();
+  for(const [k,v] of Object.entries(seen)){
+    if(!v||typeof v!=='number'||(now-v)>_TAB_SEEN_TTL_MS) delete seen[k];
+  }
   return seen;
 }
 function _touchTabSeen(id){
-  if(!id) return;
-  try{
-    const seen=_readTabSeen();
-    const now=Date.now();
-    seen[id]=now;
-    for(const [k,v] of Object.entries(seen)){
-      if(!v||typeof v!=='number'||(now-v)>_TAB_SEEN_TTL_MS) delete seen[k];
-    }
-    localStorage.setItem(TAB_ID_SEEN_KEY, JSON.stringify(seen));
-  }catch(_){}
+  _updateTabRegistry(TAB_ID_SEEN_KEY, id, _TAB_SEEN_TTL_MS, false);
 }
 // Remove per-tab keys whose owning tab has not been seen within the TTL.
 // Without this, every new tab would leave `<base>::<uuid>` entries behind and
@@ -9404,16 +9420,13 @@ function _claimTabId(id){
   // A surviving fresh claim for this id means another tab is alive with it.
   const takenByLiveTab=Object.prototype.hasOwnProperty.call(claims,id);
   const finalId=takenByLiveTab?_newTabId():id;
-  claims[finalId]=Date.now();
-  _writeTabClaims(claims);
+  _updateTabRegistry(TAB_ID_CLAIM_KEY, finalId, _TAB_CLAIM_TTL_MS, false);
   return finalId;
 }
 function _releaseTabId(){
   try{
     if(typeof window==='undefined'||!window.__hermesTabId) return;
-    const claims=_readTabClaims();
-    delete claims[window.__hermesTabId];
-    _writeTabClaims(claims);
+    _updateTabRegistry(TAB_ID_CLAIM_KEY, window.__hermesTabId, _TAB_CLAIM_TTL_MS, true);
   }catch(_){}
 }
 function _hermesTabId(){
@@ -9434,9 +9447,7 @@ function _hermesTabId(){
       // Keep this tab's claim fresh so a concurrent tab never reuses its id.
       window.__hermesTabClaimTimer=setInterval(()=>{
         try{
-          const c=_readTabClaims();
-          c[window.__hermesTabId]=Date.now();
-          _writeTabClaims(c);
+          _updateTabRegistry(TAB_ID_CLAIM_KEY, window.__hermesTabId, _TAB_CLAIM_TTL_MS, false);
           _touchTabSeen(window.__hermesTabId);
         }catch(_){}
       }, _TAB_CLAIM_HEARTBEAT_MS);
@@ -9487,8 +9498,19 @@ function _rememberedActiveSession(){
   try{ return localStorage.getItem(ACTIVE_SESSION_KEY_LEGACY); }catch(_){ return null; }
 }
 function _forgetActiveSession(){
+  let own=null;
+  try{ own=localStorage.getItem(_activeSessionKey()); }catch(_){}
   try{ localStorage.removeItem(_activeSessionKey()); }catch(_){}
-  try{ localStorage.removeItem(ACTIVE_SESSION_KEY_LEGACY); }catch(_){}
+  // The legacy key is SHARED: it is the first-paint fallback for a brand-new
+  // tab (which has no scoped key yet) and for any older client. Only clear it
+  // when it still points at the session THIS tab is forgetting — otherwise one
+  // tab closing a conversation would drop every other tab's restore target and
+  // new tabs would open the empty state.
+  try{
+    if(own&&localStorage.getItem(ACTIVE_SESSION_KEY_LEGACY)===own){
+      localStorage.removeItem(ACTIVE_SESSION_KEY_LEGACY);
+    }
+  }catch(_){}
 }
 if(typeof window!=='undefined'){
   window._rememberActiveSession=_rememberActiveSession;
@@ -9521,7 +9543,7 @@ function _getInflightStateLimits(){
 
 function _readInflightStateMap(){
   try{
-    const raw=localStorage.getItem(INFLIGHT_STATE_KEY);
+    const raw=localStorage.getItem(_inflightStateKey());
     const parsed=raw?JSON.parse(raw):{};
     return parsed&&typeof parsed==='object'?parsed:{};
   }catch(_){
@@ -9592,10 +9614,10 @@ function _writeInflightStateMap(all){
     json=JSON.stringify(current?{[current[0]]:current[1]}:{});
   }
   if(json.length>limits.jsonChars){
-    localStorage.removeItem(INFLIGHT_STATE_KEY);
+    localStorage.removeItem(_inflightStateKey());
     return false;
   }
-  localStorage.setItem(INFLIGHT_STATE_KEY,json);
+  localStorage.setItem(_inflightStateKey(),json);
   return true;
 }
 function saveInflightState(sid, state){
@@ -9608,10 +9630,10 @@ function saveInflightState(sid, state){
   }catch(err){
     if(!_isStorageQuotaError(err)) return;
     try{
-      localStorage.removeItem(INFLIGHT_STATE_KEY);
+      localStorage.removeItem(_inflightStateKey());
       _writeInflightStateMap({[sid]:entry});
     }catch(_){
-      try{localStorage.removeItem(INFLIGHT_STATE_KEY);}catch(__){}
+      try{localStorage.removeItem(_inflightStateKey());}catch(__){}
     }
   }
 }
@@ -9639,8 +9661,8 @@ function clearInflightState(sid){
     const all=_readInflightStateMap();
     if(!(sid in all)) return;
     delete all[sid];
-    if(Object.keys(all).length) localStorage.setItem(INFLIGHT_STATE_KEY, JSON.stringify(all));
-    else localStorage.removeItem(INFLIGHT_STATE_KEY);
+    if(Object.keys(all).length) localStorage.setItem(_inflightStateKey(), JSON.stringify(all));
+    else localStorage.removeItem(_inflightStateKey());
   }catch(_){ }
 }
 
@@ -9973,17 +9995,17 @@ function restoreLiveTurnHtmlForSession(sid){
 function markInflight(sid, streamId) {
   const payload=JSON.stringify({sid, streamId, ts: Date.now()});
   try{
-    localStorage.setItem(INFLIGHT_KEY, payload);
+    localStorage.setItem(_inflightKey(), payload);
   }catch(err){
     if(!_isStorageQuotaError(err)) return;
     try{
-      localStorage.removeItem(INFLIGHT_STATE_KEY);
-      localStorage.setItem(INFLIGHT_KEY, payload);
+      localStorage.removeItem(_inflightStateKey());
+      localStorage.setItem(_inflightKey(), payload);
     }catch(_){}
   }
 }
 function clearInflight() {
-  localStorage.removeItem(INFLIGHT_KEY);
+  localStorage.removeItem(_inflightKey());
 }
 function showReconnectBanner(msg) {
   $('reconnectMsg').textContent = msg || 'A response may have been in progress when you last left.';
@@ -11120,7 +11142,7 @@ function getPendingSessionMessage(session, messagesOverride=null){
   };
 }
 async function checkInflightOnBoot(sid) {
-  const raw = localStorage.getItem(INFLIGHT_KEY);
+  const raw = localStorage.getItem(_inflightKey());
   if (!raw) return;
   try {
     const {sid: inflightSid, streamId, ts} = JSON.parse(raw);
@@ -13991,6 +14013,10 @@ function _refreshTransparentThinkingLiveRow(existing, node){
   return true;
 }
 
+const _TRANSPARENT_FADE_BLOCK_TAGS = new Set([
+  'P','DIV','H1','H2','H3','H4','H5','H6','BLOCKQUOTE','LI','UL','OL','PRE','TABLE',
+]);
+
 function _bindTransparentFadeCleanup(body){
   if(!body || body._transparentFadeCleanupBound || typeof body.addEventListener !== 'function') return;
   body._transparentFadeCleanupBound = true;
@@ -14005,6 +14031,20 @@ function _bindTransparentFadeCleanup(body){
     span.classList.remove('is-new');
     if(span.style) span.style.removeProperty('--stream-fade-ms');
   });
+}
+
+// Trailing block element of a live prose body, if any. Live rows are produced
+// by the incremental streaming-markdown path, which keeps an open block (a <p>)
+// as it parses; text appended as a sibling of that block would render on its
+// own line. Inline wrappers (fade spans) are not block boxes and are skipped.
+function _transparentFadeAppendTarget(body){
+  if(!body) return body;
+  const kids = body.childNodes;
+  if(!kids || !kids.length) return body;
+  const last = kids[kids.length - 1];
+  if(!last || last.nodeType !== 1) return body;
+  const tag = String(last.tagName || '').toUpperCase();
+  return _TRANSPARENT_FADE_BLOCK_TAGS.has(tag) ? last : body;
 }
 
 function _appendTransparentFadeText(body, text){
@@ -14032,13 +14072,25 @@ function _appendTransparentFadeText(body, text){
   }
   if(!changed) frag.appendChild(document.createTextNode(value));
   else if(last < value.length) frag.appendChild(document.createTextNode(value.slice(last)));
-  body.appendChild(frag);
+  // Append inside the trailing block element (the streaming markdown parser's
+  // open <p>) rather than at the root of .msg-body. A block sibling would start
+  // its own line box, so a continuation of the current sentence — in particular
+  // the tail of a word — must land inside that block to stay on the same line.
+  _transparentFadeAppendTarget(body).appendChild(frag);
 }
 
 function _refreshTransparentFadeProseRow(existing, node, preservedState){
   let body = existing.querySelector ? existing.querySelector('.msg-body') : null;
   const nextText = String((node.dataset && node.dataset.rawText) || (node.textContent || ''));
-  const currentText = String(existing.getAttribute('data-stream-fade-text') || (body && body.textContent) || '');
+  // Resume strictly from the source-space cursor. `body.textContent` is NOT a
+  // valid substitute: rows built by the incremental streaming-markdown path
+  // render one character behind their source text (the parser holds the last
+  // character pending), so falling back to rendered text yields a delta that
+  // starts mid-word and tears the word in half. With no cursor we cannot know
+  // how much of the source is already rendered, so rebuild the body instead of
+  // guessing a delta.
+  const hasCursor = !!(existing.getAttribute && existing.getAttribute('data-stream-fade-text') !== null);
+  const currentText = hasCursor ? String(existing.getAttribute('data-stream-fade-text') || '') : '';
   const pairs = _transparentLiveRowAttributePairs(node);
   const kept = Object.create(null);
   for(const pair of pairs){
@@ -14059,7 +14111,7 @@ function _refreshTransparentFadeProseRow(existing, node, preservedState){
     existing.appendChild(body);
   }
   if(body.classList) body.classList.add('stream-fade-active');
-  if(!nextText.startsWith(currentText)){
+  if(!hasCursor || !nextText.startsWith(currentText)){
     body.textContent = '';
     existing.setAttribute('data-stream-fade-text', '');
     _appendTransparentFadeText(body, nextText);
