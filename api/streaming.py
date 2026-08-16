@@ -7293,6 +7293,7 @@ def _should_apply_active_session_tail_reduction(
     total_message_count,
     archive_durable,
     setting_enabled,
+    session_id=None,
 ) -> bool:
     """Decide whether the *visible* continuation session should be reduced
     to its post-compression tail this turn.
@@ -7305,15 +7306,46 @@ def _should_apply_active_session_tail_reduction(
     thing that makes reducing the visible transcript safe. Coupling the two
     caused ~43 of 47 observed compressions to leave the active session
     un-reduced even though the parent was already safely archived.
+
+    Every decision (applied or refused, with reason) is logged at INFO for
+    auditability (plan Option A, S4) — the auto-squash setting is opt-in and
+    silent otherwise, so INFO is the only place an operator can confirm the
+    feature actually fired on a given turn.
     """
     if not setting_enabled:
+        logger.info(
+            "auto tail reduction: skipped session=%s reason=setting_disabled",
+            session_id,
+        )
         return False
     if not archive_durable:
+        logger.info(
+            "auto tail reduction: skipped session=%s reason=parent_archive_not_durable",
+            session_id,
+        )
         return False
     if not continuation_tail or continuation_tail_boundary is None:
+        logger.info(
+            "auto tail reduction: skipped session=%s reason=no_trusted_boundary",
+            session_id,
+        )
         return False
     if len(continuation_tail) >= (total_message_count or 0):
+        logger.info(
+            "auto tail reduction: skipped session=%s reason=tail_not_smaller "
+            "tail=%d total=%d",
+            session_id,
+            len(continuation_tail),
+            total_message_count or 0,
+        )
         return False
+    logger.info(
+        "auto tail reduction: applied session=%s tail=%d total=%d dropped=%d",
+        session_id,
+        len(continuation_tail),
+        total_message_count or 0,
+        (total_message_count or 0) - len(continuation_tail),
+    )
     return True
 
 
@@ -12716,6 +12748,7 @@ def _run_agent_streaming(
                             )
                             is True
                         ),
+                        session_id=_compression_continuation_session_id,
                     ):
                         _dropped_message_count = len(s.messages or []) - len(
                             _continuation_tail
