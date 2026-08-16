@@ -457,6 +457,11 @@ function runCrossSessionOrderingBase({seedBeaconInflight, resolveBeaconMsgsBefor
   const apiHost = makeHarness();
   globalThis.apiHost = apiHost;
   globalThis.api = apiHost.api;
+  // #fastnav: le code teste appelle _apiSessionNav(sid, url, opts), qui sert
+  // d'abord une promesse prefetchee puis retombe sur api(). Aucun cache de
+  // navigation n'est amorce ici, donc on reproduit la branche de repli reelle
+  // en preservant l'ordre d'appels verifie par le harnais.
+  globalThis._apiSessionNav = (sid, url, apiOpts) => globalThis.api(url, apiOpts);
 
   const calls = makeCrossSessionCalls(apiHost);
 
@@ -520,6 +525,8 @@ async function runStaleRejectedIdleCatch() {
   const apiHost = makeHarness();
   globalThis.apiHost = apiHost;
   globalThis.api = apiHost.api;
+  // #fastnav: meme repli que ci-dessus (voir runCrossSessionOrdering).
+  globalThis._apiSessionNav = (sid, url, apiOpts) => globalThis.api(url, apiOpts);
 
   S.session = { session_id: 'sid-atlas', message_count: 0 };
 
