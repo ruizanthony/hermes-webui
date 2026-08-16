@@ -6607,18 +6607,64 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // unresolved anchor must never guess a cut point and drop live turn
       // state. The transcript still settles correctly at 'done'.
       if(cutRawIdx<0) return;
-      const container=document.getElementById('messages')||document.getElementById('msgInner');
-      const anchorNode=container
-        ? (container.querySelector(`[data-msg-idx="${cutRawIdx}"]`)
-          || (typeof _messageSessionIndexForRawIdx==='function'
-            ? container.querySelector(`[data-session-msg-idx="${_messageSessionIndexForRawIdx(cutRawIdx)}"]`)
-            : null))
-        : null;
+      // #msgInner (the scroll-inner wrapper renderMessages() actually
+      // populates with [data-msg-idx] rows) must be preferred over #messages
+      // (the outer pane wrapper that also holds .empty-state,
+      // .live-compression-cards and other siblings with no message rows).
+      // #messages always exists once the pane has mounted, so
+      // `getElementById('messages')||getElementById('msgInner')` would never
+      // fall through to the real row container -- checked with the exact
+      // shipped DOM via Playwright against a live dev server (2026-08-16).
+      const container=document.getElementById('msgInner')||document.getElementById('messages');
+      // The anchor message itself (a compaction marker) is never rendered as
+      // its own row -- _messageIsRenderable()/_isContextCompactionMessage()
+      // skip it in renderMessages(). Find the first surviving row whose
+      // local raw index is >= cutRawIdx instead of requiring an exact match;
+      // querySelectorAll returns rows in document order, which is ascending
+      // by data-msg-idx, so the first qualifying row is the correct anchor.
+      let anchorRow=null;
+      if(container){
+        const rows=container.querySelectorAll('[data-msg-idx]');
+        for(let i=0;i<rows.length;i++){
+          const idx=Number(rows[i].getAttribute('data-msg-idx'));
+          if(Number.isFinite(idx)&&idx>=cutRawIdx){ anchorRow=rows[i]; break; }
+        }
+      }
       // If the anchor row can't be located in the live DOM, do nothing at
       // all: slicing S.messages without also pruning the DOM would desync
       // in-memory state from what's on screen until the next full render.
       // The transcript still settles correctly at 'done' either way.
+      if(!anchorRow) return;
+      // [data-msg-idx] rows are not always direct children of container: a
+      // single visual turn (.msg-row.assistant-turn) can bundle several
+      // assistant-segment children (tool_call -> text -> tool_call -> text)
+      // sharing one .assistant-turn-blocks wrapper. Only the TOP-LEVEL
+      // .msg-row is a sibling under container; that's what previousSibling
+      // walking and insertBefore must operate on.
+      let anchorNode=anchorRow;
+      while(anchorNode&&anchorNode.parentElement!==container) anchorNode=anchorNode.parentElement;
       if(!anchorNode) return;
+      // Guard against splitting a multi-segment turn: bail out if the
+      // top-level node straddles the cut boundary, i.e. it contains any
+      // [data-msg-idx] BELOW cutRawIdx alongside ones at/above it (e.g. one
+      // assistant-turn bundling segments at raw idx 3 and 5 when cutRawIdx
+      // is 4 -- dropping the whole node would also destroy segment 5, which
+      // must be kept). A node whose minimum contained index is >= cutRawIdx
+      // is fully on the "kept" side and safe to use as the removal boundary
+      // even when cutRawIdx itself corresponds to a non-rendered message
+      // (the compaction marker is always skipped by
+      // _messageIsRenderable()/_isContextCompactionMessage(), so the next
+      // rendered index is routinely > cutRawIdx with nothing unsafe about
+      // it -- confirmed against the shipped bundle on a live dev server,
+      // 2026-08-16). If the cut point falls mid-turn, let the terminal
+      // 'done' event settle the transcript instead, same fail-open posture
+      // as the anchor-not-found case above.
+      const idxInAnchorNode=(anchorNode.hasAttribute('data-msg-idx')
+        ? [Number(anchorNode.getAttribute('data-msg-idx'))]
+        : Array.from(anchorNode.querySelectorAll('[data-msg-idx]'))
+            .map(r=>Number(r.getAttribute('data-msg-idx'))))
+        .filter(Number.isFinite);
+      if(!idxInAnchorNode.length||Math.min(...idxInAnchorNode)<cutRawIdx) return;
       S.messages=S.messages.slice(cutRawIdx);
       {
         let node=anchorNode.previousElementSibling;
