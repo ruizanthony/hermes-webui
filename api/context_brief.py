@@ -20,6 +20,7 @@ import copy
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -147,18 +148,56 @@ def delete_stored_brief(state_root, sid: str) -> None:
 
 # ── deterministic extraction ─────────────────────────────────────────────
 
+_WORKSPACE_TAG_RE = re.compile(r"^\s*\[Workspace::v\d+:[^\]]*\]\s*", re.I)
+
+# Automated user-role messages injected by the runtime (goal continuations,
+# delegation results, background-process wakeups, compaction handoffs).
+# They are not requests from the human, so the brief's "Your requests"
+# section must exclude them. Process wakeups are detected with the canonical
+# helper in api.process_event_utils (it also covers the internal wrapper
+# envelope); the prefixes below cover the remaining runtime injections and
+# older wakeup rows that predate the `_source` marker.
+_AUTOMATED_USER_PREFIXES = (
+    "[continuing toward your standing goal]",
+    "[async delegation batch complete",
+    "[important: background process",
+    "[internal background event",
+    "[context compaction",
+    "[system]",
+)
+
+
+def _strip_workspace_tag(text: str) -> str:
+    return _WORKSPACE_TAG_RE.sub("", str(text or ""), count=1).lstrip()
+
+
+def _is_automated_user_text(text: str) -> bool:
+    """True when a user-role message was injected by the runtime, not typed."""
+    try:
+        from api.process_event_utils import is_wakeup_user_text
+
+        if is_wakeup_user_text(text):
+            return True
+    except Exception:  # pragma: no cover - helper must never break the brief
+        logger.debug("context brief: wakeup detection unavailable", exc_info=True)
+    stripped = _strip_workspace_tag(text).lstrip()
+    head = stripped[:200].lower()
+    return any(head.startswith(prefix) for prefix in _AUTOMATED_USER_PREFIXES)
+
+
 def _is_user_request(msg: dict) -> bool:
     if not isinstance(msg, dict) or msg.get("role") != "user":
         return False
     if msg.get("_squash_summary") is True:
         return False
-    if msg.get("_source") == "process_wakeup":
+    if msg.get("_source") in ("process_wakeup", "goal_continuation", "delegation_result"):
         return False
     text = _message_text(msg.get("content")).strip()
     if not text:
         return False
-    # Compaction handoffs are reference blocks, not user demands.
-    if text.startswith("[CONTEXT COMPACTION"):
+    # Compaction handoffs, goal continuations, delegation batches and
+    # process wakeups are runtime plumbing, not user demands.
+    if _is_automated_user_text(text):
         return False
     return True
 
@@ -291,14 +330,25 @@ def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
     messages = [m for m in (getattr(session, "messages", None) or []) if isinstance(m, dict)]
 
     requests = []
+    seen_requests: set[tuple] = set()
     for msg in messages:
-        if _is_user_request(msg):
-            requests.append(
-                {
-                    "ts": msg.get("timestamp") or msg.get("_ts"),
-                    "text": _excerpt(_message_text(msg.get("content")), _REQUEST_EXCERPT_CHARS),
-                }
-            )
+        if not _is_user_request(msg):
+            continue
+        # The workspace tag is runtime plumbing prepended to every message;
+        # showing it wastes excerpt budget and hides the actual ask.
+        text = _excerpt(
+            _strip_workspace_tag(_message_text(msg.get("content"))), _REQUEST_EXCERPT_CHARS
+        )
+        if not text:
+            continue
+        ts = msg.get("timestamp") or msg.get("_ts")
+        # The same turn can be persisted several times (api_content mirror,
+        # recovery replay); dedupe on (timestamp, text) so one ask shows once.
+        key = (round(float(ts), 3) if isinstance(ts, (int, float)) else ts, text)
+        if key in seen_requests:
+            continue
+        seen_requests.add(key)
+        requests.append({"ts": ts, "text": text})
 
     conclusions = []
     compressions = []

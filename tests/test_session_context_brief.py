@@ -156,6 +156,71 @@ def test_deterministic_brief_empty_session(tmp_path):
     assert brief["accomplished"]["conclusion_count"] == 0
 
 
+def test_requests_exclude_runtime_injected_user_messages(tmp_path):
+    """Direction ask 2026-08-16: 'Your requests' = human asks only.
+
+    Goal continuations, delegation batches, background-process wakeups and
+    compaction handoffs all arrive with role='user' but are runtime
+    plumbing. Older wakeups predate the `_source` marker, so the text
+    prefix must be enough on its own.
+    """
+    ws = "[Workspace::v1: /a0/usr/projects/MES]\n"
+    messages = [
+        {"role": "user", "content": ws + "déploie la nouvelle version", "timestamp": 1.0},
+        {
+            "role": "user",
+            "content": ws + "[Continuing toward your standing goal]\nGoal: /validation",
+            "timestamp": 2.0,
+        },
+        {
+            "role": "user",
+            "content": ws + "[IMPORTANT: Background process proc_abc completed (exit_code=0).",
+            "timestamp": 3.0,
+        },
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION BATCH COMPLETE] 3 tasks finished",
+            "timestamp": 4.0,
+        },
+        {
+            "role": "user",
+            "content": "[CONTEXT COMPACTION — REFERENCE ONLY] earlier turns…",
+            "timestamp": 5.0,
+        },
+        {"role": "user", "content": ws + "vérifie le live", "timestamp": 6.0},
+    ]
+    sess = _make_session(tmp_path, messages=messages)
+    brief = context_brief.build_deterministic_brief(sess, SID, source="webui")
+
+    assert [r["text"] for r in brief["requests"]] == [
+        "déploie la nouvelle version",
+        "vérifie le live",
+    ]
+    assert brief["request_count"] == 2
+
+
+def test_requests_strip_workspace_tag_and_dedupe(tmp_path):
+    """The workspace tag is plumbing, and one ask must appear once.
+
+    A single turn can be persisted more than once (api_content mirror,
+    startup recovery replay); the brief must not show it twice.
+    """
+    ws = "[Workspace::v1: /a0/usr/projects/MES]\n"
+    messages = [
+        {"role": "user", "content": ws + "corrige le brief", "timestamp": 10.0},
+        {"role": "user", "content": "corrige le brief", "timestamp": 10.0},
+        {"role": "user", "content": ws + "corrige le brief", "timestamp": 11.0},
+    ]
+    sess = _make_session(tmp_path, messages=messages)
+    brief = context_brief.build_deterministic_brief(sess, SID, source="webui")
+
+    texts = [r["text"] for r in brief["requests"]]
+    assert all(not t.startswith("[Workspace::v") for t in texts)
+    # Same text at the same timestamp collapses; a genuine repeat later stays.
+    assert texts == ["corrige le brief", "corrige le brief"]
+    assert [r["ts"] for r in brief["requests"]] == [10.0, 11.0]
+
+
 def test_goal_block_included_when_active(tmp_path):
     sess = _make_session(tmp_path)
     goal_state = SimpleNamespace(status="active", goal="livrer la feature contexte", turns_used=3, max_turns=20)
