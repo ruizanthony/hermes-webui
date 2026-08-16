@@ -553,3 +553,22 @@ class TestFrontendStatic:
         i18n = open("static/i18n.js").read()
         assert "settings_label_context_brief_auto" in i18n
         assert "settings_desc_context_brief_auto" in i18n
+
+    def test_switch_i18n_covers_every_locale(self):
+        # Regression 2026-08-15: the first insertion only patched the `en`
+        # block, so the switch rendered in English inside a French UI while
+        # its neighbour setting was translated. Every locale that translates
+        # settings_label_quota_chip must also translate the new switch.
+        import re
+
+        src = open("static/i18n.js").read()
+        starts = [(m.start(), m.group(1)) for m in re.finditer(r"^  ([a-z][\w-]*): \{$", src, re.M)]
+        starts.append((len(src), None))
+        missing = []
+        for i, (off, loc) in enumerate(starts[:-1]):
+            block = src[off:starts[i + 1][0]]
+            if "settings_label_quota_chip" not in block:
+                continue
+            if "settings_label_context_brief_auto" not in block:
+                missing.append(loc)
+        assert not missing, f"locales missing the auto-brief switch labels: {missing}"
