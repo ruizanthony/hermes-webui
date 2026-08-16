@@ -7040,10 +7040,24 @@ def _is_context_compression_marker(msg):
 
 
 def _is_trusted_auto_compression_marker(message):
-    """Accept only WebUI-generated assistant summaries for destructive compaction."""
+    """Accept only WebUI-generated compression summaries for destructive compaction.
+
+    Trust comes strictly from the ``_compressed_summary`` metadata flag, which
+    only agent/context_compressor.py stamps (never forgeable by pasted user
+    text). The flag is intentionally role-agnostic: alternation-safety logic
+    in context_compressor.py (``_splice_micro_compact_result``, the tail-merge
+    path around ``COMPRESSED_SUMMARY_METADATA_KEY``) places the marker on
+    whichever role keeps user/assistant turns alternating, so a real trusted
+    marker can legitimately carry role="user" as often as role="assistant".
+    Requiring role == "assistant" here silently dropped every user-role
+    marker and made `_compression_tail_after_latest_compaction` fail open
+    (whole transcript kept) far more often than compressions actually ran.
+    Only "tool" stays excluded — a marker can never legitimately be a tool
+    result.
+    """
     return bool(
         isinstance(message, dict)
-        and message.get("role") == "assistant"
+        and message.get("role") in ("assistant", "user")
         and message.get("_compressed_summary") is True
         and _is_context_compression_marker(message)
     )
@@ -7148,6 +7162,65 @@ def _maybe_start_auto_snapshot_squash(
             continuation_sid,
         )
         return False
+
+
+def _pre_compression_snapshot_is_durable(snapshot_sid: str) -> bool:
+    """Confirm the archived parent transcript is actually on disk before
+    reducing the live continuation's tail.
+
+    ``_preserve_pre_compression_snapshot()`` writes the full parent session
+    synchronously during the compression rotation, *before* this decision
+    ever runs — so a durability check here is a read-only confirmation of
+    already-completed work, not a new dependency on the (best-effort,
+    thread-based) squash job. Any lookup failure fails closed: never reduce
+    the visible session without positive proof the full history survives
+    elsewhere.
+    """
+    if not snapshot_sid:
+        return False
+    try:
+        from api.models import get_session
+
+        snapshot = get_session(snapshot_sid, metadata_only=True)
+    except Exception:
+        logger.warning(
+            "auto tail reduction: could not verify durable parent snapshot %s",
+            snapshot_sid,
+            exc_info=True,
+        )
+        return False
+    return bool(getattr(snapshot, "pre_compression_snapshot", False))
+
+
+def _should_apply_active_session_tail_reduction(
+    *,
+    continuation_tail,
+    continuation_tail_boundary,
+    total_message_count,
+    archive_durable,
+    setting_enabled,
+) -> bool:
+    """Decide whether the *visible* continuation session should be reduced
+    to its post-compression tail this turn.
+
+    Deliberately decoupled from whether the background parent-squash thread
+    actually started (`_maybe_start_auto_snapshot_squash`'s return value):
+    that job is best-effort (skipped on a short summary, a manual squash
+    already running, or a thread-start failure) and its outcome says nothing
+    about whether the durable parent archive exists — which is the only
+    thing that makes reducing the visible transcript safe. Coupling the two
+    caused ~43 of 47 observed compressions to leave the active session
+    un-reduced even though the parent was already safely archived.
+    """
+    if not setting_enabled:
+        return False
+    if not archive_durable:
+        return False
+    if not continuation_tail or continuation_tail_boundary is None:
+        return False
+    if len(continuation_tail) >= (total_message_count or 0):
+        return False
+    return True
 
 
 def _cleanup_auto_tail_backup_after_writeback(
@@ -12507,15 +12580,40 @@ def _run_agent_streaming(
                         if _continuation_tail
                         else None
                     )
-                    if (
-                        _continuation_tail
-                        and _continuation_tail_boundary is not None
-                        and len(_continuation_tail) < len(s.messages or [])
-                        and _maybe_start_auto_snapshot_squash(
-                            _compression_origin_session_id,
-                            _compression_continuation_session_id,
-                            _auto_snapshot_squash_summary,
-                        )
+                    # Opportunistic: archive+squash the inactive parent snapshot
+                    # in the background regardless of whether the visible
+                    # continuation gets reduced below. This job is best-effort
+                    # (skipped on a short summary, a manual squash already
+                    # running, or a thread-start failure) and its own settings
+                    # gate (auto_squash_after_compression) is checked inside it.
+                    _maybe_start_auto_snapshot_squash(
+                        _compression_origin_session_id,
+                        _compression_continuation_session_id,
+                        _auto_snapshot_squash_summary,
+                    )
+                    # The visible continuation's own tail reduction only needs
+                    # the *durable* parent archive to already be on disk — see
+                    # _preserve_pre_compression_snapshot(), called synchronously
+                    # earlier in this same request before the background squash
+                    # job above is even scheduled. It must not depend on the
+                    # squash job's outcome (#43-of-47 undercount): full history
+                    # is safe on disk either way, and the squash job is a
+                    # separate, purely opportunistic compaction of the *parent*
+                    # session, not a precondition for reducing the child's view.
+                    _archive_durable = _pre_compression_snapshot_is_durable(
+                        _compression_origin_session_id
+                    )
+                    if _should_apply_active_session_tail_reduction(
+                        continuation_tail=_continuation_tail,
+                        continuation_tail_boundary=_continuation_tail_boundary,
+                        total_message_count=len(s.messages or []),
+                        archive_durable=_archive_durable,
+                        setting_enabled=bool(
+                            (load_settings() or {}).get(
+                                "auto_squash_after_compression"
+                            )
+                            is True
+                        ),
                     ):
                         _dropped_message_count = len(s.messages or []) - len(
                             _continuation_tail

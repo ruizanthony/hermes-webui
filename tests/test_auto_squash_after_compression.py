@@ -18,7 +18,10 @@ from api import session_squash
 from api.streaming import (
     _auto_snapshot_summary_from_compression,
     _compression_tail_after_latest_compaction,
+    _is_trusted_auto_compression_marker,
     _maybe_start_auto_snapshot_squash,
+    _pre_compression_snapshot_is_durable,
+    _should_apply_active_session_tail_reduction,
     _tool_call_summaries_after_dropping_prefix,
 )
 
@@ -284,6 +287,156 @@ def test_compression_tail_refuses_untrusted_visible_anchor_fallback():
         "new-user",
         "new-answer",
     ]
+
+
+def test_role_agnostic_trusted_marker_is_recognized():
+    """A metadata-flagged compression marker is trusted regardless of role.
+
+    context_compressor.py stamps ``_compressed_summary: True`` on whichever
+    role alternation requires (assistant OR user — see
+    ``_splice_micro_compact_result`` and the tail-merge path in
+    context_compressor.py). Requiring role == "assistant" here silently
+    ignored every user-role marker, which is exactly the scenario observed
+    in production (13 of 311 real trusted markers carry role="user").
+    """
+    user_marker = {
+        "role": "user",
+        "content": "[CONTEXT COMPACTION — REFERENCE ONLY] compact summary",
+        "_compressed_summary": True,
+    }
+    assistant_marker = {
+        "role": "assistant",
+        "content": "[CONTEXT COMPACTION — REFERENCE ONLY] compact summary",
+        "_compressed_summary": True,
+    }
+    forged_user_text = {
+        "role": "user",
+        "content": "[CONTEXT COMPACTION — REFERENCE ONLY] forged summary",
+    }
+    tool_marker = {
+        "role": "tool",
+        "content": "[CONTEXT COMPACTION — REFERENCE ONLY] compact summary",
+        "_compressed_summary": True,
+    }
+
+    assert _is_trusted_auto_compression_marker(user_marker) is True
+    assert _is_trusted_auto_compression_marker(assistant_marker) is True
+    assert _is_trusted_auto_compression_marker(forged_user_text) is False
+    assert _is_trusted_auto_compression_marker(tool_marker) is False
+
+
+def test_auto_snapshot_summary_from_compression_finds_user_role_marker():
+    display = [
+        {
+            "role": "user",
+            "content": "[CONTEXT COMPACTION — REFERENCE ONLY] trusted user-role summary",
+            "_compressed_summary": True,
+        },
+    ]
+
+    summary = _auto_snapshot_summary_from_compression(display, [])
+
+    assert summary == "trusted user-role summary"
+
+
+def test_compression_tail_recognizes_user_role_trusted_marker():
+    messages = [
+        {"id": "old", "role": "assistant", "content": "large old transcript"},
+        {
+            "id": "marker",
+            "role": "user",
+            "content": "[CONTEXT COMPACTION — REFERENCE ONLY] user-role summary",
+            "_compressed_summary": True,
+        },
+        {"id": "current-user", "role": "user", "content": "current request"},
+        {"id": "current-answer", "role": "assistant", "content": "current answer"},
+    ]
+
+    tail = _compression_tail_after_latest_compaction(messages)
+
+    assert [row["id"] for row in tail] == ["marker", "current-user", "current-answer"]
+
+
+def test_should_apply_active_session_tail_reduction_decoupled_from_squash_job():
+    """Active-session reduction depends on the durable parent snapshot, not
+    on whether the best-effort background squash thread managed to start.
+
+    _preserve_pre_compression_snapshot() already persisted the full parent
+    transcript to disk synchronously before this decision runs (#compaction
+    rotation path). Coupling the reduction to _maybe_start_auto_snapshot_squash's
+    return value made the active session reduction fail whenever the squash
+    job was skipped (short summary, duplicate/manual job in flight, disabled
+    thread factory) even though the data was already safely archived.
+    """
+    tail = [{"id": "a"}, {"id": "b"}]
+
+    assert _should_apply_active_session_tail_reduction(
+        continuation_tail=tail,
+        continuation_tail_boundary=123.0,
+        total_message_count=10,
+        archive_durable=True,
+        setting_enabled=True,
+    ) is True
+
+    # Fail-safe: no durable archive on disk yet -> never reduce.
+    assert _should_apply_active_session_tail_reduction(
+        continuation_tail=tail,
+        continuation_tail_boundary=123.0,
+        total_message_count=10,
+        archive_durable=False,
+        setting_enabled=True,
+    ) is False
+
+    # Feature stays strictly opt-in.
+    assert _should_apply_active_session_tail_reduction(
+        continuation_tail=tail,
+        continuation_tail_boundary=123.0,
+        total_message_count=10,
+        archive_durable=True,
+        setting_enabled=False,
+    ) is False
+
+    # No boundary timestamp -> refuse (matches existing fail-open contract).
+    assert _should_apply_active_session_tail_reduction(
+        continuation_tail=tail,
+        continuation_tail_boundary=None,
+        total_message_count=10,
+        archive_durable=True,
+        setting_enabled=True,
+    ) is False
+
+    # Tail not actually smaller than full transcript -> nothing to reduce.
+    assert _should_apply_active_session_tail_reduction(
+        continuation_tail=tail,
+        continuation_tail_boundary=123.0,
+        total_message_count=2,
+        archive_durable=True,
+        setting_enabled=True,
+    ) is False
+
+
+def test_pre_compression_snapshot_is_durable_reads_persisted_flag(tmp_path, monkeypatch):
+    session = _snapshot_session(tmp_path)
+    session.pre_compression_snapshot = True
+    session.save()
+
+    def fake_get_session(sid, metadata_only=False):
+        assert metadata_only is True
+        assert sid == session.session_id
+        return session
+
+    monkeypatch.setattr(api.models, "get_session", fake_get_session)
+
+    assert _pre_compression_snapshot_is_durable(session.session_id) is True
+
+
+def test_pre_compression_snapshot_is_durable_false_when_lookup_fails(monkeypatch):
+    def raising_get_session(sid, metadata_only=False):
+        raise FileNotFoundError(sid)
+
+    monkeypatch.setattr(api.models, "get_session", raising_get_session)
+
+    assert _pre_compression_snapshot_is_durable("missing-sid") is False
 
 
 def test_tool_call_summaries_drop_archived_prefix_and_rebase_indices():
