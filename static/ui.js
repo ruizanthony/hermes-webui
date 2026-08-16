@@ -15262,13 +15262,14 @@ function _compressionMessageAnchorKey(m){
   if(!norm && !attachments && !ts) return null;
   return {role:String(m.role||''), ts, text:norm, attachments};
 }
-// Plan Option A, C1: given the raw S.messages array and the
-// {role, ts, text, attachments} anchor key the server sent on 'tail_reduced'
-// (mirrors _compression_anchor_message_key in api/streaming.py), find the
-// raw index of that exact message so the caller can prune everything above
-// it. Scans from the end since the anchor is always the most recent match of
-// its kind. Returns -1 on any failure to resolve — callers must never guess
-// a cut point, matching the fail-open safety posture of the server-side
+// Plan Option A, C1: given the raw messages array (the live in-memory
+// transcript at the call site) and the {role, ts, text, attachments} anchor
+// key the server sent on 'tail_reduced' (mirrors
+// _compression_anchor_message_key in api/streaming.py), find the raw index
+// of that exact message so the caller can prune everything above it. Scans
+// from the end since the anchor is always the most recent match of its
+// kind. Returns -1 on any failure to resolve — callers must never guess a
+// cut point, matching the fail-open safety posture of the server-side
 // tail-reduction gate (_should_apply_active_session_tail_reduction).
 function _tailReductionCutRawIdx(messages, anchorKey){
   if(!anchorKey||typeof anchorKey!=='object') return -1;
