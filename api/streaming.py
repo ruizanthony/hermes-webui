@@ -12767,6 +12767,20 @@ def _run_agent_streaming(
                         s.truncation_watermark = _continuation_tail_boundary
                         s.truncation_boundary = _continuation_tail_boundary
                         _compacted_tail_this_turn = True
+                        # Plan Option A, C1: tell the browser to prune the DOM
+                        # above the compression card THIS turn instead of
+                        # waiting for the terminal 'done' event to replace the
+                        # transcript wholesale. A dedicated event (rather than
+                        # reusing 'compressed', which already fired earlier in
+                        # this block for usage/session-rotation bookkeeping,
+                        # before this reduction was even decided) keeps the
+                        # existing 'compressed' contract and timing unchanged
+                        # for every other listener.
+                        put('tail_reduced', {
+                            'session_id': s.session_id,
+                            'dropped_count': _dropped_message_count,
+                            'anchor_message_key': s.compression_anchor_message_key,
+                        })
                 with _stream_writeback_stage(_writeback_timings, "session_save"):
                     s.save()
                 _cleanup_auto_tail_backup_after_writeback(
