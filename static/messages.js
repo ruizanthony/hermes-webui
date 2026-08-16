@@ -6581,6 +6581,78 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!S.busy&&typeof renderMessages==='function') renderMessages();
     });
 
+    // Plan Option A, C1: the server emits 'tail_reduced' once it has decided
+    // (and durably archived) that the active session's own transcript should
+    // be pruned to the post-compression tail — see
+    // _should_apply_active_session_tail_reduction in api/streaming.py. This
+    // fires mid-turn, separately from 'compressed' above (which only carries
+    // usage/session-rotation bookkeeping and already fired earlier in the
+    // same block, before this reduction was decided). Do a surgical DOM prune
+    // instead of a full renderMessages() so an in-flight streaming node is
+    // never torn down mid-render (2026-08-15 renderMessages()-during-stream
+    // incident referenced in the 'compressing' handler above).
+    source.addEventListener('tail_reduced',e=>{
+      if(!S.session) return;
+      const currentSid=S.session.session_id;
+      let d={};
+      try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
+      if(!d.session_id||d.session_id!==currentSid) return;
+      const anchorKey=d.anchor_message_key;
+      const droppedCount=Number(d.dropped_count)||0;
+      if(!anchorKey||droppedCount<=0) return;
+      const cutRawIdx=(typeof _tailReductionCutRawIdx==='function')
+        ? _tailReductionCutRawIdx(S.messages, anchorKey)
+        : -1;
+      // Fail-safe, matching the server's own fail-open posture: an
+      // unresolved anchor must never guess a cut point and drop live turn
+      // state. The transcript still settles correctly at 'done'.
+      if(cutRawIdx<0) return;
+      const container=document.getElementById('messages')||document.getElementById('msgInner');
+      const anchorNode=container
+        ? (container.querySelector(`[data-msg-idx="${cutRawIdx}"]`)
+          || (typeof _messageSessionIndexForRawIdx==='function'
+            ? container.querySelector(`[data-session-msg-idx="${_messageSessionIndexForRawIdx(cutRawIdx)}"]`)
+            : null))
+        : null;
+      // If the anchor row can't be located in the live DOM, do nothing at
+      // all: slicing S.messages without also pruning the DOM would desync
+      // in-memory state from what's on screen until the next full render.
+      // The transcript still settles correctly at 'done' either way.
+      if(!anchorNode) return;
+      S.messages=S.messages.slice(cutRawIdx);
+      {
+        let node=anchorNode.previousElementSibling;
+        while(node){
+          const prev=node.previousElementSibling;
+          node.remove();
+          node=prev;
+        }
+        // Renumber every surviving [data-msg-idx] node so it stays a valid
+        // LOCAL index into the just-sliced S.messages array. data-msg-idx is
+        // raw/local (edit/regenerate compute absoluteKeepCount = _oldestIdx +
+        // msgIdx — see editMessage()/regenerateResponse() in ui.js) and must
+        // shift down by cutRawIdx; data-session-msg-idx is already an
+        // ABSOLUTE position across the whole session history and stays
+        // correct unchanged once _oldestIdx below is bumped by the same
+        // cutRawIdx, preserving the session-msg-idx invariant those rows
+        // were rendered with.
+        container.querySelectorAll('[data-msg-idx]').forEach(row=>{
+          const oldIdx=Number(row.getAttribute('data-msg-idx'));
+          if(!Number.isFinite(oldIdx)) return;
+          row.setAttribute('data-msg-idx',String(oldIdx-cutRawIdx));
+        });
+        if(typeof _oldestIdx!=='undefined') _oldestIdx=(_oldestIdx||0)+cutRawIdx;
+        const banner=document.createElement('div');
+        banner.className='tail-reduced-banner';
+        banner.setAttribute('data-tail-reduced-banner','1');
+        banner.textContent=(typeof t==='function') ? t('tail_reduced_banner',droppedCount) : `${droppedCount} messages compacted`;
+        anchorNode.parentNode.insertBefore(banner,anchorNode);
+        if(typeof _clearMessageVirtualHeightCache==='function') _clearMessageVirtualHeightCache();
+        if(typeof _visWithIdxCache!=='undefined') _visWithIdxCache=null;
+      }
+    });
+
+
     source.addEventListener('metering',e=>{
       try{
         const d=JSON.parse(e.data||'{}');
