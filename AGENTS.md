@@ -92,6 +92,32 @@ Goal continuations additionally acquire the same gate before claiming an
 intent so maintenance cannot create claim churn. Never bypass this chokepoint
 for a new autonomous turn source.
 
+### Restarting the live service
+
+The self-update path already refuses to re-exec while chat streams are active
+(#1565). Operator-driven restarts — `systemctl restart`, a signal sent to the
+service, or a deferred/scheduled restart script — bypass that guarantee and are
+the remaining way to kill a live turn.
+
+- Never restart, signal, or re-exec the live service while any session is
+  streaming. Poll `/api/sessions?sidebar_source=webui` and require
+  `is_streaming == 0`, confirmed on consecutive reads, before acting.
+- Fail closed on uncertainty: an unreachable endpoint or an unparsable response
+  is NOT idle. A restart helper that runs out of attempts must abort and leave
+  the restart to a human; it must never restart anyway after N tries.
+- Never restart from a shell whose process tree descends from the service being
+  restarted. The restart kills the deploying turn — and any long-running child
+  it started — before it can report. Detach the helper (for example via
+  `systemd-run --user`) so it outlives the restart it triggers.
+- A turn killed mid-write leaves its WebUI sidecar unwritten. The transcript
+  survives in `state.db` and is recoverable through
+  `_claim_or_synthesize_cli_session`, but the session stays unreachable until
+  that sidecar is materialized, so treat an interrupted deploy as unfinished
+  until the affected session is verified writeable again.
+- A restart that is gated on idleness cannot complete while the requesting
+  conversation is itself streaming. Hand the restart to a detached helper and
+  end the turn, or restart explicitly and accept that the current turn dies.
+
 - Keep one logical change per PR; split unrelated refactors or cleanup.
 - Read `docs/CONTRACTS.md` and the linked contract/RFC for the touched
   subsystem before editing.
