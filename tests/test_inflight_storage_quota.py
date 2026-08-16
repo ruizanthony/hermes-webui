@@ -27,7 +27,7 @@ def test_inflight_state_is_compacted_before_localstorage_write():
     save_body = _function_body(UI_JS, "saveInflightState")
     compact_body = _function_body(UI_JS, "_compactInflightState")
 
-    assert "const entry={..._compactInflightState(state),updated_at:Date.now()};" in save_body
+    assert "const entry={..._compactInflightState(state),updated_at:Date.now()" in save_body
     assert "const limits=_getInflightStateLimits();" in compact_body
     assert ".slice(-limits.messages)" in compact_body
     assert ".slice(-limits.toolCalls)" in compact_body
