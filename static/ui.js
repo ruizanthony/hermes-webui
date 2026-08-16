@@ -489,7 +489,7 @@ async function startCompressionRecovery(btn){
     const data=await api('/api/session/compression-recovery/start',{method:'POST',body:JSON.stringify({session_id:sourceSid})});
     const sid=data&&data.session&&data.session.session_id;
     if(!sid) throw new Error('Compression recovery did not return a session.');
-    try{localStorage.setItem('hermes-webui-session',sid);}catch(_){}
+    try{_rememberActiveSession(sid);}catch(_){}
     if(typeof loadSession==='function') await loadSession(sid,{preserveActiveInput:false});
     else if(data.session){S.session=data.session;S.messages=data.session.messages||[];syncTopbar();renderMessages();}
     if(typeof renderSessionList==='function') await renderSessionList();
@@ -9295,9 +9295,206 @@ function autoReadLastAssistant(){
   speechSynthesis.speak(utter);
 }
 
+// ── Per-tab identity (multi-tab isolation) ──
+//
+// localStorage is shared by every tab on the same origin, so any key that
+// describes "the" active conversation is really a single global slot that all
+// tabs fight over. Opening conversation A in tab 1 and conversation B in tab 2
+// made the last writer win: reload restored the wrong session, the reconnect
+// banner pointed at another tab's stream, and inflight transcript snapshots
+// from one tab were merged into another tab's chat.
+//
+// sessionStorage IS per-tab (and survives reload / is copied on tab
+// duplication), so we mint a stable tab id there and namespace all
+// tab-scoped runtime state with it. localStorage remains the storage
+// backend (sessionStorage would be lost by some PWA/BFCache restores), but
+// every entry is now explicitly owned by exactly one tab.
+const TAB_ID_KEY = 'hermes-webui-tab-id';
+const TAB_ID_CLAIM_KEY = 'hermes-webui-tab-claims';
+function _newTabId(){
+  try{
+    if(typeof window!=='undefined'&&window.crypto&&typeof window.crypto.randomUUID==='function'){
+      return window.crypto.randomUUID();
+    }
+  }catch(_){}
+  return 't'+Date.now().toString(36)+Math.random().toString(36).slice(2,10);
+}
+// Duplicating a tab (Chrome "Duplicate", or a PWA restore) COPIES sessionStorage,
+// so the clone would start life with the original tab's id and both tabs would
+// write to the same per-tab keys — reintroducing exactly the cross-talk this
+// fix removes. Each tab therefore claims its id in a shared localStorage
+// registry and heartbeats it while alive; a tab that finds its id already
+// claimed by a LIVE tab mints a fresh one.
+//
+// Reload safety: the claim is released on pagehide, so a normal refresh
+// re-claims the same id and keeps its in-flight recovery snapshot. Only a
+// genuinely concurrent (duplicated) tab sees a live claim.
+const _TAB_CLAIM_TTL_MS = 45000;
+const _TAB_CLAIM_HEARTBEAT_MS = 15000;
+// A tab id that has not been seen for this long is considered gone for good and
+// its leftover per-tab keys are garbage collected (see _gcOrphanTabKeys).
+const _TAB_SEEN_TTL_MS = 24 * 60 * 60 * 1000;
+const TAB_ID_SEEN_KEY = 'hermes-webui-tab-seen';
+// Storage key bases for per-tab state. Declared HERE, before the helpers that
+// reference them, so _gcOrphanTabKeys() can never hit a temporal-dead-zone
+// ReferenceError — its body is inside a try/catch, so such an error would make
+// garbage collection a silent no-op and let localStorage grow unbounded.
+const INFLIGHT_KEY_BASE = 'hermes-webui-inflight'; // legacy/global (migration only)
+const INFLIGHT_STATE_KEY_BASE = 'hermes-webui-inflight-state';
+const ACTIVE_SESSION_KEY_LEGACY = 'hermes-webui-session';
+function _readTabClaims(){
+  let claims={};
+  try{ claims=JSON.parse(localStorage.getItem(TAB_ID_CLAIM_KEY)||'{}')||{}; }catch(_){ claims={}; }
+  if(typeof claims!=='object'||!claims) claims={};
+  const now=Date.now();
+  for(const [k,v] of Object.entries(claims)){
+    if(!v||typeof v!=='number'||(now-v)>_TAB_CLAIM_TTL_MS) delete claims[k];
+  }
+  return claims;
+}
+function _writeTabClaims(claims){
+  try{ localStorage.setItem(TAB_ID_CLAIM_KEY, JSON.stringify(claims)); }catch(_){}
+}
+// "Seen" registry: unlike claims (a short-lived liveness lock released on
+// pagehide), this records the last time a tab id was active so that closed
+// tabs' leftover keys can eventually be reclaimed instead of growing the
+// localStorage footprint forever (#2386 quota).
+function _readTabSeen(){
+  let seen={};
+  try{ seen=JSON.parse(localStorage.getItem(TAB_ID_SEEN_KEY)||'{}')||{}; }catch(_){ seen={}; }
+  if(typeof seen!=='object'||!seen) seen={};
+  return seen;
+}
+function _touchTabSeen(id){
+  if(!id) return;
+  try{
+    const seen=_readTabSeen();
+    const now=Date.now();
+    seen[id]=now;
+    for(const [k,v] of Object.entries(seen)){
+      if(!v||typeof v!=='number'||(now-v)>_TAB_SEEN_TTL_MS) delete seen[k];
+    }
+    localStorage.setItem(TAB_ID_SEEN_KEY, JSON.stringify(seen));
+  }catch(_){}
+}
+// Remove per-tab keys whose owning tab has not been seen within the TTL.
+// Without this, every new tab would leave `<base>::<uuid>` entries behind and
+// slowly fill the origin's localStorage quota.
+function _gcOrphanTabKeys(){
+  try{
+    const seen=_readTabSeen();
+    const prefixes=[INFLIGHT_KEY_BASE+'::', INFLIGHT_STATE_KEY_BASE+'::', ACTIVE_SESSION_KEY_LEGACY+'::'];
+    const doomed=[];
+    for(let i=0;i<localStorage.length;i++){
+      const key=localStorage.key(i);
+      if(!key) continue;
+      const prefix=prefixes.find(p=>key.indexOf(p)===0);
+      if(!prefix) continue;
+      const owner=key.slice(prefix.length);
+      if(!owner) continue;
+      if(!Object.prototype.hasOwnProperty.call(seen,owner)) doomed.push(key);
+    }
+    for(const key of doomed){
+      try{ localStorage.removeItem(key); }catch(_){}
+    }
+  }catch(_){}
+}
+function _claimTabId(id){
+  const claims=_readTabClaims();
+  // A surviving fresh claim for this id means another tab is alive with it.
+  const takenByLiveTab=Object.prototype.hasOwnProperty.call(claims,id);
+  const finalId=takenByLiveTab?_newTabId():id;
+  claims[finalId]=Date.now();
+  _writeTabClaims(claims);
+  return finalId;
+}
+function _releaseTabId(){
+  try{
+    if(typeof window==='undefined'||!window.__hermesTabId) return;
+    const claims=_readTabClaims();
+    delete claims[window.__hermesTabId];
+    _writeTabClaims(claims);
+  }catch(_){}
+}
+function _hermesTabId(){
+  if(typeof window==='undefined') return 'default';
+  if(window.__hermesTabId) return window.__hermesTabId;
+  let id='';
+  try{ id=sessionStorage.getItem(TAB_ID_KEY)||''; }catch(_){ id=''; }
+  const claimed=_claimTabId(id||_newTabId());
+  if(claimed!==id){
+    try{ sessionStorage.setItem(TAB_ID_KEY,claimed); }catch(_){}
+  }
+  window.__hermesTabId=claimed;
+  _touchTabSeen(claimed);
+  // Reclaim keys left behind by tabs that are gone for good.
+  _gcOrphanTabKeys();
+  try{
+    if(!window.__hermesTabClaimTimer){
+      // Keep this tab's claim fresh so a concurrent tab never reuses its id.
+      window.__hermesTabClaimTimer=setInterval(()=>{
+        try{
+          const c=_readTabClaims();
+          c[window.__hermesTabId]=Date.now();
+          _writeTabClaims(c);
+          _touchTabSeen(window.__hermesTabId);
+        }catch(_){}
+      }, _TAB_CLAIM_HEARTBEAT_MS);
+      // Release on unload so a plain refresh keeps the same id (and therefore
+      // its in-flight recovery snapshot) instead of being treated as a clone.
+      // The "seen" entry is deliberately NOT removed here: it is what lets a
+      // reloading tab keep its keys while still allowing eventual GC.
+      window.addEventListener('pagehide', _releaseTabId);
+    }
+  }catch(_){}
+  return claimed;
+}
+
 // ── Reconnect banner (B4/B5: reload resilience) ──
-const INFLIGHT_KEY = 'hermes-webui-inflight'; // localStorage key for in-flight session tracking
-const INFLIGHT_STATE_KEY = 'hermes-webui-inflight-state'; // localStorage snapshots for mid-stream reload recovery
+// Tab-scoped: each tab tracks its OWN in-flight stream, so a second tab
+// starting a turn can no longer overwrite the first tab's reconnect marker.
+// (INFLIGHT_KEY_BASE / INFLIGHT_STATE_KEY_BASE are declared with the per-tab
+// identity helpers above so the storage GC can reference them safely.)
+function _inflightKey(){ return INFLIGHT_KEY_BASE+'::'+_hermesTabId(); }
+function _inflightStateKey(){ return INFLIGHT_STATE_KEY_BASE+'::'+_hermesTabId(); }
+// Back-compat aliases: several call sites (and tests) reference these names
+// directly. They now resolve per tab via the accessors above.
+if(typeof window!=='undefined'){
+  Object.defineProperty(window, 'INFLIGHT_KEY', {get:_inflightKey, configurable:true});
+  Object.defineProperty(window, 'INFLIGHT_STATE_KEY', {get:_inflightStateKey, configurable:true});
+}
+
+// Tab-scoped active session. The legacy global 'hermes-webui-session' key is
+// still written (so an unrelated/older tab and the boot fallback keep working),
+// but each tab ALSO records its own last-opened session and prefers it on
+// reload. Without this, reloading tab 1 could restore whatever conversation
+// tab 2 opened most recently.
+function _activeSessionKey(){ return ACTIVE_SESSION_KEY_LEGACY+'::'+_hermesTabId(); }
+function _rememberActiveSession(sid){
+  if(!sid) return;
+  try{ localStorage.setItem(_activeSessionKey(), sid); }catch(_){}
+  // Keep the legacy key in sync for boot fallback + older code paths.
+  try{ localStorage.setItem(ACTIVE_SESSION_KEY_LEGACY, sid); }catch(_){}
+}
+function _rememberedActiveSession(){
+  // This tab's own choice always wins over the shared/global slot.
+  // Returns null when nothing is stored, matching the original
+  // localStorage.getItem() contract this helper replaced.
+  try{
+    const own=localStorage.getItem(_activeSessionKey());
+    if(own) return own;
+  }catch(_){}
+  try{ return localStorage.getItem(ACTIVE_SESSION_KEY_LEGACY); }catch(_){ return null; }
+}
+function _forgetActiveSession(){
+  try{ localStorage.removeItem(_activeSessionKey()); }catch(_){}
+  try{ localStorage.removeItem(ACTIVE_SESSION_KEY_LEGACY); }catch(_){}
+}
+if(typeof window!=='undefined'){
+  window._rememberActiveSession=_rememberActiveSession;
+  window._rememberedActiveSession=_rememberedActiveSession;
+  window._forgetActiveSession=_forgetActiveSession;
+}
 const INFLIGHT_STATE_DEFAULT_LIMITS = {
   maxSessions:8,
   messages:24,
@@ -9403,7 +9600,7 @@ function _writeInflightStateMap(all){
 }
 function saveInflightState(sid, state){
   if(!sid||!state) return;
-  const entry={..._compactInflightState(state),updated_at:Date.now()};
+  const entry={..._compactInflightState(state),updated_at:Date.now(),tabId:_hermesTabId()};
   try{
     const all=_readInflightStateMap();
     all[sid]=entry;
@@ -9423,6 +9620,12 @@ function loadInflightState(sid, streamId){
   const all=_readInflightStateMap();
   const entry=all[sid];
   if(!entry) return null;
+  // Tab ownership: entries are stored under a per-tab key, but a duplicated tab
+  // inherits sessionStorage (hence the same tab id) and legacy entries written
+  // before this fix carry no owner at all. Reject any snapshot that explicitly
+  // belongs to a DIFFERENT tab so one tab's live transcript can never be
+  // merged into another tab's conversation.
+  if(entry.tabId && entry.tabId!==_hermesTabId()) return null;
   if(streamId&&entry.streamId&&entry.streamId!==streamId) return null;
   if(entry.updated_at&&Date.now()-entry.updated_at>10*60*1000){
     clearInflightState(sid);
