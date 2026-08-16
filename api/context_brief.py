@@ -163,6 +163,7 @@ _AUTOMATED_USER_PREFIXES = (
     "[important: background process",
     "[internal background event",
     "[context compaction",
+    "[prior context",
     "[system]",
 )
 
