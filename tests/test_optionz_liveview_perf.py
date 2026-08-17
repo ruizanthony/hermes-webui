@@ -608,43 +608,91 @@ def _make_meta_session(sid, count, updated_at=123.0):
 
 def test_persisted_message_count_uses_metadata_only(monkeypatch):
     """The companion lookup must return the persisted count via a metadata-only
-    load (never parsing the full transcript) and None when unknown."""
+    disk read (never parsing the full transcript) and None when unknown."""
     from api import background_process as bp
     import api.models as models
 
     sid = "sess-persisted-count"
 
     # Normal: metadata stub carries _metadata_message_count.
-    monkeypatch.setattr(models, "get_session", lambda _sid, metadata_only=False: _make_meta_session(_sid, 7), raising=True)
+    monkeypatch.setattr(
+        models.Session, "load_metadata_only",
+        classmethod(lambda cls, _sid, **_kw: _make_meta_session(_sid, 7)),
+        raising=True,
+    )
     assert bp.persisted_message_count_for_session(sid) == 7
 
     # Unknown count (legacy sidecar, no persisted count, empty messages) → None
     # so the caller treats it as "cannot tell", never a spurious trigger.
-    monkeypatch.setattr(models, "get_session", lambda _sid, metadata_only=False: _make_meta_session(_sid, None), raising=True)
+    monkeypatch.setattr(
+        models.Session, "load_metadata_only",
+        classmethod(lambda cls, _sid, **_kw: _make_meta_session(_sid, None)),
+        raising=True,
+    )
+    assert bp.persisted_message_count_for_session(sid) is None
+
+    # Missing sidecar → None (fail closed, never a spurious trigger).
+    monkeypatch.setattr(
+        models.Session, "load_metadata_only",
+        classmethod(lambda cls, _sid, **_kw: None),
+        raising=True,
+    )
     assert bp.persisted_message_count_for_session(sid) is None
 
     # Lookup failure (e.g. corrupt sidecar) is swallowed → None, never raises.
-    def _boom(_sid, metadata_only=False):
+    def _boom(cls, _sid, **_kw):
         raise RuntimeError("decode error")
-    monkeypatch.setattr(models, "get_session", _boom, raising=True)
+    monkeypatch.setattr(models.Session, "load_metadata_only", classmethod(_boom), raising=True)
     assert bp.persisted_message_count_for_session(sid) is None
 
 
 def test_persisted_message_count_requests_metadata_only(monkeypatch):
-    """Guard the perf contract: the lookup MUST pass metadata_only=True so it
-    never parses a 400KB+ transcript on every per-session SSE (re)connect."""
+    """Guard the perf contract: the lookup MUST go through the metadata-only
+    sidecar prefix reader so it never parses a 400KB+ transcript on every
+    per-session SSE (re)connect."""
     from api import background_process as bp
     import api.models as models
 
     seen = {}
 
-    def _spy(_sid, metadata_only=False):
-        seen["metadata_only"] = metadata_only
+    def _spy(cls, _sid, **_kw):
+        seen["called_with"] = _sid
         return _make_meta_session(_sid, 3)
 
-    monkeypatch.setattr(models, "get_session", _spy, raising=True)
+    monkeypatch.setattr(models.Session, "load_metadata_only", classmethod(_spy), raising=True)
     assert bp.persisted_message_count_for_session("sess-spy") == 3
-    assert seen.get("metadata_only") is True
+    assert seen.get("called_with") == "sess-spy"
+
+
+def test_persisted_message_count_ignores_stale_full_session_cache(monkeypatch):
+    """Regression: a cache-resident FULL Session object can carry the
+    pre-compaction in-memory transcript (e.g. 5527 rows) while the persisted
+    sidecar prefix says 141. The SSE on-subscribe self-heal count MUST come
+    from the persisted sidecar on disk — never from the cached object's
+    in-memory ``messages`` — otherwise every (re)subscribe emits a spurious
+    ``session-updated`` (5527 > known_count) and the tab loops on
+    loadSession forever (the 'Loading conversation...' freeze)."""
+    from api import background_process as bp
+    import api.models as models
+
+    sid = "sess-stale-cache-count"
+
+    class _CachedFullSession:
+        session_id = sid
+        messages = [{"role": "user", "content": str(i)} for i in range(5527)]
+
+    with models.LOCK:
+        models.SESSIONS[sid] = _CachedFullSession()
+    try:
+        monkeypatch.setattr(
+            models.Session, "load_metadata_only",
+            classmethod(lambda cls, _sid, **_kw: _make_meta_session(_sid, 141)),
+            raising=True,
+        )
+        assert bp.persisted_message_count_for_session(sid) == 141
+    finally:
+        with models.LOCK:
+            models.SESSIONS.pop(sid, None)
 
 
 def test_session_sse_handler_wires_finished_during_gap_self_heal():
