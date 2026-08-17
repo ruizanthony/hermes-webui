@@ -2126,8 +2126,45 @@ function _dispatchExtensionTurnLifecycle(type,sessionId,streamId,details={}){
   }
 }
 
-function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
-  if(!activeSid||!streamId) return;
+function attachLiveStream(attachSid, streamId, uploaded=[], options={}){
+  if(!attachSid||!streamId) return;
+  // ── Rolling live-stream identity ───────────────────────────────────────────
+  // This used to be the immutable parameter `activeSid`, captured once at
+  // attach time and compared against `S.session.session_id` by ~28 guards
+  // inside this closure. A mid-turn compression rotates the conversation: the
+  // `midturn_compacted` / `compressed` handlers below deliberately rewrite
+  // `S.session.session_id` to the continuation id so the address bar (and any
+  // reload) follows the rotation instead of resurrecting the frozen
+  // pre-compression archive. Nothing advanced the captured constant with it, so
+  // from the first rotation onward EVERY `S.session.session_id!==activeSid`
+  // guard was false for the rest of the turn: tool cards, the running row and
+  // the sidebar badge all went silent while the turn kept working (observed
+  // 4169a7cacdd3 -> 20260817_142640_dada12: 28 tool + 28 tool_complete + 71
+  // token events after the rotation, none of them rendered).
+  //
+  // Making the identity itself mutable fixes the whole class at the
+  // chokepoint instead of patching each guard: every consumer in this closure
+  // reads the current id automatically.
+  let activeSid=attachSid;
+  // The SERVER keeps emitting every event of this turn under the id the run
+  // started with: the run journal for the incident holds all 446 events under
+  // the origin id 4169a7cacdd3, including the ~9 minutes AFTER the rotation.
+  // So the two id comparisons in this closure are NOT the same question:
+  //
+  //   * "is the tab still showing this stream?"  -> compare S.session.session_id
+  //     against `activeSid`, which must ROTATE with the conversation;
+  //   * "does this event belong to this stream?" -> compare the event-provided
+  //     `d.session_id` against every id this stream has ever owned, because the
+  //     server legitimately keeps using the pre-rotation one.
+  //
+  // Rotating `activeSid` without this set would silently invert the bug:
+  // metering/title/goal/run_meta/todo events would start being rejected.
+  const _streamOwnedSids=new Set([attachSid]);
+  const _streamOwnsEventSid=(eventSid)=>{
+    const id=String(eventSid||'').trim();
+    return !id||_streamOwnedSids.has(id);
+  };
+
   const reconnecting=!!options.reconnecting;
   const _extensionTurnStartedAt=(S.session&&S.session.session_id===activeSid&&Number.isFinite(S.session.pending_started_at))
     ?S.session.pending_started_at
@@ -2165,6 +2202,67 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(INFLIGHT[activeSid].currentLiveSegmentSeq===undefined) INFLIGHT[activeSid].currentLiveSegmentSeq=0;
   let assistantText='';
   let reasoningText='';
+  // Chokepoint: adopt a rotated session id ONCE, moving both the identity and
+  // the per-session bookkeeping keyed by it. Returns true when it rotated.
+  function _adoptRotatedStreamSession(continuationSid){
+    const next=String(continuationSid||'').trim();
+    if(!next||next===activeSid) return false;
+    const prev=activeSid;
+    // Move the session-keyed live-turn state so reconnect/restore paths can
+    // still find this turn under the id the tab now shows. Never clobber an
+    // existing entry for the continuation (a concurrent attach owns it).
+    try{
+      if(INFLIGHT&&INFLIGHT[prev]&&!INFLIGHT[next]){
+        INFLIGHT[next]=INFLIGHT[prev];
+        delete INFLIGHT[prev];
+        if(typeof saveInflightState==='function'){
+          saveInflightState(next,{
+            streamId,
+            messages:INFLIGHT[next].messages||[],
+            uploaded:INFLIGHT[next].uploaded||[],
+            toolCalls:INFLIGHT[next].toolCalls||[],
+          });
+        }
+        if(typeof clearInflightState==='function') clearInflightState(prev);
+      }
+    }catch(_inflightErr){ }
+    try{
+      if(typeof LIVE_STREAMS!=='undefined'&&LIVE_STREAMS&&LIVE_STREAMS[prev]&&!LIVE_STREAMS[next]){
+        LIVE_STREAMS[next]=LIVE_STREAMS[prev];
+        delete LIVE_STREAMS[prev];
+      }
+    }catch(_liveErr){ }
+    try{
+      if(typeof _STREAM_WAS_HIDDEN!=='undefined'&&_STREAM_WAS_HIDDEN&&_STREAM_WAS_HIDDEN[prev]&&!_STREAM_WAS_HIDDEN[next]){
+        _STREAM_WAS_HIDDEN[next]=_STREAM_WAS_HIDDEN[prev];
+        delete _STREAM_WAS_HIDDEN[prev];
+      }
+      if(typeof _STREAM_NOTIFICATION_BACKGROUND!=='undefined'&&_STREAM_NOTIFICATION_BACKGROUND&&_STREAM_NOTIFICATION_BACKGROUND[prev]&&!_STREAM_NOTIFICATION_BACKGROUND[next]){
+        _STREAM_NOTIFICATION_BACKGROUND[next]=_STREAM_NOTIFICATION_BACKGROUND[prev];
+        delete _STREAM_NOTIFICATION_BACKGROUND[prev];
+      }
+    }catch(_trackerErr){ }
+    activeSid=next;
+    _streamOwnedSids.add(next);
+    // The stream is still live: keep S.activeStreamId bound to it so the
+    // ownership guards (`S.activeStreamId!==streamId`) stay satisfied and the
+    // Stop button keeps targeting the running turn.
+    try{
+      if(S.session&&S.session.session_id===next){
+        S.activeStreamId=streamId;
+        S.session.active_stream_id=streamId;
+      }
+    }catch(_bindErr){ }
+    // Sidebar: carry the running badge to the continuation row.
+    try{
+      if(typeof _adoptSessionStreamingRotation==='function') _adoptSessionStreamingRotation(prev,next);
+    }catch(_sidebarErr){ }
+    try{
+      if(typeof _rememberActiveSession==='function') _rememberActiveSession(next);
+    }catch(_rememberErr){ }
+    return true;
+  }
+
   if(S.session&&S.session.session_id===activeSid&&S.activeStreamId===streamId&&typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
   const existingLive=LIVE_STREAMS[activeSid];
   if(
@@ -5948,7 +6046,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // is the UI-side filter (a late event that arrives after the user
       // already navigated to another session must not pollute S.todos).
       // Both must agree with activeSid before we touch global state.
-      if(d.session_id&&d.session_id!==activeSid) return;
+      if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(d.session_id)) return;
       if(!S.session||S.session.session_id!==activeSid) return;
       if(!Array.isArray(d.todos)) return;
       const incomingTs=Number(d.ts)||0;
@@ -5991,7 +6089,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     source.addEventListener('state_saved',e=>{
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
-      if((d.session_id||activeSid)!==activeSid) return;
+      if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(d.session_id)) return;
       if(!S.session||S.session.session_id!==activeSid) return;
       _applyToAnchor('state_saved',d,e,null,{render:false});
       _showPersistentStateToast(d.kind, d.name||'', {created:String(d.action||'').toLowerCase()==='created'});
@@ -6000,14 +6098,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     source.addEventListener('title',e=>{
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
-      if((d.session_id||activeSid)!==activeSid) return;
+      if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(d.session_id)) return;
       applySessionTitleUpdate(activeSid, d.title);
     });
 
     source.addEventListener('title_status',e=>{
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
-      if((d.session_id||activeSid)!==activeSid) return;
+      if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(d.session_id)) return;
       try{
         console.info('[title]', {
           status:String(d.status||''),
@@ -6022,7 +6120,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     source.addEventListener('context_status',e=>{
       let d={};
       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
-      if((d.session_id||activeSid)!==activeSid) return;
+      if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(d.session_id)) return;
       const prefill=d.prefill||{};
       const status=String(prefill.status||'not_configured');
       const label=String(prefill.label||'session recall');
@@ -6050,7 +6148,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     source.addEventListener('goal',e=>{
       try{
         const d=JSON.parse(e.data||'{}');
-        if((d.session_id||activeSid)!==activeSid) return;
+        if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(d.session_id)) return;
         const goalState=String(d.state||'').trim();
         const goalEvaluatingMessage=t('goal_evaluating_progress');
         if(goalState==='evaluating'){
@@ -6109,7 +6207,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     source.addEventListener('run_meta',e=>{
       try{
         const d=JSON.parse(e.data||'{}');
-        if(d&&d.session_id&&activeSid&&d.session_id!==activeSid)return;
+        if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(d&&d.session_id))return;
         if(typeof updateLiveRunStatus==='function'){
           updateLiveRunStatus({sessionId:activeSid,meta:{
             model:String((d&&d.model)||''),
@@ -6457,7 +6555,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       try{
         const d=JSON.parse(e.data||'{}');
-        if((d.session_id||activeSid)!==activeSid) return;
+        if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(d.session_id)) return;
       }catch(_){}
       if(S.activeStreamId===streamId && _liveStreamEndScenePresent()){
         _scheduleStreamEndRecovery(source);
@@ -6510,7 +6608,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!S.session||S.session.session_id!==activeSid) return;
       let d={};
       try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
-      if(d.session_id&&d.session_id!==activeSid) return;
+      if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(d.session_id)) return;
       // Authoritative usage snapshot: the backend publishes the exact
       // context_length / threshold / prompt values its preflight decision was
       // made on. Apply them to the gauge BEFORE the "Compressing context"
@@ -6595,6 +6693,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(continuationSid,{replace:true});
         }catch(_rotateErr){ }
       }
+      // Advance the live stream's own identity in the same breath, or every
+      // `S.session.session_id!==activeSid` guard in this closure goes false for
+      // the rest of the turn and the UI freezes while the turn keeps running.
+      // Same `typeof` idiom as the rotation helpers just above: these handlers
+      // are extracted and executed in isolation by the Node test harnesses.
+      if(typeof _adoptRotatedStreamSession==='function') _adoptRotatedStreamSession(continuationSid);
       if(!S.busy&&typeof renderMessages==='function') renderMessages();
     });
 
@@ -6787,13 +6891,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(continuationSid,{replace:true});
         }catch(_rotateErr){ }
       }
+      // ── 3. move the live stream's own identity with it ──
+      // Without this the tab shows the continuation while every SSE guard in
+      // this closure still compares against the pre-rotation id: tool cards,
+      // the running row and the sidebar badge stop for the rest of the turn.
+      // `typeof` guard: the Node test harnesses execute this handler body in
+      // isolation, without the enclosing attachLiveStream scope.
+      if(typeof _adoptRotatedStreamSession==='function') _adoptRotatedStreamSession(continuationSid);
     });
 
 
     source.addEventListener('metering',e=>{
       try{
         const d=JSON.parse(e.data||'{}');
-        if((d.session_id||activeSid)!==activeSid) return;
+        if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(d.session_id)) return;
         if(d.usage&&typeof _syncCtxIndicator==='function'){
           if(S.session&&S.session.session_id===activeSid){
             S.lastUsage=typeof _mergeUsageForCtxIndicator==='function'
@@ -7107,7 +7218,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         // Belt-and-suspenders: the embedded cancel snapshot must be for THIS session.
         // The GET path guarantees it via the URL; the embedded path via the stream→session
         // binding — but reject a mismatched id so a stray payload can't overwrite the view.
-        if(sessionPayload.session_id&&sessionPayload.session_id!==activeSid) return false;
+        if(typeof _streamOwnsEventSid==='function'&&!_streamOwnsEventSid(sessionPayload.session_id)) return false;
         // Capture follow-intent BEFORE replacing S.messages: a reader who was
         // following the live stream when it got cancelled/reconnected must land at
         // the bottom (where the cancellation notice renders), not be stranded at a
