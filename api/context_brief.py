@@ -475,9 +475,17 @@ def _session_messages(session) -> list[dict]:
     brief exists to preserve. Stitch the lineage through the same memoized
     helper the transcript display uses so brief and transcript agree.
 
+    LIVE compaction goes further: the agent runtime persists the pre-compaction
+    turns only in state.db — the snapshot parent sidecar often holds just the
+    anchor summary (observed 2026-08-17: parent sidecars with 1-3 messages while
+    state.db held the full 1,500-row history). The sidecar stitch alone still
+    loses the original ask, so lineage sessions additionally merge the state.db
+    continuation history (text-deduped, chronologically ordered).
+
     State.db shims (SimpleNamespace) and forks pass through unchanged — the
-    stitcher only follows ``pre_compression_snapshot`` parents. Any stitch
-    failure falls back to the session's own messages (never a hard error).
+    stitcher only follows ``pre_compression_snapshot`` parents. Any stitch or
+    state.db failure falls back to the session's own messages (never a hard
+    error).
     """
     own = [
         message
@@ -492,11 +500,103 @@ def _session_messages(session) -> list[dict]:
         stitched = _webui_sidecar_lineage_messages_for_display(session)
     except Exception:  # pragma: no cover - brief must never break on stitch
         logger.debug("context brief: lineage stitch failed", exc_info=True)
-        return own
+        stitched = None
     stitched = [m for m in (stitched or []) if isinstance(m, dict)]
     # Fail closed: the stitched view can only extend the transcript. If it
     # comes back shorter than the child's own messages, distrust it.
-    return stitched if len(stitched) >= len(own) else own
+    base = stitched if len(stitched) >= len(own) else own
+    return _merge_lineage_with_state_db(session, base)
+
+
+# state.db serializes rich content as a NUL-prefixed JSON envelope (see
+# hermes_state._CONTENT_JSON_PREFIX). Decode it so text extraction sees the
+# actual blocks instead of the raw envelope string.
+_STATE_DB_JSON_PREFIX = "\x00json:"
+
+
+def _decode_state_db_content(content):
+    if isinstance(content, str) and content.startswith(_STATE_DB_JSON_PREFIX):
+        try:
+            return json.loads(content[len(_STATE_DB_JSON_PREFIX):])
+        except ValueError:
+            return content
+    return content
+
+
+def _lineage_merge_key(msg: dict) -> tuple:
+    text = _message_text(_decode_state_db_content(msg.get("content")))
+    normalized = " ".join(_strip_workspace_tag(text).split())
+    digest = hashlib.sha1(normalized.encode("utf-8", "replace")).hexdigest()
+    return (str(msg.get("role") or ""), digest)
+
+
+def _merge_lineage_with_state_db(session, base: list[dict]) -> list[dict]:
+    """Union the sidecar lineage view with the state.db continuation history.
+
+    Both inputs are chronological within themselves; rows are deduped on
+    (role, normalized-text hash) — the state.db mirror of a sidecar turn can
+    carry a slightly different timestamp and a ``\\x00json:`` content envelope,
+    so timestamp-based keys miss them. Ordering merges the two lists by
+    carry-forward timestamp (undated rows inherit their predecessor's ts) with
+    the sidecar side winning ties. Any failure returns ``base`` unchanged.
+    """
+    sid = str(getattr(session, "session_id", "") or "")
+    if not sid:
+        return base
+    try:
+        from api.models import get_state_db_session_messages
+
+        db_rows = get_state_db_session_messages(sid, stitch_continuations=True) or []
+    except Exception:
+        logger.debug("context brief: state.db lineage read failed for %s", sid, exc_info=True)
+        return base
+    if not db_rows:
+        return base
+    try:
+        seen = {_lineage_merge_key(m) for m in base}
+        added: list[dict] = []
+        for row in db_rows:
+            if not isinstance(row, dict):
+                continue
+            decoded = row
+            content = row.get("content")
+            if isinstance(content, str) and content.startswith(_STATE_DB_JSON_PREFIX):
+                decoded = dict(row)
+                decoded["content"] = _decode_state_db_content(content)
+            key = _lineage_merge_key(decoded)
+            if key in seen:
+                continue
+            seen.add(key)
+            added.append(decoded)
+        if not added:
+            return base
+        def _effective_ts(rows: list[dict]) -> list[float]:
+            last = 0.0
+            out = []
+            for m in rows:
+                ts = m.get("timestamp")
+                try:
+                    if ts is not None:
+                        last = float(ts)
+                except (TypeError, ValueError):
+                    pass
+                out.append(last)
+            return out
+        base_ts = _effective_ts(base)
+        added_ts = _effective_ts(added)
+        merged: list[dict] = []
+        i = j = 0
+        while i < len(base) and j < len(added):
+            if base_ts[i] <= added_ts[j]:
+                merged.append(base[i]); i += 1
+            else:
+                merged.append(added[j]); j += 1
+        merged.extend(base[i:])
+        merged.extend(added[j:])
+        return merged
+    except Exception:  # pragma: no cover - merge must never break the brief
+        logger.debug("context brief: state.db lineage merge failed for %s", sid, exc_info=True)
+        return base
 
 
 def _transcript_revision(session) -> str:

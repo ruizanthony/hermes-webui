@@ -125,3 +125,84 @@ def test_fork_parent_not_stitched(brief_env):
     child.save()
     msgs = brief_env.brief._session_messages(child)
     assert [m["content"] for m in msgs] == ["fork child ask"]
+
+
+def test_brief_merges_state_db_history_when_sidecar_parent_empty(brief_env, monkeypatch):
+    """LIVE compaction: parent sidecar holds only the anchor; state.db holds history.
+
+    Observed 2026-08-17 on session 20260817_215809_7842fc: the
+    pre_compression_snapshot parents contained 1-3 messages while state.db
+    carried the full pre-compaction history. The brief must union the state.db
+    continuation rows (including their NUL-JSON content envelopes) with the
+    sidecar lineage so the ORIGINAL ask and its conclusion survive.
+    """
+    models = brief_env.models
+    now = time.time()
+    parent = models.Session(session_id="20260101_000500_dbpar0")
+    parent.messages = [
+        {"role": "assistant", "content": "[CONTEXT COMPACTION] anchor only", "timestamp": now + 50},
+    ]
+    parent.pre_compression_snapshot = True
+    parent.save()
+    child = models.Session(session_id="20260101_000501_dbchi0")
+    child.parent_session_id = parent.session_id
+    child.messages = [
+        {"role": "user", "content": "poursuis", "timestamp": now + 60},
+    ]
+    child.save()
+
+    import json as _json
+
+    db_rows = [
+        {"role": "user", "content": "DEMANDE INITIALE state.db", "timestamp": now},
+        {
+            "role": "assistant",
+            "content": "\x00json:" + _json.dumps(
+                [{"type": "text", "text": "# CONCLUSION\n---\n> 🟢 Réponse / recommandation: conclusion state.db"}]
+            ),
+            "timestamp": now + 10,
+        },
+        # duplicate of a sidecar turn: must not appear twice
+        {"role": "user", "content": "poursuis", "timestamp": now + 60.4},
+    ]
+    monkeypatch.setattr(
+        brief_env.models,
+        "get_state_db_session_messages",
+        lambda sid, **kw: list(db_rows) if sid == child.session_id else [],
+    )
+
+    brief = brief_env.brief.build_deterministic_brief(child, child.session_id, source="webui")
+    texts = [r["text"] for r in brief["requests"]]
+    assert any("DEMANDE INITIALE state.db" in t for t in texts), texts
+    assert sum("poursuis" in t for t in texts) == 1, texts
+    excerpts = [c["excerpt"] for c in brief["accomplished"]["conclusions"]]
+    assert any("conclusion state.db" in e for e in excerpts), excerpts
+    # chronological: the state.db original ask precedes the continuation ask
+    msgs = brief_env.brief._session_messages(child)
+    contents = [str(m.get("content")) for m in msgs]
+    idx_db = next(i for i, c in enumerate(contents) if "DEMANDE INITIALE" in c)
+    idx_child = next(i for i, c in enumerate(contents) if c == "poursuis")
+    assert idx_db < idx_child
+
+
+def test_state_db_read_failure_falls_back_to_sidecar(brief_env, monkeypatch):
+    models = brief_env.models
+    now = time.time()
+    parent = models.Session(session_id="20260101_000600_dbfail")
+    parent.messages = [
+        {"role": "user", "content": "ask sidecar", "timestamp": now},
+    ]
+    parent.pre_compression_snapshot = True
+    parent.save()
+    child = models.Session(session_id="20260101_000601_dbfai2")
+    child.parent_session_id = parent.session_id
+    child.messages = [{"role": "user", "content": "suite", "timestamp": now + 5}]
+    child.save()
+
+    def _boom(sid, **kw):
+        raise RuntimeError("state.db unavailable")
+
+    monkeypatch.setattr(brief_env.models, "get_state_db_session_messages", _boom)
+    brief = brief_env.brief.build_deterministic_brief(child, child.session_id, source="webui")
+    texts = [r["text"] for r in brief["requests"]]
+    assert any("ask sidecar" in t for t in texts), texts
