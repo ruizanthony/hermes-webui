@@ -324,18 +324,30 @@ def persisted_message_count_for_session(session_id: str) -> Optional[int]:
     compares the freshly-(re)subscribed tab's last-known count against this
     persisted count; a server that is AHEAD means a turn landed during the gap.
 
-    Reads via ``metadata_only=True`` so it never parses the full transcript
+    Reads the persisted sidecar prefix DIRECTLY from disk via
+    ``Session.load_metadata_only`` so it never parses the full transcript
     (this runs on every per-session SSE (re)connect). The persisted count is
     written by ``Session.save`` as ``meta['message_count'] = len(messages)`` —
     the SAME basis the frontend's ``S.session.message_count`` is built from —
     so the comparison is apples-to-apples. Returns None when the count is
     unknown (legacy sidecars without a persisted count); the caller treats
     None as "cannot tell, do nothing", never as a trigger.
+
+    Deliberately NOT ``get_session(sid, metadata_only=True)``: that resolver
+    returns a cache-resident FULL Session object when one exists, and such an
+    object (a) has no ``_metadata_message_count`` and (b) can still carry the
+    pre-compaction in-memory transcript after a compression rotated/pruned the
+    persisted sidecar. Falling back to ``len(cached.messages)`` then reports a
+    hugely inflated count (e.g. 5527 vs the persisted 141), so every
+    (re)subscribe emits a spurious ``session-updated`` and the tab loops on
+    ``loadSession`` forever — the reported 'Loading conversation...' freeze.
     """
     try:
-        from api.models import get_session
+        from api.models import Session
 
-        s = get_session(session_id, metadata_only=True)
+        s = Session.load_metadata_only(session_id)
+        if s is None:
+            return None
         count = getattr(s, "_metadata_message_count", None)
         if count is None:
             msgs = getattr(s, "messages", None)
