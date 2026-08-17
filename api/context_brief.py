@@ -328,7 +328,7 @@ def _extract_in_flight(sid: str, session) -> dict:
 
 
 def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
-    messages = [m for m in (getattr(session, "messages", None) or []) if isinstance(m, dict)]
+    messages = _session_messages(session)
 
     requests = []
     seen_requests: set[tuple] = set()
@@ -375,6 +375,16 @@ def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
                 conclusions.append({"ts": msg.get("timestamp") or msg.get("_ts"), "excerpt": excerpt})
         last_assistant = {"ts": msg.get("timestamp") or msg.get("_ts"), "excerpt": _excerpt(text, _LAST_REPLY_EXCERPT_CHARS)}
 
+    # Preserve the mission's ORIGIN under capping: a long session can carry
+    # dozens of requests/conclusions, and keeping only the tail would drop the
+    # initial ask and its first conclusion — the prompt→conclusion sequence the
+    # brief exists to preserve across compactions. Keep the FIRST entry plus
+    # the most recent tail when over the cap.
+    def _cap_keep_first(items: list, cap: int) -> list:
+        if cap <= 0 or len(items) <= cap:
+            return items[-cap:] if cap > 0 else []
+        return [items[0]] + items[-(cap - 1):]
+
     return {
         "session_id": sid,
         "generated_at": time.time(),
@@ -389,10 +399,10 @@ def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
         },
         "goal": _extract_goal(sid, session),
         "todos": _extract_todos(messages),
-        "requests": requests[-_REQUEST_CAP:],
+        "requests": _cap_keep_first(requests, _REQUEST_CAP),
         "request_count": len(requests),
         "accomplished": {
-            "conclusions": conclusions[-_CONCLUSION_CAP:],
+            "conclusions": _cap_keep_first(conclusions, _CONCLUSION_CAP),
             "conclusion_count": len(conclusions),
             "compressions": compressions[-_COMPRESSION_CAP:],
             "compression_count": len(compressions),
@@ -456,11 +466,37 @@ def load_llm_brief(session, sid: str) -> dict | None:
 
 
 def _session_messages(session) -> list[dict]:
-    return [
+    """Return the DISPLAY transcript for brief building and revision hashing.
+
+    WebUI compression continuations keep older turns in ``pre_compression_snapshot``
+    parent sidecars; the child's own ``messages`` array starts at the anchor.
+    Building the brief from the child alone loses the ORIGINAL user request and
+    every conclusion emitted before the compaction — exactly the sequence the
+    brief exists to preserve. Stitch the lineage through the same memoized
+    helper the transcript display uses so brief and transcript agree.
+
+    State.db shims (SimpleNamespace) and forks pass through unchanged — the
+    stitcher only follows ``pre_compression_snapshot`` parents. Any stitch
+    failure falls back to the session's own messages (never a hard error).
+    """
+    own = [
         message
         for message in (getattr(session, "messages", None) or [])
         if isinstance(message, dict)
     ]
+    if not str(getattr(session, "parent_session_id", "") or "").strip():
+        return own
+    try:
+        from api.routes import _webui_sidecar_lineage_messages_for_display
+
+        stitched = _webui_sidecar_lineage_messages_for_display(session)
+    except Exception:  # pragma: no cover - brief must never break on stitch
+        logger.debug("context brief: lineage stitch failed", exc_info=True)
+        return own
+    stitched = [m for m in (stitched or []) if isinstance(m, dict)]
+    # Fail closed: the stitched view can only extend the transcript. If it
+    # comes back shorter than the child's own messages, distrust it.
+    return stitched if len(stitched) >= len(own) else own
 
 
 def _transcript_revision(session) -> str:
