@@ -1617,6 +1617,11 @@ def _run_gateway_chat_streaming(
             except Exception:
                 logger.debug("Failed to clear gateway stream state", exc_info=True)
             _cleanup_gateway_pending_mirror(session_id)
+        try:
+            from api.streaming import _release_cancel_reason
+            _release_cancel_reason(stream_id)
+        except Exception:
+            logger.debug("Failed to release cancel provenance", exc_info=True)
         with STREAMS_LOCK:
             AGENT_INSTANCES.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)

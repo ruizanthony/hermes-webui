@@ -258,4 +258,7 @@ class TestCancelledTurnPersistenceGuards:
         assert "_cancel_event_payload('Cancelled by user', s)" not in worker_block
         assert "_cancel_event_payload('Cancelled by user', session=" not in worker_block
         assert "None if ephemeral else s" not in worker_block
-        assert "_cancel_event_payload('Cancelled by user', session=_cancel_session_payload)" in cancel_stream_block
+        # cancel_stream() owns the session-payload-bearing terminal event. The
+        # message itself is now provenance-derived (_cancel_message) instead of
+        # a hard-coded "Cancelled by user" — see tests/test_cancel_provenance.py.
+        assert "_cancel_event_payload(_cancel_message, session=_cancel_session_payload" in cancel_stream_block

@@ -240,17 +240,134 @@ def _ephemeral_session_payload(session_id: str, messages) -> dict:
     )
 
 
+# Cancel provenance: which client gesture asked for the cancellation.
+#
+# The frontend (static/boot.js) already distinguishes an explicit Stop button
+# from /stop, /interrupt and the sidebar control, but historically only logged
+# that reason to the browser console. The server then hard-coded the terminal
+# message to "Cancelled by user", so a cancel triggered by anything else still
+# told the human *they* did it — an accusation the backend could not prove
+# (this deployment has no reverse proxy, hence no HTTP access log either).
+#
+# Only reasons in this set are genuine, deliberate human gestures.
+_USER_INITIATED_CANCEL_REASONS = frozenset({
+    'composer-stop',      # Stop button in the composer
+    'slash-stop',         # /stop
+    'slash-interrupt',    # /interrupt
+    'busy-interrupt',     # send-while-busy in interrupt mode
+    'sidebar-stop',       # sidebar "Stop response"
+    'explicit-cancel',    # generic explicit path (boot.js default)
+})
+
+_USER_CANCEL_MESSAGE = 'Cancelled by user'
+# Neutral wording for a cancel whose origin the server cannot attribute.
+# Never claim the human did it without evidence (fail closed on blame).
+_UNATTRIBUTED_CANCEL_MESSAGE = 'Run cancelled'
+
+
+def _normalize_cancel_reason(reason) -> str | None:
+    """Return a short, safe provenance token, or None when unknown.
+
+    Hostile input guard: this value reaches the journal and the session
+    transcript, so it is length-capped and restricted to a conservative
+    character set instead of being trusted verbatim from the query string.
+    """
+    if reason is None:
+        return None
+    text = str(reason).strip()
+    if not text:
+        return None
+    text = re.sub(r'[^A-Za-z0-9._:-]', '-', text)[:64]
+    return text or None
+
+
+def _cancel_message_for_reason(reason) -> str:
+    """Map cancel provenance to the user-facing terminal message.
+
+    A known human gesture keeps the familiar "Cancelled by user" wording.
+    Anything else — unknown, missing, or machine-triggered — stays neutral.
+    """
+    normalized = _normalize_cancel_reason(reason)
+    if normalized and normalized in _USER_INITIATED_CANCEL_REASONS:
+        return _USER_CANCEL_MESSAGE
+    return _UNATTRIBUTED_CANCEL_MESSAGE
+
+
+# Cancel provenance registry, keyed by stream_id.
+#
+# cancel_stream() records the reason here BEFORE setting the cancel flag, so the
+# streaming worker — which notices the flag asynchronously at ~11 different exit
+# points — can emit the same attributed message instead of hard-coding
+# "Cancelled by user" at each site. Owner: cancel_stream() writes;
+# _release_cancel_reason() clears it wherever CANCEL_FLAGS is popped, so the
+# entry cannot outlive its stream on any exit path (success, error, cancel,
+# teardown).
+_CANCEL_REASONS: dict[str, str] = {}
+_CANCEL_REASONS_LOCK = threading.Lock()
+
+
+def _record_cancel_reason(stream_id, reason) -> str | None:
+    """Record cancel provenance for ``stream_id``. Returns the normalized token."""
+    normalized = _normalize_cancel_reason(reason)
+    if not stream_id:
+        return normalized
+    with _CANCEL_REASONS_LOCK:
+        if normalized:
+            _CANCEL_REASONS[str(stream_id)] = normalized
+        else:
+            # An unattributed cancel must not inherit a previous reason.
+            _CANCEL_REASONS.pop(str(stream_id), None)
+    return normalized
+
+
+def _peek_cancel_reason(stream_id):
+    if not stream_id:
+        return None
+    with _CANCEL_REASONS_LOCK:
+        return _CANCEL_REASONS.get(str(stream_id))
+
+
+def _release_cancel_reason(stream_id) -> None:
+    """Drop recorded provenance. Safe to call repeatedly."""
+    if not stream_id:
+        return
+    with _CANCEL_REASONS_LOCK:
+        _CANCEL_REASONS.pop(str(stream_id), None)
+
+
+def _cancel_payload_for_stream(stream_id, *, session: dict | None = None) -> dict:
+    """Build a cancel terminal payload using this stream's recorded provenance.
+
+    Used by the streaming worker's cancel exits so the message the user reads
+    matches what actually triggered the cancellation.
+    """
+    reason = _peek_cancel_reason(stream_id)
+    return _cancel_event_payload(
+        _cancel_message_for_reason(reason),
+        session=session,
+        reason=reason,
+    )
+
+
 def _cancel_event_payload(
     message: str = "Cancelled by user",
     *,
     session: dict | None = None,
+    reason=None,
 ) -> dict:
-    """Return base cancel terminal event metadata."""
+    """Return base cancel terminal event metadata.
+
+    ``reason`` records *why* the run was cancelled so a disputed cancellation
+    can be traced from the run journal alone.
+    """
     payload = {
         'message': message,
         'type': 'cancelled',
         'status': 'cancelled',
     }
+    normalized = _normalize_cancel_reason(reason)
+    if normalized:
+        payload['reason'] = normalized
     if session:
         payload['session'] = session
         payload['session_id'] = session.get('session_id')
@@ -11509,7 +11626,7 @@ def _run_agent_streaming(
                         logger.debug("Failed to interrupt agent before start")
                     with _agent_lock:
                         _finalize_cancelled_turn(s, ephemeral=ephemeral, message='Task cancelled before start.', stream_id=stream_id)
-                    put('cancel', _cancel_event_payload('Cancelled by user'))
+                    put('cancel', _cancel_payload_for_stream(stream_id))
                     return
 
             # Announce the run's effective model + reasoning effort up front so
@@ -11770,7 +11887,7 @@ def _run_agent_streaming(
                             )
                         except Exception:
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                put('cancel', _cancel_event_payload('Cancelled by user'))
+                put('cancel', _cancel_payload_for_stream(stream_id))
                 return
             # ── Ephemeral mode (/btw): deliver answer, skip persistence, cleanup ──
             if ephemeral:
@@ -11822,7 +11939,7 @@ def _run_agent_streaming(
                         )
                     except Exception:
                         logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                put('cancel', _cancel_event_payload('Cancelled by user'))
+                put('cancel', _cancel_payload_for_stream(stream_id))
                 return
             _writeback_timings = []
             _writeback_started = time.perf_counter()
@@ -11883,7 +12000,7 @@ def _run_agent_streaming(
                             )
                         except Exception:
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                        put('cancel', _cancel_event_payload('Cancelled by user'))
+                        put('cancel', _cancel_payload_for_stream(stream_id))
                         return
                     _result_messages = _settle_result_messages(
                         s,
@@ -12157,7 +12274,7 @@ def _run_agent_streaming(
                                 )
                             except Exception:
                                 logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                        put('cancel', _cancel_event_payload('Cancelled by user'))
+                        put('cancel', _cancel_payload_for_stream(stream_id))
                         return
                     _err_str = str(_last_err) if _last_err else ''
                     if (
@@ -12917,7 +13034,7 @@ def _run_agent_streaming(
                         )
                     except Exception:
                         logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                    put('cancel', _cancel_event_payload('Cancelled by user'))
+                    put('cancel', _cancel_payload_for_stream(stream_id))
                     return
                 if (
                     _compressed
@@ -13023,7 +13140,7 @@ def _run_agent_streaming(
                         )
                     except Exception:
                         logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                    put('cancel', _cancel_event_payload('Cancelled by user'))
+                    put('cancel', _cancel_payload_for_stream(stream_id))
                     return
                 if not ephemeral:
                     try:
@@ -13127,7 +13244,7 @@ def _run_agent_streaming(
                         )
                     except Exception:
                         logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                    put('cancel', _cancel_event_payload('Cancelled by user'))
+                    put('cancel', _cancel_payload_for_stream(stream_id))
                     return
                 try:
                     _latest_pause_owner = get_session(getattr(s, 'session_id', session_id))
@@ -13159,7 +13276,7 @@ def _run_agent_streaming(
                             )
                         except Exception:
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                        put('cancel', _cancel_event_payload('Cancelled by user'))
+                        put('cancel', _cancel_payload_for_stream(stream_id))
                         return
                     with _stream_writeback_stage(_writeback_timings, "process_wakeup_pause_clear_save"):
                         s.save(touch_updated_at=False)
@@ -13182,7 +13299,7 @@ def _run_agent_streaming(
                             )
                         except Exception:
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-                        put('cancel', _cancel_event_payload('Cancelled by user'))
+                        put('cancel', _cancel_payload_for_stream(stream_id))
                         return
                 _success_writeback_committed = True
             usage = {
@@ -13595,7 +13712,7 @@ def _run_agent_streaming(
                             )
                         except Exception:
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
-            put('cancel', _cancel_event_payload('Cancelled by user'))
+            put('cancel', _cancel_payload_for_stream(stream_id))
             return
         _exc_is_quota = _classification['type'] == 'quota_exhausted'
         # Exception quota text still includes: 'more credits' in _exc_lower, 'can only afford' in _exc_lower, 'fewer max_tokens' in _exc_lower.
@@ -13901,6 +14018,7 @@ def _run_agent_streaming(
         # CLI/cron env fallback resumes — same lifecycle slot as the env
         # restore above.
         _reset_turn_session_identity(_turn_session_identity_tokens)
+        _release_cancel_reason(stream_id)
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)
@@ -14108,8 +14226,13 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                        "stream_id": active_stream_id})
 
 
-def cancel_stream(stream_id: str) -> bool:
+def cancel_stream(stream_id: str, reason=None) -> bool:
     """Signal an in-flight stream to cancel. Returns True if work was found.
+
+    ``reason`` is the client-supplied provenance token (``composer-stop``,
+    ``slash-stop``, ``sidebar-stop``, ...). It is logged and carried into the
+    terminal event so a disputed cancellation can be attributed after the fact;
+    without it the server can only report that *something* cancelled the run.
 
     Eagerly releases the session lock (pops STREAMS/CANCEL_FLAGS/AGENT_INSTANCES
     and clears session.active_stream_id) so new /api/chat/start requests succeed
@@ -14120,6 +14243,17 @@ def cancel_stream(stream_id: str) -> bool:
     ordering (streaming thread does LOCK → STREAMS_LOCK; inverting would deadlock).
     """
     from api import config as _live_config
+
+    # Resolve provenance ONCE and use that single value for the log line, the
+    # agent interrupt text and the terminal event, so the record an operator
+    # reads and the message the user sees can never disagree.
+    _cancel_reason = _record_cancel_reason(stream_id, reason)
+    _cancel_message = _cancel_message_for_reason(_cancel_reason)
+    logger.info(
+        "Cancel requested for stream %s (reason=%s)",
+        stream_id,
+        _cancel_reason or "unattributed",
+    )
 
     # Use module-level aliases (imported from api.config at startup).
     # In production these are always the same objects as api.config.STREAMS etc.
@@ -14238,7 +14372,7 @@ def cancel_stream(stream_id: str) -> bool:
             pass
     if agent:
         try:
-            agent.interrupt("Cancelled by user")
+            agent.interrupt(_cancel_message)
         except Exception as e:
             # Log but don't block the cancel flow
             import logging
@@ -14502,7 +14636,7 @@ def cancel_stream(stream_id: str) -> bool:
             except Exception:
                 logger.debug("Failed to note cancel event_id %s for stream %s", _cancel_event_id, stream_id, exc_info=True)
         try:
-            _payload = _cancel_event_payload('Cancelled by user', session=_cancel_session_payload)
+            _payload = _cancel_event_payload(_cancel_message, session=_cancel_session_payload, reason=_cancel_reason)
             q.put_nowait(('cancel', _payload))
         except Exception:
             logger.debug("Failed to put cancel event to queue")

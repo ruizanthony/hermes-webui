@@ -43,7 +43,7 @@ class TestCancelInterrupt:
         AGENT_INSTANCES[stream_id] = mock_agent
 
         # Execute
-        result = cancel_stream(stream_id)
+        result = cancel_stream(stream_id, reason='composer-stop')
 
         # Assert
         assert result is True
@@ -64,7 +64,7 @@ class TestCancelInterrupt:
         AGENT_INSTANCES[stream_id] = mock_agent
 
         # Should not raise exception
-        result = cancel_stream(stream_id)
+        result = cancel_stream(stream_id, reason='composer-stop')
 
         # Assert
         assert result is True
@@ -81,7 +81,7 @@ class TestCancelInterrupt:
         # Note: AGENT_INSTANCES[stream_id] not set (simulating race condition)
 
         # Should succeed even without agent
-        result = cancel_stream(stream_id)
+        result = cancel_stream(stream_id, reason='composer-stop')
 
         # Assert
         assert result is True
@@ -124,7 +124,7 @@ class TestCancelInterrupt:
             SESSION_AGENT_CACHE[session_id] = (mock_agent, "sig")
 
         with patch("api.streaming.get_session", return_value=mock_session):
-            result = cancel_stream(stream_id)
+            result = cancel_stream(stream_id, reason='composer-stop')
 
         assert result is True
         assert ACTIVE_RUNS[stream_id]["phase"] == "cancelling"
@@ -143,7 +143,7 @@ class TestCancelInterrupt:
         cancel_event = threading.Event()
         CANCEL_FLAGS[stream_id] = cancel_event
 
-        result = cancel_stream(stream_id)
+        result = cancel_stream(stream_id, reason='composer-stop')
 
         assert result is True
         assert cancel_event.is_set()
@@ -156,7 +156,7 @@ class TestCancelInterrupt:
         STREAMS[stream_id] = q
         CANCEL_FLAGS[stream_id] = threading.Event()
 
-        result = cancel_stream(stream_id)
+        result = cancel_stream(stream_id, reason='composer-stop')
 
         assert result is True
         # Check that cancel message was queued
@@ -216,7 +216,7 @@ class TestCancelInterrupt:
         mock_session.save = Mock()
 
         with patch("api.streaming.get_session", return_value=mock_session):
-            result = cancel_stream(stream_id)
+            result = cancel_stream(stream_id, reason='composer-stop')
 
         assert result is True
         mock_agent.interrupt.assert_called_once_with("Cancelled by user")
@@ -279,7 +279,7 @@ class TestCancelInterrupt:
 
         with patch("api.streaming.get_session", return_value=mock_session), \
                 patch("api.streaming._cached_agent_matches_session", return_value=True):
-            result = cancel_stream(stream_id)
+            result = cancel_stream(stream_id, reason='composer-stop')
 
         assert result is True
         mock_agent.interrupt.assert_called_once_with("Cancelled by user")

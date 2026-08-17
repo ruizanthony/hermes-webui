@@ -13833,7 +13833,12 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, payload)
 
     if parsed.path == "/api/chat/cancel":
-        stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
+        _cancel_qs = parse_qs(parsed.query)
+        stream_id = _cancel_qs.get("stream_id", [""])[0]
+        # Cancel provenance supplied by the client (composer-stop, slash-stop,
+        # sidebar-stop, ...). Without it the server can only report that
+        # *something* cancelled the run — it must not claim the user did.
+        cancel_reason = _cancel_qs.get("reason", [""])[0]
         if not stream_id:
             return bad(handler, "stream_id required")
         if not _stream_id_visible_to_request_profile(handler, stream_id):
@@ -13876,10 +13881,12 @@ def handle_get(handler, parsed) -> bool:
         from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
 
         if runtime_adapter_enabled():
-            adapter = LegacyJournalRuntimeAdapter(cancel_delegate=cancel_stream)
+            adapter = LegacyJournalRuntimeAdapter(
+                cancel_delegate=lambda sid: cancel_stream(sid, reason=cancel_reason)
+            )
             cancelled = adapter.cancel_run(stream_id).accepted
         else:
-            cancelled = cancel_stream(stream_id)
+            cancelled = cancel_stream(stream_id, reason=cancel_reason)
         return j(handler, {"ok": True, "cancelled": cancelled, "stream_id": stream_id})
 
     if parsed.path == "/api/chat/stream":
