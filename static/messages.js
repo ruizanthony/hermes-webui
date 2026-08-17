@@ -6503,8 +6503,217 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(typeof clearCompressionUi==='function') clearCompressionUi();
       else window._compressionUi=null;
       if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
+      // Follow the rotation: compression replaces session A with continuation B
+      // and freezes A as a pre-compression archive. Until the tab moves to B,
+      // the address bar (and any reload/restore built from it) points at that
+      // archive -- where the active-session tail reduction deliberately refuses
+      // to prune, so the user sees the full pre-compression transcript and
+      // concludes compaction did nothing. The terminal 'done' handler already
+      // calls _setActiveSessionUrl, but that can be minutes away on a long turn
+      // and is lost entirely if the tab is reloaded or backgrounded first.
+      // Purely local: no fetch, no re-render. The transcript itself is handled
+      // by 'tail_reduced' (mid-turn) and by 'done' (settlement).
+      if(continuationSid&&continuationSid!==currentSid){
+        try{
+          S.session.session_id=continuationSid;
+          if(typeof _rememberActiveSession==='function') _rememberActiveSession(continuationSid);
+          if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(continuationSid,{replace:true});
+        }catch(_rotateErr){ }
+      }
       if(!S.busy&&typeof renderMessages==='function') renderMessages();
     });
+
+    // Plan Option A, C1: the server emits 'tail_reduced' once it has decided
+    // (and durably archived) that the active session's own transcript should
+    // be pruned to the post-compression tail — see
+    // _should_apply_active_session_tail_reduction in api/streaming.py. This
+    // fires mid-turn, separately from 'compressed' above (which only carries
+    // usage/session-rotation bookkeeping and already fired earlier in the
+    // same block, before this reduction was decided). Do a surgical DOM prune
+    // instead of a full renderMessages() so an in-flight streaming node is
+    // never torn down mid-render (2026-08-15 renderMessages()-during-stream
+    // incident referenced in the 'compressing' handler above).
+    source.addEventListener('tail_reduced',e=>{
+      if(!S.session) return;
+      const currentSid=S.session.session_id;
+      let d={};
+      try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
+      if(!d.session_id||d.session_id!==currentSid) return;
+      const anchorKey=d.anchor_message_key;
+      const droppedCount=Number(d.dropped_count)||0;
+      if(!anchorKey||droppedCount<=0) return;
+      const cutRawIdx=(typeof _tailReductionCutRawIdx==='function')
+        ? _tailReductionCutRawIdx(S.messages, anchorKey)
+        : -1;
+      // Fail-safe, matching the server's own fail-open posture: an
+      // unresolved anchor must never guess a cut point and drop live turn
+      // state. The transcript still settles correctly at 'done'.
+      if(cutRawIdx<0) return;
+      // #msgInner (the scroll-inner wrapper renderMessages() actually
+      // populates with [data-msg-idx] rows) must be preferred over #messages
+      // (the outer pane wrapper that also holds .empty-state,
+      // .live-compression-cards and other siblings with no message rows).
+      // #messages always exists once the pane has mounted, so
+      // `getElementById('messages')||getElementById('msgInner')` would never
+      // fall through to the real row container -- checked with the exact
+      // shipped DOM via Playwright against a live dev server (2026-08-16).
+      const container=document.getElementById('msgInner')||document.getElementById('messages');
+      // The anchor message itself (a compaction marker) is never rendered as
+      // its own row -- _messageIsRenderable()/_isContextCompactionMessage()
+      // skip it in renderMessages(). Find the first surviving row whose
+      // local raw index is >= cutRawIdx instead of requiring an exact match;
+      // querySelectorAll returns rows in document order, which is ascending
+      // by data-msg-idx, so the first qualifying row is the correct anchor.
+      let anchorRow=null;
+      if(container){
+        const rows=container.querySelectorAll('[data-msg-idx]');
+        for(let i=0;i<rows.length;i++){
+          const idx=Number(rows[i].getAttribute('data-msg-idx'));
+          if(Number.isFinite(idx)&&idx>=cutRawIdx){ anchorRow=rows[i]; break; }
+        }
+      }
+      // If the anchor row can't be located in the live DOM, do nothing at
+      // all: slicing S.messages without also pruning the DOM would desync
+      // in-memory state from what's on screen until the next full render.
+      // The transcript still settles correctly at 'done' either way.
+      if(!anchorRow) return;
+      // [data-msg-idx] rows are not always direct children of container: a
+      // single visual turn (.msg-row.assistant-turn) can bundle several
+      // assistant-segment children (tool_call -> text -> tool_call -> text)
+      // sharing one .assistant-turn-blocks wrapper. Only the TOP-LEVEL
+      // .msg-row is a sibling under container; that's what previousSibling
+      // walking and insertBefore must operate on.
+      let anchorNode=anchorRow;
+      while(anchorNode&&anchorNode.parentElement!==container) anchorNode=anchorNode.parentElement;
+      if(!anchorNode) return;
+      // Guard against splitting a multi-segment turn: bail out if the
+      // top-level node straddles the cut boundary, i.e. it contains any
+      // [data-msg-idx] BELOW cutRawIdx alongside ones at/above it (e.g. one
+      // assistant-turn bundling segments at raw idx 3 and 5 when cutRawIdx
+      // is 4 -- dropping the whole node would also destroy segment 5, which
+      // must be kept). A node whose minimum contained index is >= cutRawIdx
+      // is fully on the "kept" side and safe to use as the removal boundary
+      // even when cutRawIdx itself corresponds to a non-rendered message
+      // (the compaction marker is always skipped by
+      // _messageIsRenderable()/_isContextCompactionMessage(), so the next
+      // rendered index is routinely > cutRawIdx with nothing unsafe about
+      // it -- confirmed against the shipped bundle on a live dev server,
+      // 2026-08-16). If the cut point falls mid-turn, let the terminal
+      // 'done' event settle the transcript instead, same fail-open posture
+      // as the anchor-not-found case above.
+      const idxInAnchorNode=(anchorNode.hasAttribute('data-msg-idx')
+        ? [Number(anchorNode.getAttribute('data-msg-idx'))]
+        : Array.from(anchorNode.querySelectorAll('[data-msg-idx]'))
+            .map(r=>Number(r.getAttribute('data-msg-idx'))))
+        .filter(Number.isFinite);
+      if(!idxInAnchorNode.length||Math.min(...idxInAnchorNode)<cutRawIdx) return;
+      S.messages=S.messages.slice(cutRawIdx);
+      {
+        let node=anchorNode.previousElementSibling;
+        while(node){
+          const prev=node.previousElementSibling;
+          node.remove();
+          node=prev;
+        }
+        // Renumber every surviving [data-msg-idx] node so it stays a valid
+        // LOCAL index into the just-sliced S.messages array. data-msg-idx is
+        // raw/local (edit/regenerate compute absoluteKeepCount = _oldestIdx +
+        // msgIdx — see editMessage()/regenerateResponse() in ui.js) and must
+        // shift down by cutRawIdx; data-session-msg-idx is already an
+        // ABSOLUTE position across the whole session history and stays
+        // correct unchanged once _oldestIdx below is bumped by the same
+        // cutRawIdx, preserving the session-msg-idx invariant those rows
+        // were rendered with.
+        container.querySelectorAll('[data-msg-idx]').forEach(row=>{
+          const oldIdx=Number(row.getAttribute('data-msg-idx'));
+          if(!Number.isFinite(oldIdx)) return;
+          row.setAttribute('data-msg-idx',String(oldIdx-cutRawIdx));
+        });
+        if(typeof _oldestIdx!=='undefined') _oldestIdx=(_oldestIdx||0)+cutRawIdx;
+        const banner=document.createElement('div');
+        banner.className='tail-reduced-banner';
+        banner.setAttribute('data-tail-reduced-banner','1');
+        banner.textContent=(typeof t==='function') ? t('tail_reduced_banner',droppedCount) : `${droppedCount} messages compacted`;
+        anchorNode.parentNode.insertBefore(banner,anchorNode);
+        if(typeof _clearMessageVirtualHeightCache==='function') _clearMessageVirtualHeightCache();
+        if(typeof _visWithIdxCache!=='undefined') _visWithIdxCache=null;
+      }
+    });
+
+
+    // Mid-turn compaction (2026-08-16). The server publishes this the moment
+    // the agent reports "compaction complete" — typically many minutes before
+    // the terminal 'done' event on a long tool-heavy turn, and well before the
+    // end-of-turn 'tail_reduced' path runs at all. Two effects, both cheap and
+    // strictly local:
+    //   1. collapse the archived history above the live compaction card, so a
+    //      long conversation stops costing scroll/render weight immediately;
+    //   2. follow the session rotation in the address bar right away, instead
+    //      of leaving the tab on the frozen pre-compression archive for the
+    //      rest of the turn (that archive is exactly where the user sees the
+    //      "nothing was compacted" full transcript).
+    // S.messages is intentionally NOT sliced here: mid-turn the server has not
+    // yet reconciled the authoritative transcript, so the array must stay as
+    // rendered until 'done'/'tail_reduced' settles it. Only the DOM above the
+    // card is pruned, and the pruned rows are already durable on disk (the
+    // server proved it before emitting).
+    source.addEventListener('midturn_compacted',e=>{
+      if(!S.session) return;
+      let d={};
+      try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
+      const originSid=d.old_session_id||d.session_id||'';
+      const continuationSid=d.continuation_session_id||d.new_session_id||'';
+      const currentSid=S.session.session_id;
+      // Only act for the conversation this tab is actually showing.
+      if(originSid&&originSid!==currentSid&&continuationSid!==currentSid) return;
+      // ── 1. prune the DOM above the live compaction card ──
+      const container=document.getElementById('msgInner')||document.getElementById('messages');
+      if(container){
+        // The live compaction card is the visual boundary between archived
+        // history and the ongoing turn. Anchor on its top-level row so the
+        // in-flight streaming node is never touched.
+        let cardNode=container.querySelector('.compression-card-row')
+          ||container.querySelector('.live-compression-cards')
+          ||container.querySelector('.compression-card');
+        while(cardNode&&cardNode.parentElement&&cardNode.parentElement!==container){
+          cardNode=cardNode.parentElement;
+        }
+        // Fail-safe: with no resolvable anchor, leave the DOM completely
+        // alone. The transcript still settles at 'done'.
+        if(cardNode&&cardNode.parentElement===container){
+          let removed=0;
+          let node=cardNode.previousElementSibling;
+          while(node){
+            const prev=node.previousElementSibling;
+            // Never remove a node that carries the live turn being streamed.
+            if(node.id==='liveAssistantTurn'){ node=prev; continue; }
+            node.remove();
+            removed++;
+            node=prev;
+          }
+          if(removed>0){
+            const banner=document.createElement('div');
+            banner.className='tail-reduced-banner';
+            banner.setAttribute('data-midturn-compacted-banner','1');
+            banner.textContent=(typeof t==='function')
+              ? t('midturn_compacted_banner')
+              : 'Earlier messages compacted — history archived';
+            cardNode.parentNode.insertBefore(banner,cardNode);
+            if(typeof _clearMessageVirtualHeightCache==='function') _clearMessageVirtualHeightCache();
+            if(typeof _visWithIdxCache!=='undefined') _visWithIdxCache=null;
+          }
+        }
+      }
+      // ── 2. follow the rotation immediately ──
+      if(continuationSid&&continuationSid!==currentSid){
+        try{
+          S.session.session_id=continuationSid;
+          if(typeof _rememberActiveSession==='function') _rememberActiveSession(continuationSid);
+          if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(continuationSid,{replace:true});
+        }catch(_rotateErr){ }
+      }
+    });
+
 
     source.addEventListener('metering',e=>{
       try{

@@ -57,7 +57,11 @@ from api.helpers import (
     scrub_internal_replay_fields,
     _redact_text,
 )
-from api.compression_anchor import is_context_compression_marker, visible_messages_for_anchor
+from api.compression_anchor import (
+    compaction_summary_segment,
+    is_context_compression_marker,
+    visible_messages_for_anchor,
+)
 from api.compression_recovery import stamp_compression_exhausted_recovery
 from api.metering import meter
 from api.run_journal import RunJournalWriter
@@ -614,6 +618,36 @@ def _is_agent_compression_start_status(kind: str, message: str) -> bool:
         or '- compressing (' in m
         or 'compression attempt' in m
     )
+
+
+def _is_agent_compression_done_status(kind: str, message: str) -> bool:
+    """Return True for the agent's structured *compaction complete* edge.
+
+    Contract with hermes-agent: ``_emit_compaction_done()`` in
+    ``agent/conversation_compression.py`` calls
+    ``status_callback("compacted", COMPACTION_DONE_STATUS)``. That call sits in
+    ``_release_lock()``, which runs *after* ``agent.session_id`` has rotated to
+    the continuation and after the child session has been committed — so when
+    this fires, the rotation is already durable and the continuation is the
+    live session.
+
+    Matching on ``kind`` is the whole point: the wording of the status text is
+    cosmetic and localisable, while the kind is the structural signal. The
+    message is only used as a weak secondary guard so an unrelated future
+    ``compacted`` kind (e.g. a memory compaction) cannot be mistaken for a
+    context-compression edge.
+    """
+    k = str(kind or '').strip().lower()
+    if k != 'compacted':
+        return False
+    m = str(message or '').strip().lower()
+    if not m:
+        # A bare 'compacted' kind is still the documented structural edge.
+        return True
+    # Reject explicit failure/abort wording; those are surfaced as warnings.
+    if 'abort' in m or 'failed' in m:
+        return False
+    return 'compaction' in m or 'compact' in m or 'context' in m
 
 
 def _prewarm_skill_tool_modules():
@@ -5980,10 +6014,24 @@ def _is_context_compression_marker(msg):
 
 
 def _is_trusted_auto_compression_marker(message):
-    """Accept only WebUI-generated assistant summaries for destructive compaction."""
+    """Accept only WebUI-generated compression summaries for destructive compaction.
+
+    Trust comes strictly from the ``_compressed_summary`` metadata flag, which
+    only agent/context_compressor.py stamps (never forgeable by pasted user
+    text). The flag is intentionally role-agnostic: alternation-safety logic
+    in context_compressor.py (``_splice_micro_compact_result``, the tail-merge
+    path around ``COMPRESSED_SUMMARY_METADATA_KEY``) places the marker on
+    whichever role keeps user/assistant turns alternating, so a real trusted
+    marker can legitimately carry role="user" as often as role="assistant".
+    Requiring role == "assistant" here silently dropped every user-role
+    marker and made `_compression_tail_after_latest_compaction` fail open
+    (whole transcript kept) far more often than compressions actually ran.
+    Only "tool" stays excluded — a marker can never legitimately be a tool
+    result.
+    """
     return bool(
         isinstance(message, dict)
-        and message.get("role") == "assistant"
+        and message.get("role") in ("assistant", "user")
         and message.get("_compressed_summary") is True
         and _is_context_compression_marker(message)
     )
@@ -6090,6 +6138,201 @@ def _maybe_start_auto_snapshot_squash(
         return False
 
 
+def _pre_compression_snapshot_is_durable(snapshot_sid: str) -> bool:
+    """Confirm the archived parent transcript is actually on disk before
+    reducing the live continuation's tail.
+
+    ``_preserve_pre_compression_snapshot()`` writes the full parent session
+    synchronously during the compression rotation, *before* this decision
+    ever runs — so a durability check here is a read-only confirmation of
+    already-completed work, not a new dependency on the (best-effort,
+    thread-based) squash job. Any lookup failure fails closed: never reduce
+    the visible session without positive proof the full history survives
+    elsewhere.
+    """
+    if not snapshot_sid:
+        return False
+    try:
+        from api.models import get_session
+
+        snapshot = get_session(snapshot_sid, metadata_only=True)
+    except Exception:
+        logger.warning(
+            "auto tail reduction: could not verify durable parent snapshot %s",
+            snapshot_sid,
+            exc_info=True,
+        )
+        return False
+    return bool(getattr(snapshot, "pre_compression_snapshot", False))
+
+
+def _session_transcript_is_durable(session_id: str, minimum_messages: int = 1) -> bool:
+    """Confirm a session's transcript is already persisted on disk.
+
+    Mid-turn counterpart of ``_pre_compression_snapshot_is_durable``. At the
+    moment the agent signals "compaction complete", the parent session file has
+    been written by the periodic checkpoint saver but the *rotation* bookkeeping
+    (which stamps ``pre_compression_snapshot``) only runs at turn finalisation.
+    So the snapshot flag cannot be required yet; what must be proven is that a
+    real transcript for that id exists on disk, so hiding it from the viewport
+    can never be the only copy disappearing.
+
+    Fails closed on any lookup problem: no proof, no pruning.
+    """
+    if not session_id:
+        return False
+    try:
+        from api.models import get_session
+
+        snapshot = get_session(session_id)
+    except Exception:
+        logger.warning(
+            "midturn compaction: could not verify durable transcript for %s",
+            session_id,
+            exc_info=True,
+        )
+        return False
+    if snapshot is None:
+        return False
+    try:
+        return len(getattr(snapshot, "messages", None) or []) >= max(1, minimum_messages)
+    except Exception:
+        return False
+
+
+def _emit_midturn_compaction_event(
+    put,
+    *,
+    origin_session_id,
+    continuation_session_id,
+    settings=None,
+):
+    """Tell the browser to compact the *visible* conversation immediately.
+
+    Called from the agent status bridge the moment compaction completes, which
+    is many minutes before turn finalisation on a long tool-heavy turn. Without
+    this, the promise "compact at each compression so the WebUI stays
+    responsive" is only kept between turns — never during the long turn where
+    it actually matters (observed on session 20260816_210523_091383).
+
+    Deliberately **display-only**. Mid-turn the agent owns the authoritative
+    transcript and hands it back only when the turn returns; truncating
+    ``s.messages`` from this callback thread would race the live turn and could
+    drop in-flight state. The authoritative reduction therefore stays exactly
+    where it is (turn finalisation) and this event only prunes the DOM.
+
+    Returns True when an event was published, False on any no-op/guard.
+    """
+    origin = str(origin_session_id or "").strip()
+    continuation = str(continuation_session_id or "").strip()
+    # A compression that did not rotate the session has no archived parent to
+    # collapse into: there is nothing safe to hide from the viewport.
+    if not origin or not continuation or origin == continuation:
+        return False
+    try:
+        if settings is None:
+            from api.config import load_settings
+
+            settings = load_settings()
+        # Same single user-facing switch as the end-of-turn reduction, so
+        # turning the feature off really turns all of it off.
+        if (settings or {}).get("auto_squash_after_compression") is not True:
+            return False
+    except Exception:
+        logger.debug("midturn compaction: settings lookup failed", exc_info=True)
+        return False
+    # Fail closed: never hide history from the viewport without positive proof
+    # the full pre-compression transcript is already durable on disk.
+    if not _session_transcript_is_durable(origin):
+        logger.info(
+            "midturn compaction: skipped session=%s reason=parent_not_durable",
+            continuation,
+        )
+        return False
+    try:
+        put(
+            "midturn_compacted",
+            {
+                "session_id": origin,
+                "old_session_id": origin,
+                "new_session_id": continuation,
+                "continuation_session_id": continuation,
+            },
+        )
+    except Exception:
+        logger.debug("midturn compaction: failed to publish event", exc_info=True)
+        return False
+    logger.info(
+        "midturn compaction: emitted origin=%s continuation=%s",
+        origin,
+        continuation,
+    )
+    return True
+
+
+def _should_apply_active_session_tail_reduction(
+    *,
+    continuation_tail,
+    continuation_tail_boundary,
+    total_message_count,
+    archive_durable,
+    setting_enabled,
+    session_id=None,
+) -> bool:
+    """Decide whether the *visible* continuation session should be reduced
+    to its post-compression tail this turn.
+
+    Deliberately decoupled from whether the background parent-squash thread
+    actually started (`_maybe_start_auto_snapshot_squash`'s return value):
+    that job is best-effort (skipped on a short summary, a manual squash
+    already running, or a thread-start failure) and its outcome says nothing
+    about whether the durable parent archive exists — which is the only
+    thing that makes reducing the visible transcript safe. Coupling the two
+    caused ~43 of 47 observed compressions to leave the active session
+    un-reduced even though the parent was already safely archived.
+
+    Every decision (applied or refused, with reason) is logged at INFO for
+    auditability (plan Option A, S4) — the auto-squash setting is opt-in and
+    silent otherwise, so INFO is the only place an operator can confirm the
+    feature actually fired on a given turn.
+    """
+    if not setting_enabled:
+        logger.info(
+            "auto tail reduction: skipped session=%s reason=setting_disabled",
+            session_id,
+        )
+        return False
+    if not archive_durable:
+        logger.info(
+            "auto tail reduction: skipped session=%s reason=parent_archive_not_durable",
+            session_id,
+        )
+        return False
+    if not continuation_tail or continuation_tail_boundary is None:
+        logger.info(
+            "auto tail reduction: skipped session=%s reason=no_trusted_boundary",
+            session_id,
+        )
+        return False
+    if len(continuation_tail) >= (total_message_count or 0):
+        logger.info(
+            "auto tail reduction: skipped session=%s reason=tail_not_smaller "
+            "tail=%d total=%d",
+            session_id,
+            len(continuation_tail),
+            total_message_count or 0,
+        )
+        return False
+    logger.info(
+        "auto tail reduction: applied session=%s tail=%d total=%d dropped=%d",
+        session_id,
+        len(continuation_tail),
+        total_message_count or 0,
+        (total_message_count or 0) - len(continuation_tail),
+    )
+    return True
+
+
 def _cleanup_auto_tail_backup_after_writeback(
     session,
     *,
@@ -6188,7 +6431,11 @@ def _auto_snapshot_summary_from_compression(display_messages, context_messages):
     raw = raw_marker_text(context_messages) or raw_marker_text(display_messages)
     if not isinstance(raw, str):
         return None
-    text = raw.strip()
+    # Merged [PRIOR CONTEXT …] markers embed the compaction summary after the
+    # END-OF-PRIOR-CONTEXT delimiter; isolate that segment first so the strip
+    # logic below never treats the replayed prior-context turns as summary.
+    segment = compaction_summary_segment(raw)
+    text = (segment if segment is not None else raw).strip()
     marker_match = re.match(r"^\[CONTEXT COMPACTION[^\]]*\]\s*", text, re.IGNORECASE)
     if marker_match:
         text = text[marker_match.end():].lstrip()
@@ -8653,6 +8900,26 @@ def _run_agent_streaming(
                 'session_id': session_id,
                 'message': 'Compressing context',
             })
+            return
+        # Compaction just finished, mid-turn. The agent has already rotated
+        # agent.session_id to the continuation and committed the child session
+        # (see _release_lock -> _emit_compaction_done in hermes-agent), but the
+        # WebUI's own rotation bookkeeping and tail reduction do not run until
+        # turn finalisation — many minutes away on a long tool-heavy turn.
+        # Publish a display-only event now so the browser can collapse the
+        # archived history and follow the rotation immediately.
+        if _is_agent_compression_done_status(_kind, _message):
+            try:
+                _live_continuation_sid = getattr(agent, 'session_id', None)
+                _emit_midturn_compaction_event(
+                    put,
+                    origin_session_id=session_id,
+                    continuation_session_id=_live_continuation_sid,
+                )
+            except Exception:
+                logger.debug(
+                    "midturn compaction bridge failed", exc_info=True
+                )
             return
         # Pass through rate-limit and fallback messages so the frontend can
         # show them as warnings via the existing messages.js 'warning' listener.
@@ -11417,15 +11684,41 @@ def _run_agent_streaming(
                         if _continuation_tail
                         else None
                     )
-                    if (
-                        _continuation_tail
-                        and _continuation_tail_boundary is not None
-                        and len(_continuation_tail) < len(s.messages or [])
-                        and _maybe_start_auto_snapshot_squash(
-                            _compression_origin_session_id,
-                            _compression_continuation_session_id,
-                            _auto_snapshot_squash_summary,
-                        )
+                    # Opportunistic: archive+squash the inactive parent snapshot
+                    # in the background regardless of whether the visible
+                    # continuation gets reduced below. This job is best-effort
+                    # (skipped on a short summary, a manual squash already
+                    # running, or a thread-start failure) and its own settings
+                    # gate (auto_squash_after_compression) is checked inside it.
+                    _maybe_start_auto_snapshot_squash(
+                        _compression_origin_session_id,
+                        _compression_continuation_session_id,
+                        _auto_snapshot_squash_summary,
+                    )
+                    # The visible continuation's own tail reduction only needs
+                    # the *durable* parent archive to already be on disk — see
+                    # _preserve_pre_compression_snapshot(), called synchronously
+                    # earlier in this same request before the background squash
+                    # job above is even scheduled. It must not depend on the
+                    # squash job's outcome (#43-of-47 undercount): full history
+                    # is safe on disk either way, and the squash job is a
+                    # separate, purely opportunistic compaction of the *parent*
+                    # session, not a precondition for reducing the child's view.
+                    _archive_durable = _pre_compression_snapshot_is_durable(
+                        _compression_origin_session_id
+                    )
+                    if _should_apply_active_session_tail_reduction(
+                        continuation_tail=_continuation_tail,
+                        continuation_tail_boundary=_continuation_tail_boundary,
+                        total_message_count=len(s.messages or []),
+                        archive_durable=_archive_durable,
+                        setting_enabled=bool(
+                            (load_settings() or {}).get(
+                                "auto_squash_after_compression"
+                            )
+                            is True
+                        ),
+                        session_id=_compression_continuation_session_id,
                     ):
                         _dropped_message_count = len(s.messages or []) - len(
                             _continuation_tail
@@ -11444,6 +11737,20 @@ def _run_agent_streaming(
                         s.truncation_watermark = _continuation_tail_boundary
                         s.truncation_boundary = _continuation_tail_boundary
                         _compacted_tail_this_turn = True
+                        # Plan Option A, C1: tell the browser to prune the DOM
+                        # above the compression card THIS turn instead of
+                        # waiting for the terminal 'done' event to replace the
+                        # transcript wholesale. A dedicated event (rather than
+                        # reusing 'compressed', which already fired earlier in
+                        # this block for usage/session-rotation bookkeeping,
+                        # before this reduction was even decided) keeps the
+                        # existing 'compressed' contract and timing unchanged
+                        # for every other listener.
+                        put('tail_reduced', {
+                            'session_id': s.session_id,
+                            'dropped_count': _dropped_message_count,
+                            'anchor_message_key': s.compression_anchor_message_key,
+                        })
                 with _stream_writeback_stage(_writeback_timings, "session_save"):
                     s.save()
                 _cleanup_auto_tail_backup_after_writeback(

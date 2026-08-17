@@ -14760,10 +14760,30 @@ function _collectHandoffSummaryStates(messages){
 function _isContextCompactionMessage(m){
   if(!m||!m.role||m.role==='tool') return false;
   const text=msgContent(m)||String(m.content||'');
-  return _isContextCompactionText(text);
+  if(_isContextCompactionText(text)) return true;
+  // Agent merge-into-tail compaction: [PRIOR CONTEXT ...] envelope whose
+  // [CONTEXT COMPACTION ...] marker sits after the END-OF-PRIOR-CONTEXT
+  // delimiter. Only the synthetic _compressed_summary stamp makes this
+  // shape a marker (mirrors api/compression_anchor.py fail-closed rule).
+  return m._compressed_summary===true && _compactionSummarySegment(text)!==null;
 }
 function _isContextCompactionText(text){
   return /^\s*\[context compaction/i.test(String(text||'')) || /^\s*context compaction/i.test(String(text||''));
+}
+function _compactionSummarySegment(text){
+  // Mirror of api/compression_anchor.py compaction_summary_segment().
+  const s=String(text||'').replace(/^\s+/,'');
+  const low=s.toLowerCase();
+  if(low.startsWith('[context compaction')||low.startsWith('context compaction')) return s;
+  if(!low.startsWith('[prior context')) return null;
+  const delim=low.indexOf('[end of prior context');
+  if(delim===-1) return null;
+  const after=s.slice(delim);
+  const close=after.indexOf(']');
+  if(close===-1) return null;
+  const segment=after.slice(close+1).replace(/^\s+/,'');
+  if(segment.toLowerCase().startsWith('[context compaction')) return segment;
+  return null;
 }
 function _isPreservedCompressionTaskListMarkerText(text){
   return /^\s*\[your active task list was preserved across context compression\]/i.test(String(text||''));
@@ -14803,6 +14823,34 @@ function _compressionMessageAnchorKey(m){
   const attachments=Array.isArray(m.attachments)?m.attachments.length:0;
   if(!norm && !attachments && !ts) return null;
   return {role:String(m.role||''), ts, text:norm, attachments};
+}
+// Plan Option A, C1: given the raw messages array (the live in-memory
+// transcript at the call site) and the {role, ts, text, attachments} anchor
+// key the server sent on 'tail_reduced' (mirrors
+// _compression_anchor_message_key in api/streaming.py), find the raw index
+// of that exact message so the caller can prune everything above it. Scans
+// from the end since the anchor is always the most recent match of its
+// kind. Returns -1 on any failure to resolve — callers must never guess a
+// cut point, matching the fail-open safety posture of the server-side
+// tail-reduction gate (_should_apply_active_session_tail_reduction).
+function _tailReductionCutRawIdx(messages, anchorKey){
+  if(!anchorKey||typeof anchorKey!=='object') return -1;
+  if(!Array.isArray(messages)||!messages.length) return -1;
+  const anchorTs=String(anchorKey.ts??'');
+  for(let i=messages.length-1;i>=0;i--){
+    const candidate=_compressionMessageAnchorKey(messages[i]);
+    if(!candidate) continue;
+    const candidateTs=String(candidate.ts??'');
+    if(
+      candidate.role===String(anchorKey.role||'') &&
+      (!anchorTs||!candidateTs||candidateTs===anchorTs) &&
+      String(candidate.text||'')===String(anchorKey.text||'') &&
+      Number(candidate.attachments||0)===Number(anchorKey.attachments||0)
+    ){
+      return i;
+    }
+  }
+  return -1;
 }
 function _compressionAnchorIndex(visWithIdx, anchorKey, fallbackIdx=null){
   if(anchorKey&&Array.isArray(visWithIdx)){
@@ -16429,9 +16477,14 @@ function renderMessages(options){
     S.messages,
     sessionCompressionSummary
   );
-  const referenceText=referenceMessage
-    ? msgContent(referenceMessage)||String(referenceMessage.content||'')
-    : sessionCompressionSummary;
+  const referenceText=(()=>{
+    if(!referenceMessage) return sessionCompressionSummary;
+    const raw=msgContent(referenceMessage)||String(referenceMessage.content||'');
+    // Merged [PRIOR CONTEXT ...] markers embed the summary after the
+    // delimiter; never surface the replayed prior-context turns in the card.
+    const segment=_compactionSummarySegment(raw);
+    return segment!==null?segment:raw;
+  })();
   const referenceNode=(!compressionState && _shouldShowSettledCompressionReference(referenceText) && (sessionCompressionAnchor!==null || sessionCompressionAnchorKey || sessionCompressionSummary))
     ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_compressionReferenceCardHtml(referenceText,false)}${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
     : null;
