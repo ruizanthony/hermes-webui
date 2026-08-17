@@ -9937,6 +9937,19 @@ def _run_agent_streaming(
     # write without nonlocal) so it can seed `_last_err` and let the classifier
     # surface the real, actionable cause (model_not_found / auth_mismatch).
     _captured_terminal_error = [None]
+    # A single long turn can compress MORE THAN ONCE before it returns (observed
+    # session 20260817_074600_1bffd4: two rotations in one turn, 07:46 and
+    # 07:55). Each mid-turn emission's origin must be the id the browser is
+    # CURRENTLY parked on -- the previous hop's continuation -- not the fixed
+    # turn-start `session_id`. Otherwise a second rotation reports a stale
+    # origin the client already navigated away from, the same-session match
+    # guard in messages.js's `midturn_compacted` listener drops it, and the
+    # tab is stranded on the intermediate hop id, which never receives its
+    # own WebUI sidecar (only the turn's start and final ids do, via the
+    # end-of-turn reconciliation block) -- so reloading that URL later
+    # synthesizes an unbounded state.db stitch across the whole lineage
+    # instead of showing the live conversation.
+    _midturn_last_known_sid = session_id
 
     def _agent_status_callback(kind, message):
         """Bridge Agent lifecycle status into WebUI SSE.
@@ -9947,6 +9960,7 @@ def _run_agent_streaming(
         turn-completion classifier can report the real cause instead of the
         generic no_response fallback. All other lifecycle messages are dropped.
         """
+        nonlocal _midturn_last_known_sid
         _message = str(message or '').strip()
         _kind = str(kind or '').strip().lower()
         if not _message:
@@ -9974,11 +9988,19 @@ def _run_agent_streaming(
         if _is_agent_compression_done_status(_kind, _message):
             try:
                 _live_continuation_sid = getattr(agent, 'session_id', None)
-                _emit_midturn_compaction_event(
+                _emitted = _emit_midturn_compaction_event(
                     put,
-                    origin_session_id=session_id,
+                    origin_session_id=_midturn_last_known_sid,
                     continuation_session_id=_live_continuation_sid,
                 )
+                # Only advance the rolling pointer on a successful emission.
+                # A fail-closed no-op (durability not yet proven, setting
+                # disabled, no real rotation) must leave the tracker exactly
+                # where the browser still is, so the NEXT rotation in this
+                # turn still reports the correct, un-shown origin instead of
+                # skipping a hop.
+                if _emitted and _live_continuation_sid:
+                    _midturn_last_known_sid = _live_continuation_sid
             except Exception:
                 logger.debug(
                     "midturn compaction bridge failed", exc_info=True
