@@ -655,6 +655,34 @@ def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
     )
 
 
+def _is_session_lease_wait_message(kind: str, message: str) -> bool:
+    """Return True for cross-process session-turn-lease wait/timeout notices.
+
+    The Agent serialises turns per conversation *lineage* with a durable lease
+    (hermes-agent ``run_agent.py`` -> ``acquire_session_turn_lease``). While a
+    turn waits for that lease it emits progress through ``_emit_status``, and on
+    the 1800s ceiling it emits a terminal notice through ``_emit_warning``.
+
+    These used to be dropped by the lifecycle bridge, so a user replying inside
+    a mid-turn compaction continuation session saw a completely dead screen
+    until the wait timed out. Matching them here makes the wait visible without
+    touching the locking semantics, which are correct.
+
+    Matched on the Agent's emitted shapes; both the 'lifecycle' status kind and
+    the 'warn' kind (timeout branch) are accepted.
+    """
+    k = str(kind or '').strip().lower()
+    m = str(message or '').strip().lower()
+    if k not in ('lifecycle', 'warn'):
+        return False
+    return (
+        'another hermes process is using this session' in m
+        or 'still waiting for the other hermes process' in m
+        or 'another hermes process kept this session busy' in m
+        or 'session is free; loading the latest transcript' in m
+    )
+
+
 def _is_agent_compression_start_status(kind: str, message: str) -> bool:
     """Return True only for real Hermes context-compression start notices.
 
@@ -9956,9 +9984,12 @@ def _run_agent_streaming(
 
         Passes compression events as 'compressing' events and rate-limit/fallback
         events as 'warning' events so the frontend can surface them to the user.
-        Also captures a terminal non-retryable provider error (#5940) so the
-        turn-completion classifier can report the real cause instead of the
-        generic no_response fallback. All other lifecycle messages are dropped.
+        Cross-process session-turn-lease waits are forwarded as 'warning' too, so
+        a turn queued behind another turn on the same conversation lineage shows
+        a live notice instead of a dead screen. Also captures a terminal
+        non-retryable provider error (#5940) so the turn-completion classifier
+        can report the real cause instead of the generic no_response fallback.
+        Remaining lifecycle messages are dropped.
         """
         nonlocal _midturn_last_known_sid
         _message = str(message or '').strip()
@@ -10005,6 +10036,13 @@ def _run_agent_streaming(
                 logger.debug(
                     "midturn compaction bridge failed", exc_info=True
                 )
+            return
+        # A turn queued behind another turn on the same conversation lineage.
+        # The lease itself is correct and untouched; without this the browser
+        # showed nothing at all until the 1800s ceiling failed the turn.
+        # Forwarded before the fallback branch so it cannot be dropped.
+        if _is_session_lease_wait_message(_kind, _message):
+            put('warning', {'type': 'session_lease_wait', 'message': _message})
             return
         # Pass through rate-limit and fallback messages so the frontend can
         # show them as warnings via the existing messages.js 'warning' listener.
