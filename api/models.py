@@ -4251,10 +4251,17 @@ def _recover_journaled_output_and_terminal_error(
     session,
     stream_id: str | None,
     *,
-    dedupe_existing: bool = False,
+    dedupe_existing: bool = True,
     terminal_recovery: dict | None = None,
 ) -> tuple[bool, bool]:
-    """Recover readable activity first, then append its authoritative terminal error."""
+    """Recover readable activity first, then append its authoritative terminal error.
+
+    ``dedupe_existing`` defaults to True: journal replay must be idempotent.
+    A recovery pass that runs again for the same stream (state.db resync,
+    failed save retried on next load, lazy retry hook) must claim the
+    already-restored messages instead of appending duplicates — repeated
+    non-deduped replays are how multi-GB session sidecars were produced.
+    """
     recovered_output = _append_journaled_partial_output(
         session,
         stream_id,
@@ -4305,7 +4312,7 @@ def _append_journaled_partial_output(
     session,
     stream_id: str | None,
     *,
-    dedupe_existing: bool = False,
+    dedupe_existing: bool = True,
 ) -> bool:
     """Recover already-emitted visible output from a dead stream journal.
 
@@ -4342,6 +4349,32 @@ def _append_journaled_partial_output(
     recovered_tool_calls: list[dict] = []
     initial_message_count = len(session.messages or [])
     claimed_existing_assistant_indexes: set[int] = set()
+
+    # Anti-amplification hard stop for non-deduped replays only: a journal can
+    # never legitimately restore more messages than it has events. If a
+    # previous (pre-dedupe) replay already inflated this session past that
+    # bound, refuse to replay again instead of compounding the duplication
+    # into a multi-GB sidecar. Deduped replays are allowed through — they
+    # claim existing messages (repairing context/reasoning) and never append
+    # duplicates, so the guard must not block that repair pass.
+    if not dedupe_existing:
+        already_recovered = sum(
+            1
+            for message in (session.messages or [])
+            if isinstance(message, dict)
+            and message.get('_recovered_stream_id') == stream_id
+        )
+        if already_recovered >= len(events):
+            logger.warning(
+                "Session %s: skipping non-deduped journal replay for stream %s — "
+                "%d messages already recovered for %d journal events "
+                "(amplification guard)",
+                getattr(session, 'session_id', '?'),
+                stream_id,
+                already_recovered,
+                len(events),
+            )
+            return False
 
     def content_match_can_receive_reasoning(existing_idx: int) -> bool:
         messages = session.messages or []

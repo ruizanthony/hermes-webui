@@ -4184,7 +4184,25 @@ function _contextBriefBannerNode(){
   btn.type = 'button';
   btn.className = 'ctx-brief-banner-btn';
   btn.textContent = t('context_brief_banner_btn');
-  btn.onclick = () => { if (typeof switchPanel === 'function') switchPanel('context'); };
+  btn.onclick = () => {
+    // Opening the panel is not enough: on mobile the panel renders inside
+    // the sidebar drawer, on desktop it needs an expanded rail. Open the
+    // container first or the tap appears to do nothing (#skill convention).
+    try {
+      const isMobile = window.matchMedia && window.matchMedia('(max-width: 768px)').matches;
+      const sidebar = document.querySelector('.sidebar');
+      if (isMobile){
+        if (sidebar && !sidebar.classList.contains('mobile-open')
+            && typeof toggleMobileSidebar === 'function'){
+          toggleMobileSidebar();
+        }
+      } else if (typeof _isSidebarCollapsed === 'function' && _isSidebarCollapsed()
+                 && typeof expandSidebar === 'function'){
+        expandSidebar();
+      }
+    } catch(_){ /* container helpers unavailable — still switch the panel */ }
+    if (typeof switchPanel === 'function') switchPanel('context');
+  };
   bar.appendChild(label);
   bar.appendChild(btn);
   return bar;
