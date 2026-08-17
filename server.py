@@ -698,6 +698,12 @@ def main() -> None:
     start_goal_continuation_worker()
     from api.context_brief import start_auto_brief_worker
     start_auto_brief_worker()
+    try:
+        from api.run_journal_retention import start_run_journal_retention_worker
+        if start_run_journal_retention_worker():
+            print('[ok] Run-journal retention worker started', flush=True)
+    except Exception as e:
+        print(f'[!!] WARNING: Run-journal retention worker failed to start: {e}', flush=True)
 
     from api.config import TLS_ENABLED, TLS_CERT, TLS_KEY
     scheme = 'https' if TLS_ENABLED else 'http'
