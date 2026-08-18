@@ -10355,6 +10355,7 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "is_streaming",
     "cron_running",
     "active_stream_id",
+    "stream_origin_session_id",
     "has_pending_user_message",
     "pending_started_at",
     "default_hidden",
@@ -13457,6 +13458,11 @@ def handle_get(handler, parsed) -> bool:
                 raw["threshold_floor_applied"] = _threshold_info["floor_applied"]
             except Exception:
                 pass
+            if not original_stream_id:
+                from api.session_live_stream import apply_live_stream_lineage_projection
+
+                apply_live_stream_lineage_projection(raw)
+                original_stream_id = raw.get("active_stream_id")
             if original_stream_id:
                 try:
                     journal = find_run_summary(original_stream_id)
@@ -13680,6 +13686,34 @@ def handle_get(handler, parsed) -> bool:
             }
             attach_todo_state(sess, msgs)
             sess = _merge_cli_sidebar_metadata(sess, cli_meta)
+            # Mid-turn compression hops have no sidecar yet. Project the
+            # origin run so a PWA reload of the hop URL rejoins the live SSE
+            # instead of painting a finished stitch.
+            from api.session_live_stream import apply_live_stream_lineage_projection
+
+            apply_live_stream_lineage_projection(sess)
+            _projected_stream_id = sess.get("active_stream_id")
+            if _projected_stream_id:
+                try:
+                    journal = find_run_summary(_projected_stream_id)
+                except Exception:
+                    journal = None
+                if journal:
+                    sess["runtime_journal"] = _run_journal_status_payload(
+                        journal,
+                        active=True,
+                    )
+                    try:
+                        snapshot = _run_journal_live_snapshot(
+                            _projected_stream_id,
+                            handler=handler,
+                        )
+                    except Exception:
+                        snapshot = None
+                    if snapshot:
+                        sess["runtime_journal_snapshot"] = (
+                            _runtime_journal_snapshot_for_session_payload(snapshot)
+                        )
             return j(handler, {"session": public_session_projection(sess)})
 
     if parsed.path == "/api/session/lineage/report":

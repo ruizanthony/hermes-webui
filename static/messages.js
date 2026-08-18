@@ -2160,6 +2160,10 @@ function attachLiveStream(attachSid, streamId, uploaded=[], options={}){
   // Rotating `activeSid` without this set would silently invert the bug:
   // metering/title/goal/run_meta/todo events would start being rejected.
   const _streamOwnedSids=new Set([attachSid]);
+  if(S.session&&S.session.session_id===attachSid){
+    const _originSid=String(S.session.stream_origin_session_id||'').trim();
+    if(_originSid) _streamOwnedSids.add(_originSid);
+  }
   const _streamOwnsEventSid=(eventSid)=>{
     const id=String(eventSid||'').trim();
     return !id||_streamOwnedSids.has(id);

@@ -525,6 +525,15 @@ def _session_list_cache_overlay_runtime_rows(rows: list[dict]) -> list[dict]:
                 live_value = _session_list_row_numeric_value(raw_live_value)
                 if live_value > current:
                     item[key] = raw_live_value
+        overlaid.append(item)
+    try:
+        from api.session_live_stream import overlay_live_stream_lineage_on_session_rows
+
+        overlay_live_stream_lineage_on_session_rows(overlaid)
+    except Exception:
+        pass
+    for item in overlaid:
+        sid = str(item.get("session_id") or "").strip()
         stream_id = item.get("active_stream_id")
         item["is_streaming"] = bool(stream_id and stream_id in active_stream_ids)
         # #6728: a still-running cron job's session row must not look completed
@@ -537,7 +546,6 @@ def _session_list_cache_overlay_runtime_rows(rows: list[dict]) -> list[dict]:
         item["cron_running"] = _session_list_row_cron_running(
             sid, item, cron_job_prefixes
         )
-        overlaid.append(item)
     overlaid.sort(key=_session_list_runtime_sort_key, reverse=True)
     return overlaid
 
