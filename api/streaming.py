@@ -76,6 +76,7 @@ from api.models import (
     _STRUCTURED_REPLAY_FIELDS,
     _canonical_message_digest,
     _collapse_replayed_assistant_rows,
+    _current_turn_pending_already_present,
     _durable_empty_assistant_replay_key,
     _incomplete_reasoning_message_id,
     _is_admissible_empty_text_content,
@@ -8660,21 +8661,29 @@ def _turn_transcript_lacks_final_assistant_answer(
     current_user_idx = current_user_token_idx
     if current_user_idx is None:
         current_user_idx = _find_current_user_turn(merged_messages, msg_text)
+    has_strong_current = (
+        current_user_idx is not None
+        and _looks_like_current_user_turn(merged_messages[current_user_idx], msg_text)
+    )
     if current_user_idx is None or (
         current_user_token_idx is None
+        and not has_strong_current
         and current_user_idx < len(previous_display)
     ):
         # The active turn lives after the durable transcript boundary. If the
         # merged display only exposes an older user row, materialize the pending
         # prompt so a replayed assistant row cannot satisfy the wrong turn.
-        pending_user = {
-            'role': 'user',
-            'content': msg_text,
-        }
-        if source and source != 'webui':
-            pending_user['_source'] = source
-        merged_messages.append(pending_user)
-        current_user_idx = len(merged_messages) - 1
+        # A strong match already in previous_display is the eager checkpoint of
+        # THIS turn (possibly followed by a lineage restitch) — do not append.
+        if not has_strong_current:
+            pending_user = {
+                'role': 'user',
+                'content': msg_text,
+            }
+            if source and source != 'webui':
+                pending_user['_source'] = source
+            merged_messages.append(pending_user)
+            current_user_idx = len(merged_messages) - 1
 
     current_user_key = _message_identity(merged_messages[current_user_idx])
     filtered_messages = merged_messages[:current_user_idx + 1]
@@ -9111,6 +9120,14 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
         )
 
     if is_exact_checkpoint(getattr(session, 'messages', None)):
+        return False
+    if _current_turn_pending_already_present(
+        getattr(session, 'messages', None),
+        pending_text,
+        pending_started_at=pending_started_at,
+        pending_source=pending_source,
+        pending_attachments=pending_attachments,
+    ):
         return False
     recovered = {
         'role': 'user',

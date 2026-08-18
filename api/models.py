@@ -1455,6 +1455,17 @@ def _append_recovered_pending_turn(session, *, timestamp: int | None = None) -> 
     pending_text = str(session.pending_user_message or '')
     if not pending_text:
         return None
+    boundary = getattr(session, 'pending_started_at', None)
+    if not (isinstance(boundary, (int, float)) and boundary > 0):
+        boundary = timestamp
+    if _current_turn_pending_already_present(
+        getattr(session, 'messages', None),
+        pending_text,
+        pending_started_at=boundary,
+        pending_source=getattr(session, 'pending_user_source', None),
+        pending_attachments=getattr(session, 'pending_attachments', None),
+    ):
+        return None
     recovered_ts = int(time.time())
     if isinstance(timestamp, (int, float)) and timestamp > 0:
         recovered_ts = int(timestamp)
@@ -3577,6 +3588,55 @@ def _latest_user_matches_pending_text(messages, pending_text):
     for message in reversed(messages):
         if isinstance(message, dict) and message.get('role') == 'user':
             return _message_matches_pending_text(message, pending_text)
+    return False
+
+
+def _current_turn_pending_already_present(
+    messages,
+    pending_text,
+    *,
+    pending_started_at=None,
+    pending_source=None,
+    pending_attachments=None,
+) -> bool:
+    """True when this turn's prompt is already in the transcript.
+
+    Tail-only matching is insufficient after a lineage restitch or compression
+    replay: older history can be appended AFTER the current user row, so the
+    last user is no longer the active prompt. A previous turn with the same
+    text must not count as this one — ``pending_started_at`` is the boundary.
+    """
+    if not isinstance(messages, list) or not pending_text:
+        return False
+    started = None
+    if isinstance(pending_started_at, (int, float)) and pending_started_at > 0:
+        started = float(pending_started_at)
+    # Tail checkpoint: the transcript still ends on this turn's user row.
+    # A previous identical prompt is not the tail once its assistant exists.
+    if messages and _message_matches_pending_text(messages[-1], pending_text):
+        tail_ts = _message_timestamp(messages[-1])
+        if started is None:
+            return True
+        if tail_ts is not None and tail_ts + 1e-6 >= started:
+            return True
+    if started is None:
+        return False
+    for message in messages:
+        if _message_matches_pending_checkpoint(
+            message,
+            pending_text,
+            pending_started_at,
+            pending_source,
+            pending_attachments,
+        ):
+            return True
+        if not _message_matches_pending_text(message, pending_text):
+            continue
+        timestamp = _message_timestamp(message)
+        if timestamp is None:
+            continue
+        if timestamp + 1e-6 >= started:
+            return True
     return False
 
 
