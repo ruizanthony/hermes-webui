@@ -15566,7 +15566,7 @@ function _resolvedSessionCompressionSummary(session){
   const latest=typeof session.latest_compaction_summary==='string'
     ? session.latest_compaction_summary.trim()
     : '';
-  if(latest) return latest;
+  if(latest) return _compactionDigestText(latest);
   return typeof session.compression_anchor_summary==='string'
     ? session.compression_anchor_summary.trim()
     : '';
