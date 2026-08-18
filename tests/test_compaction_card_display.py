@@ -103,6 +103,26 @@ assert.deepStrictEqual(_loadedCompactionMarkerRawIdxs({json.dumps(messages)}), [
     _run_node(script)
 
 
+def test_latest_agent_compaction_summary_wins_over_stale_webui_anchor() -> None:
+    source = UI_JS.read_text(encoding="utf-8")
+    helper = _extract_function(source, "_resolvedSessionCompressionSummary")
+    script = f"""
+const assert = require('assert');
+{helper}
+const session = {{
+  compression_anchor_summary: 'old 13KB WebUI snapshot',
+  latest_compaction_summary: 'latest 5KB Agent digest with Compactions/latest.md',
+}};
+assert.strictEqual(
+  _resolvedSessionCompressionSummary(session),
+  'latest 5KB Agent digest with Compactions/latest.md'
+);
+delete session.latest_compaction_summary;
+assert.strictEqual(_resolvedSessionCompressionSummary(session), 'old 13KB WebUI snapshot');
+"""
+    _run_node(script)
+
+
 def test_settled_reference_is_pinned_at_top_when_marker_is_outside_tail() -> None:
     source = UI_JS.read_text(encoding="utf-8")
     helper = _extract_function(source, "_pinSettledCompressionReferenceAtTop")

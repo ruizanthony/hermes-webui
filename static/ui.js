@@ -15561,6 +15561,16 @@ function _loadedCompactionMarkerRawIdxs(messages){
   }
   return out;
 }
+function _resolvedSessionCompressionSummary(session){
+  if(!session||typeof session!=='object') return '';
+  const latest=typeof session.latest_compaction_summary==='string'
+    ? session.latest_compaction_summary.trim()
+    : '';
+  if(latest) return latest;
+  return typeof session.compression_anchor_summary==='string'
+    ? session.compression_anchor_summary.trim()
+    : '';
+}
 // A settled compaction whose marker sits before the server-loaded tail must
 // remain visible at the top of that tail. Anchoring it to an old assistant/tool
 // turn can bury it inside a hidden worklog, which makes compaction look absent.
@@ -17162,9 +17172,7 @@ function renderMessages(options){
   const sessionCompressionAnchorKey=(
     S.session && S.session.compression_anchor_message_key && typeof S.session.compression_anchor_message_key==='object'
   ) ? S.session.compression_anchor_message_key : null;
-  const sessionCompressionSummary=(
-    S.session && typeof S.session.compression_anchor_summary==='string'
-  ) ? S.session.compression_anchor_summary.trim() : '';
+  const sessionCompressionSummary=_resolvedSessionCompressionSummary(S.session);
   const worklogDetailDisclosureState=_captureWorklogDetailDisclosureState(inner);
   _recycleStash.clear();
   if(_msgNodeRecycleEnabled){

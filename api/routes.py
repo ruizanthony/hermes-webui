@@ -9932,6 +9932,7 @@ from api.models import (
     get_cli_sessions,
     get_cli_session_messages,
     get_state_db_session_messages,
+    get_latest_state_db_compaction_summary,
     get_state_db_session_message_prefix_summary,
     get_state_db_session_message_keys_before_timestamp,
     get_state_db_session_summary,
@@ -13418,6 +13419,25 @@ def handle_get(handler, parsed) -> bool:
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
             }
+            # Display-only projection: Hermes Agent rotates state.db ids at
+            # compression while the WebUI keeps the original public sid. Surface
+            # the newest continuation-tip digest without mutating the canonical
+            # WebUI compression anchor/recovery state.
+            _latest_compaction = get_latest_state_db_compaction_summary(
+                sid,
+                profile=_session_profile,
+            )
+            if _latest_compaction:
+                _latest_compaction_ts = float(_latest_compaction.get("timestamp") or 0)
+                _anchor_key = raw.get("compression_anchor_message_key")
+                try:
+                    _anchor_ts = float((_anchor_key or {}).get("ts") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    _anchor_ts = 0
+                if _latest_compaction_ts >= _anchor_ts:
+                    raw["latest_compaction_summary"] = _latest_compaction["summary"]
+                    raw["latest_compaction_timestamp"] = _latest_compaction_ts
+                    raw["latest_compaction_session_id"] = _latest_compaction["session_id"]
             # Effective-vs-configured compression threshold: resolve with the
             # SAME rules the agent's compressor applies (per-model overrides,
             # codex autoraise, 75% small-window floor) so the context tooltip

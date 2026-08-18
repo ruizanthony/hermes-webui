@@ -9991,6 +9991,74 @@ def _json_loads_if_string(value):
         return value
 
 
+def get_latest_state_db_compaction_summary(sid, *, profile=None) -> dict | None:
+    """Return the newest trusted compaction marker on the active lineage tip.
+
+    A WebUI conversation keeps its original public session id while Hermes Agent
+    rotates state.db session ids after compression. Reading only ``sid`` therefore
+    returns an old 10-15KB snapshot even when a newer ultra-compact digest exists
+    on a continuation child. Reuse the canonical lineage-tip projection, then
+    read only that tip's marker row. Any schema/DB uncertainty fails closed.
+    """
+    sid = str(sid or "").strip()
+    if not sid:
+        return None
+    try:
+        import sqlite3
+    except ImportError:
+        return None
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / "state.db"
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not db_path.exists():
+        return None
+    try:
+        lineage = read_session_lineage_metadata(db_path, {sid}) or {}
+        tip_id = str((lineage.get(sid) or {}).get("_lineage_tip_id") or sid)
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(messages)")
+            cols = {str(row["name"]) for row in cur.fetchall()}
+            if not {"session_id", "role", "content", "timestamp"}.issubset(cols):
+                return None
+            active_clause = " AND (active IS NULL OR active != 0)" if "active" in cols else ""
+            id_order = ", id DESC" if "id" in cols else ""
+            cur.execute(
+                f"""
+                SELECT content, timestamp
+                FROM messages
+                WHERE session_id = ?
+                  AND role != 'tool'
+                  AND (
+                    lower(ltrim(content)) LIKE '[context compaction%'
+                    OR lower(ltrim(content)) LIKE 'context compaction%'
+                  )
+                  {active_clause}
+                ORDER BY timestamp DESC{id_order}
+                LIMIT 1
+                """,
+                (tip_id,),
+            )
+            row = cur.fetchone()
+        if not row or not isinstance(row["content"], str) or not row["content"].strip():
+            return None
+        try:
+            timestamp = float(row["timestamp"])
+        except (TypeError, ValueError):
+            return None
+        return {
+            "summary": row["content"].strip(),
+            "timestamp": timestamp,
+            "session_id": tip_id,
+        }
+    except Exception:
+        return None
+
+
 def get_state_db_session_messages(
     sid,
     *,
