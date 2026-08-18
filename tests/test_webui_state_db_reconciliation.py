@@ -226,6 +226,50 @@ def test_normal_state_db_reconciliation_keeps_new_row_with_existing_sidecar():
     assert [message["_state_db_row_id"] for message in reconciled] == [1, 2]
 
 
+def test_agent_row_id_alias_dedupes_restamped_prompt_before_final_answer():
+    """Agent ``_row_id`` and WebUI provenance must identify the same SQLite row."""
+    import api.models as models
+
+    sidecar_messages = [
+        {
+            "role": "assistant",
+            "content": "earlier activity",
+            "timestamp": 100.0,
+            "_state_db_row_id": 700,
+            "api_content": "earlier activity wire",
+        },
+        {
+            "role": "user",
+            "content": "original maintenance question",
+            "timestamp": 110.0,
+            "_row_id": 780107,
+            "api_content": "original maintenance question wire",
+        },
+        {
+            "role": "assistant",
+            "content": "settled final answer",
+            "timestamp": 130.0,
+        },
+    ]
+    state_messages = [
+        {
+            "role": "user",
+            "content": "original maintenance question",
+            "timestamp": 120.0,
+            "_state_db_row_id": 780107,
+            "api_content": "original maintenance question wire",
+        }
+    ]
+
+    merged = models.merge_session_messages_append_only(sidecar_messages, state_messages)
+
+    assert [message["content"] for message in merged] == [
+        "earlier activity",
+        "original maintenance question",
+        "settled final answer",
+    ]
+
+
 @pytest.mark.parametrize(
     ("first_row_id", "second_row_id"),
     [

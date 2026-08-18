@@ -10645,7 +10645,7 @@ def _state_db_row_identity_details(
     if not isinstance(message, dict):
         return None, True
     values: set[tuple[str, object]] = set()
-    for key in ("_state_db_row_id", "_db_row_id", "state_db_row_id"):
+    for key in ("_row_id", "_state_db_row_id", "_db_row_id", "state_db_row_id"):
         if key not in message or message.get(key) in (None, ""):
             continue
         value = message.get(key)
