@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# post-commit — warn immediately when a local commit is not protected.
+#
+# /opt/hermes-webui carries a long stack of site-local commits that are not
+# upstream. The nightly updater rebases/merges this checkout onto
+# origin/master; a commit survives that only if a `local/keep-*` ref points AT
+# it and that ref is declared in WEBUI_PROTECTED_PATCHES. Otherwise the work
+# disappears silently at the next upstream update.
+#
+# This hook never blocks the commit (protection is a follow-up step, and a
+# blocking hook would just get bypassed with --no-verify). It makes the gap
+# impossible to miss instead of relying on memory.
+#
+# Bypass for a deliberately throwaway commit:  HERMES_SKIP_PROTECT_CHECK=1
+
+set -u
+
+[ "${HERMES_SKIP_PROTECT_CHECK:-0}" = "1" ] && exit 0
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+AUDIT="$REPO/scripts/audit_unprotected_commits.py"
+[ -x "$AUDIT" ] || exit 0
+
+# Amend/rebase/merge in progress: audit once the operation settles, not per step.
+if [ -d "$REPO/.git/rebase-merge" ] || [ -d "$REPO/.git/rebase-apply" ] || \
+   [ -f "$REPO/.git/CHERRY_PICK_HEAD" ] || [ -f "$REPO/.git/MERGE_HEAD" ]; then
+  exit 0
+fi
+
+if ! "$AUDIT" --rev HEAD --quiet >/dev/null 2>&1; then
+  SHA="$(git rev-parse --short HEAD)"
+  printf '\n\033[33m┌─ COMMIT SANS PROTECTION DE REJEU ────────────────────────────┐\033[0m\n'
+  printf '\033[33m│\033[0m %s n'"'"'a aucun filet individuel.\n' "$SHA"
+  printf '\033[33m│\033[0m Aucun ref local/keep-* déclaré ne pointe dessus.\n'
+  printf '\033[33m│\033[0m Un merge amont le préserve, mais un reset/rollback le perd.\n'
+  printf '\033[33m│\033[0m\n'
+  printf '\033[33m│\033[0m  1. git branch -f local/keep-<nom> %s\n' "$SHA"
+  printf '\033[33m│\033[0m  2. déclarer le ref dans WEBUI_PROTECTED_PATCHES\n'
+  printf '\033[33m│\033[0m     (/usr/local/sbin/hermes-nightly-update) avec des\n'
+  printf '\033[33m│\033[0m     marqueurs DISCRIMINANTS (absents avant le commit)\n'
+  printf '\033[33m│\033[0m  3. prouver le rejeu, puis: scripts/audit_unprotected_commits.py\n'
+  printf '\033[33m└──────────────────────────────────────────────────────────────┘\033[0m\n\n'
+fi
+
+exit 0
