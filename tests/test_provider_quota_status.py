@@ -1760,3 +1760,61 @@ def test_kimi_aliases_supported_by_account_usage_probe():
 
     for alias in ("kimi-coding", "kimi-coding-cn", "kimi", "moonshot", "kimi-cn", "moonshot-cn"):
         assert alias in providers._ACCOUNT_USAGE_PROVIDERS
+
+
+def test_xai_oauth_account_usage_is_reported(monkeypatch, tmp_path):
+    """SuperGrok OAuth must go through the account-limits probe, not the pool card."""
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
+    old_cfg, old_mtime = _with_config(model={"provider": "xai-oauth"})
+
+    import api.providers as providers
+    seen = {}
+
+    def fake_fetch(provider, home, api_key=None):
+        seen["provider"] = provider
+        return SimpleNamespace(
+            provider="xai-oauth",
+            source="grok_cli_billing",
+            title="Account limits",
+            plan="SuperGrok",
+            fetched_at=datetime(2030, 8, 18, 17, 0, tzinfo=timezone.utc),
+            available=True,
+            windows=(
+                SimpleNamespace(
+                    label="Weekly",
+                    used_percent=17.0,
+                    reset_at=datetime(2030, 8, 23, 8, 49, tzinfo=timezone.utc),
+                    detail=None,
+                ),
+            ),
+            details=("Grok Build: 17% of total", "Extra usage credits: $0.00"),
+            unavailable_reason=None,
+        )
+
+    monkeypatch.setattr(providers, "_agent_fetch_account_usage_for_home", fake_fetch)
+    try:
+        result = providers.get_provider_quota()
+    finally:
+        _restore_config(old_cfg, old_mtime)
+
+    assert seen["provider"] == "xai-oauth"
+    assert result["ok"] is True
+    assert result["provider"] == "xai-oauth"
+    assert result["supported"] is True
+    assert result["status"] == "available"
+    windows = result["account_limits"]["windows"]
+    assert [w["label"] for w in windows] == ["Weekly"]
+    assert windows[0]["used_percent"] == 17.0
+    assert windows[0]["remaining_percent"] == 83.0
+    assert result["account_limits"]["plan"] == "SuperGrok"
+    assert result["account_limits"]["details"] == [
+        "Grok Build: 17% of total",
+        "Extra usage credits: $0.00",
+    ]
+
+
+def test_xai_oauth_aliases_supported_by_account_usage_probe():
+    import api.providers as providers
+
+    for alias in ("xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth"):
+        assert alias in providers._ACCOUNT_USAGE_PROVIDERS

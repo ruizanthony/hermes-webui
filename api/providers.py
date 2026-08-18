@@ -97,6 +97,13 @@ _ACCOUNT_USAGE_PROVIDERS = frozenset({
     # Alibaba Token Plan usage is computed locally by Hermes Agent from the
     # recorded token history (the endpoint exposes no quota API).
     "alibaba",
+    # SuperGrok weekly pool comes from Hermes Agent's fetch_account_usage()
+    # (GET cli-chat-proxy.grok.com/v1/billing?format=credits). Official
+    # api.x.ai usage paths 404.
+    "xai-oauth",
+    "grok-oauth",
+    "x-ai-oauth",
+    "xai-grok-oauth",
 })
 
 # Upper bound on simultaneous profile-isolated quota probe subprocesses.
