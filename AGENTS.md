@@ -42,6 +42,44 @@ Follow that checklist's safety rules:
   `auth.json` files, or password hashes
 - collect non-secret status and log evidence before recommending a fix
 
+## Local commits must be protected
+
+This checkout carries a long stack of site-local commits that are **not**
+upstream. A local commit survives an upstream reset or rollback only when both
+halves hold:
+
+1. a `local/keep-*` ref **points at** the commit (not merely contains it — the
+   updater's replay is a cherry-pick of the commit its ref points at); and
+2. that ref is declared in `WEBUI_PROTECTED_PATCHES` in
+   `/usr/local/sbin/hermes-nightly-update`, with markers that are absent before
+   the commit and present after it.
+
+Protect the commit **in the session that creates it**. Do not defer it: an
+unprotected commit has no individual safety net if the stack is ever reset or
+rolled back, which has already happened on this host. Verify before reporting
+the work as delivered:
+
+```bash
+./scripts/audit_unprotected_commits.py --rev HEAD   # exit 1 => unprotected
+./scripts/audit_unprotected_commits.py              # whole local stack
+```
+
+A versioned advisory `post-commit` hook surfaces the gap at commit time. It is
+not installed by a clone — reinstall it after cloning:
+
+```bash
+cp scripts/hooks/post-commit .git/hooks/post-commit && chmod +x .git/hooks/post-commit
+```
+
+The hook is deliberately non-blocking: a blocking hook gets bypassed with
+`--no-verify`. It makes the omission visible; it does not fix it.
+
+Scope, so the audit is not misread: it measures **replay** protection
+(individual restoration after a reset or rollback). The updater's normal path
+is an upstream merge, which preserves every commit reachable from `HEAD`. Do
+not turn a replay gap into a false "tonight's update will delete your work"
+alarm — and do not cite merge-preservation as a reason to skip protection.
+
 ## Contribution style
 
 ### Final reporting
