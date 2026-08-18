@@ -17252,7 +17252,7 @@ function renderMessages(options){
     return {node:row.firstElementChild, rawIdx:markerRawIdx};
   });
   const referenceNode=(!compressionState && !compactionCardNodes.length && _shouldShowSettledCompressionReference(referenceText) && (sessionCompressionAnchor!==null || sessionCompressionAnchorKey || sessionCompressionSummary))
-    ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_compressionReferenceCardHtml(referenceText,false)}${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
+    ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_compressionReferenceCardHtml(referenceText,true)}${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
     : null;
   let referenceNodePinnedAtTop=false;
   let preservedCompressionTaskCardsAttached=!!referenceNode||compactionCardNodes.length>0;
@@ -17284,6 +17284,8 @@ function renderMessages(options){
     inner.appendChild(_messageVirtualSpacer(virtualWindow.topPad,'before'));
   }
   if(hasServerOlder){
+    // Digest first: Load earlier is pagination chrome, not the context itself.
+    referenceNodePinnedAtTop=_pinSettledCompressionReferenceAtTop(inner,referenceNode,referenceMessageRawIdx);
     const indicator=document.createElement('button');
     indicator.type='button';
     indicator.id='loadOlderIndicator';
@@ -17293,9 +17295,6 @@ function renderMessages(options){
       : (typeof t==='function'?t('load_older_messages'):'Load earlier messages');
     inner.appendChild(indicator);
     _wireMessageWindowLoadEarlierButton();
-    // Keep the settled compacted-context card immediately visible in a long,
-    // tail-loaded conversation. Put it in flow (not inside an old tool turn).
-    referenceNodePinnedAtTop=_pinSettledCompressionReferenceAtTop(inner,referenceNode,referenceMessageRawIdx);
     if(typeof _contextBriefBannerNode==='function') inner.appendChild(_contextBriefBannerNode());
   }
   let lastUserRawIdx=-1;

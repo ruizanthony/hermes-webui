@@ -4618,6 +4618,21 @@ body.resizing .sidebar{transition:none!important;}
 }
 .tool-card-compress-reference .tool-card-name{
   color:var(--blue);
+  opacity:1;
+}
+.tool-card-compress-reference:not(.open) .tool-card-preview{
+  display:inline;
+  min-width:0;
+  flex:1 1 auto;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  color:var(--text);
+  opacity:.78;
+  font-size:calc(var(--message-body-font-size) * .92);
+}
+.tool-card-compress-reference.open .tool-card-detail{
+  max-height:28em;
 }
 .tool-card-handoff-summary{
   background:rgba(124,185,255,.04);
