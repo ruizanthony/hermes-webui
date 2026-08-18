@@ -803,7 +803,7 @@ def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
             # line above, so it needs its own match or it is silently
             # dropped — the exact bug that left the live footer pinned on the
             # primary model (e.g. gpt-5.6-sol) while claude-fable-5 answered.
-            or 'switched to fallback model' in m
+            or 'switched to fallback' in m
         )
     )
 
@@ -817,7 +817,12 @@ def _is_fallback_switch_succeeded_message(kind: str, message: str) -> bool:
     """
     k = str(kind or '').strip().lower()
     m = str(message or '').strip().lower()
-    return k == 'lifecycle' and 'switched to fallback model' in m
+    # Both Hermes success wordings:
+    #   "Switched to fallback model: X via P1 → Y via P2"  (pending notice)
+    #   "↻ Switched to fallback: Y (P2)"                   (empty-content path)
+    # 'switching to fallback' is the pre-activation attempt line and must
+    # NOT match — 'switched' ≠ 'switching'.
+    return k == 'lifecycle' and 'switched to fallback' in m
 
 
 def _is_session_lease_wait_message(kind: str, message: str) -> bool:

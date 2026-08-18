@@ -84,6 +84,18 @@ class TestBackendEmission:
     def test_done_payload_carries_reasoning_effort(self):
         assert "usage['reasoning_effort'] = _effort_label_done" in STREAMING_PY
 
+    def test_done_handler_copies_used_model_onto_last_assistant(self):
+        # usage.used_model is stamped from agent.model AFTER the run (so a
+        # fallback is attributed correctly). The live settle path must copy
+        # it onto lastAsst._usedModel or the chip stays empty until reload.
+        assert "lastAsst._usedModel=d.usage.used_model" in MESSAGES_JS
+
+    def test_ephemeral_carry_forward_keeps_used_model_and_effort(self):
+        # A shorter terminal snapshot must not drop the chips the live path
+        # just stamped.
+        assert "'_usedModel'" in MESSAGES_JS.split("const _EPHEMERAL_TURN_FIELDS=")[1].split("];")[0]
+        assert "'_reasoningEffort'" in MESSAGES_JS.split("const _EPHEMERAL_TURN_FIELDS=")[1].split("];")[0]
+
     def test_display_metadata_persists_reasoning_effort(self):
         assert "_dm['_reasoningEffort'] = _effort_label" in STREAMING_PY
         assert '"_reasoningEffort"' in MODELS_PY.split("_SESSION_MESSAGE_DISPLAY_METADATA_KEYS")[1].split(")")[0]

@@ -74,6 +74,17 @@ class TestFallbackSwitchSucceededPredicate:
             "🔄 Primary model failed — switching to fallback: xai via xai",
         )
 
+    def test_short_empty_content_success_line_matches_succeeded_predicate(self):
+        # conversation_loop empty-content path uses a shorter wording.
+        assert _is_fallback_switch_succeeded_message(
+            "lifecycle",
+            "↻ Switched to fallback: claude-fable-5 (anthropic)",
+        )
+        assert _is_fallback_lifecycle_message(
+            "lifecycle",
+            "↻ Switched to fallback: claude-fable-5 (anthropic)",
+        )
+
     def test_non_lifecycle_kind_never_matches_succeeded(self):
         assert not _is_fallback_switch_succeeded_message(
             "warn", "🔄 Switched to fallback model: a via b → c via d"
