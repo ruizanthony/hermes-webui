@@ -795,8 +795,29 @@ def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
             or 'falling back' in m
             or 'fallback activated' in m
             or 'trying fallback' in m
+            # Past-tense success notice emitted once via
+            # ``agent._emit_pending_fallback_notice()`` after a fallback swap
+            # actually recovers (see run_agent.py / chat_completion_helpers.py:
+            # "Switched to fallback model: X via P1 → Y via P2"). Distinct
+            # wording from the buffered failure-path "switching to fallback"
+            # line above, so it needs its own match or it is silently
+            # dropped — the exact bug that left the live footer pinned on the
+            # primary model (e.g. gpt-5.6-sol) while claude-fable-5 answered.
+            or 'switched to fallback model' in m
         )
     )
+
+
+def _is_fallback_switch_succeeded_message(kind: str, message: str) -> bool:
+    """True only for the one-shot post-swap success notice (not the failure buffer line).
+
+    Used to decide when to re-announce ``run_meta`` so the live run-status
+    footer reflects the model actually answering, not the one requested at
+    turn start. See ``_is_fallback_lifecycle_message`` for the wording story.
+    """
+    k = str(kind or '').strip().lower()
+    m = str(message or '').strip().lower()
+    return k == 'lifecycle' and 'switched to fallback model' in m
 
 
 def _is_session_lease_wait_message(kind: str, message: str) -> bool:
@@ -10262,6 +10283,30 @@ def _run_agent_streaming(
         _is_fallback_notice = _is_fallback_lifecycle_message(_kind, _message)
         if _is_fallback_notice:
             put('warning', {'type': 'fallback', 'message': _message})
+            # The live-run footer was announced once via `run_meta` at turn
+            # start with the originally requested model/provider. A fallback
+            # swap mutates agent.model / agent.provider / agent.reasoning_config
+            # in place (chat_completion_helpers.py `_try_activate_fallback`)
+            # but nothing re-announces `run_meta`, so the footer stayed pinned
+            # on the primary the whole turn while a different model actually
+            # answered and got billed (e.g. footer showed "gpt-5.6-sol" while
+            # claude-fable-5 was the effective/billed model in state.db).
+            # Re-emit with the agent's current post-swap identity, but only on
+            # the one-shot success notice — not the buffered pre-swap
+            # "switching to fallback" attempt line, which fires even for
+            # candidates that then fail and get skipped.
+            if _is_fallback_switch_succeeded_message(_kind, _message):
+                try:
+                    put('run_meta', {
+                        'session_id': session_id,
+                        'model': getattr(agent, 'model', None) or '',
+                        'provider': getattr(agent, 'provider', None) or '',
+                        'reasoning_effort': _effective_reasoning_effort_label(agent, None),
+                    })
+                except Exception:
+                    logger.debug(
+                        "post-fallback run_meta re-announce failed", exc_info=True
+                    )
 
     # xsession wakeup misroute root fix (Option 1): pre-init so the outer
     # finally can always reset even if an exception fires before the bind.

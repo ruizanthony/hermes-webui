@@ -65,8 +65,18 @@ class TestEffectiveReasoningEffortLabel:
 
 class TestBackendEmission:
     def test_run_meta_emitted_upfront_after_agent_registration(self):
+        # A second `put('run_meta', ...)` call site exists earlier in the
+        # source text (inside `_agent_status_callback`, defined before the
+        # agent is created) to re-announce the footer when a fallback swap
+        # succeeds mid-turn — see test_fallback_run_meta_reannounce.py. It
+        # runs later at RUNTIME than registration (only invoked from within
+        # the already-running turn) despite appearing earlier in the file
+        # TEXT, so anchor on the upfront emission's unique surrounding code
+        # instead of the first textual `put('run_meta'` occurrence.
         registration = STREAMING_PY.index("AGENT_INSTANCES[stream_id] = agent")
-        emission = STREAMING_PY.index("put('run_meta'")
+        emission = STREAMING_PY.index(
+            "_run_meta_effort = _effective_reasoning_effort_label(agent, _reasoning_config)"
+        )
         assert registration < emission
         assert "'reasoning_effort': _run_meta_effort" in STREAMING_PY
         assert "'model': getattr(agent, 'model', None) or resolved_model or model" in STREAMING_PY
