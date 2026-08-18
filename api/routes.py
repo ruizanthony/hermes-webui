@@ -22136,10 +22136,16 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
                         # Ghost not added to survivors — removed from index.
 
                     if cleaned > 0 and len(survivors) < len(index_file_data):
+                        from api.models import _index_entries_payload
+
                         _tmp = SESSION_INDEX_FILE.with_suffix(
                             f".tmp.{os.getpid()}.{threading.current_thread().ident}"
                         )
-                        _payload = json.dumps(survivors, ensure_ascii=False, indent=2)
+                        _payload = json.dumps(
+                            _index_entries_payload(survivors),
+                            ensure_ascii=False,
+                            indent=2,
+                        )
                         try:
                             with open(_tmp, "w", encoding="utf-8") as f:
                                 f.write(_payload)

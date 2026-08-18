@@ -712,6 +712,39 @@ def _index_entry_exists(session_id: str, in_memory_ids=None) -> bool:
     return p.exists()
 
 
+# Fields carried by ``Session.compact()`` that the sidebar index must NOT
+# persist. ``compression_anchor_summary`` is a multi-KB compaction digest: it
+# accounted for 89% of a 10.4 MB production ``_index.json`` (7.02 MB / 1558
+# rows) while no index consumer ever reads it. The WebUI renders the compaction
+# card from ``/api/session`` (sidecar-backed ``S.session``), never from a
+# sidebar row, and every index reader here uses only identity/lineage/count
+# fields. Dropping it at write time cuts the parse+serialise+fsync cost paid on
+# EVERY session save — a fixed tax charged to small and large conversations
+# alike, and the dominant serial (GIL-held) cost when many conversations run in
+# parallel.
+#
+# This is a projection filter, not a schema change: the field stays in the
+# sidecar, in ``state.db`` and in ``Session.compact()``. Readers already treat
+# absent keys as ``None`` (``entry.get(...)``), and stale rows written before
+# this change are stripped on their next rewrite.
+_INDEX_OMITTED_FIELDS = frozenset({'compression_anchor_summary'})
+
+
+def _index_entries_payload(entries):
+    """Return ``entries`` projected for on-disk index storage.
+
+    Builds new dicts instead of mutating in place: fast-path callers may pass
+    compact entries they still own (``Session.save()`` does), and silently
+    stripping a caller's dict would be an invisible side effect.
+    """
+    projected = []
+    for entry in entries:
+        if isinstance(entry, dict) and not _INDEX_OMITTED_FIELDS.isdisjoint(entry):
+            entry = {k: v for k, v in entry.items() if k not in _INDEX_OMITTED_FIELDS}
+        projected.append(entry)
+    return projected
+
+
 def _write_session_index(updates=None, *, session_dir: Path | None = None, session_index_file: Path | None = None):
     """Update the session index file.
 
@@ -766,7 +799,7 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
                 ]
             entries.extend(in_memory_entries)
             entries.sort(key=lambda s: s.get('updated_at', 0), reverse=True)
-            _payload = json.dumps(entries, ensure_ascii=False, indent=2)
+            _payload = json.dumps(_index_entries_payload(entries), ensure_ascii=False, indent=2)
 
             try:
                 with open(_tmp, 'w', encoding='utf-8') as f:
@@ -821,7 +854,7 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
                 if sid in updated_map:
                     existing[i] = updated_map[sid]
             existing.sort(key=lambda s: s.get('updated_at', 0), reverse=True)
-            _payload = json.dumps(existing, ensure_ascii=False, indent=2)
+            _payload = json.dumps(_index_entries_payload(existing), ensure_ascii=False, indent=2)
 
             try:
                 with open(_tmp, 'w', encoding='utf-8') as f:
@@ -868,7 +901,7 @@ def prune_session_from_index(session_id: str) -> None:
                 pruned = [e for e in existing if e.get('session_id') != sid]
                 if len(pruned) == len(existing):
                     return
-                _payload = json.dumps(pruned, ensure_ascii=False, indent=2)
+                _payload = json.dumps(_index_entries_payload(pruned), ensure_ascii=False, indent=2)
 
             try:
                 with open(_tmp, 'w', encoding='utf-8') as f:
