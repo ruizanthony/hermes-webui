@@ -3999,21 +3999,38 @@ function renderContextBrief(brief, panel){
     parts.push(`<div class="ctx-brief-section ctx-brief-llm"><div class="ctx-brief-h">${esc(t('context_brief_summary'))}</div><div class="ctx-brief-dim ctx-brief-summary-hint">${esc(t('context_brief_summary_hint'))}</div><div class="ctx-brief-actions"><button type="button" class="ctx-brief-btn" onclick="_contextBriefRefresh(this)">${esc(t('context_brief_generate'))}</button><button type="button" class="ctx-brief-btn ctx-brief-btn-goal" onclick="_contextBriefGoalFinish(this)">${esc(t('context_goal_finish'))}</button></div></div>`);
   }
 
+  // Conversation thread: requests and their conclusions read in sequence,
+  // asks aligned right, conclusions left — the panel mirrors the chat itself
+  // instead of forcing a lookup between two disjoint lists. The server sends
+  // the merged, transcript-ordered `timeline`; briefs cached before that field
+  // existed fall back to requests-then-conclusions so an old payload still renders.
   const reqs = Array.isArray(brief.requests) ? brief.requests : [];
   const reqCount = Number.isFinite(brief.request_count) ? brief.request_count : reqs.length;
-  const reqRows = reqs.length
-    ? reqs.map(r => `<li>${esc(r.text||'')}</li>`).join('')
-    : `<li class="ctx-brief-dim">${esc(t('context_brief_empty_requests'))}</li>`;
-  parts.push(`<div class="ctx-brief-section"><div class="ctx-brief-h">${esc(t('context_brief_requests'))} <span class="ctx-brief-dim">(${reqCount})</span></div><ul class="ctx-brief-list">${reqRows}</ul></div>`);
-
   const acc = brief.accomplished || {};
   const concl = Array.isArray(acc.conclusions) ? acc.conclusions : [];
+  const conclCount = Number.isFinite(acc.conclusion_count) ? acc.conclusion_count : concl.length;
   const compCount = Number.isFinite(acc.compression_count) ? acc.compression_count : (Array.isArray(acc.compressions) ? acc.compressions.length : 0);
-  let accHtml = concl.length
-    ? `<ul class="ctx-brief-list">${concl.map(c => `<li>${esc(c.excerpt||'')}</li>`).join('')}</ul>`
-    : `<div class="ctx-brief-dim">${esc(t('context_brief_empty_accomplished'))}</div>`;
-  if (compCount > 0) accHtml += `<div class="ctx-brief-compressions">${compCount} ${esc(t('context_brief_compressions'))}</div>`;
-  parts.push(`<div class="ctx-brief-section"><div class="ctx-brief-h">${esc(t('context_brief_accomplished'))}</div>${accHtml}</div>`);
+
+  let thread = Array.isArray(brief.timeline) ? brief.timeline : null;
+  if (!thread){
+    thread = reqs.map(r => ({role:'request', text: r.text || ''}))
+      .concat(concl.map(c => ({role:'conclusion', text: c.excerpt || ''})));
+  }
+  const threadRows = thread
+    .map(item => {
+      const isReq = String(item && item.role) === 'request';
+      const cls = isReq ? 'ctx-thread-request' : 'ctx-thread-conclusion';
+      const who = esc(t(isReq ? 'context_brief_thread_you' : 'context_brief_thread_agent'));
+      return `<div class="ctx-thread-row ${cls}"><div class="ctx-thread-bubble"><div class="ctx-thread-who">${who}</div><div class="ctx-thread-text">${esc((item && item.text) || '')}</div></div></div>`;
+    })
+    .join('');
+  const threadHtml = threadRows
+    ? `<div class="ctx-thread">${threadRows}</div>`
+    : `<div class="ctx-brief-dim">${esc(t('context_brief_empty_thread'))}</div>`;
+  const threadCounts = `<span class="ctx-brief-dim">(${reqCount} · ${conclCount})</span>`;
+  let threadBlock = `<div class="ctx-brief-section"><div class="ctx-brief-h">${esc(t('context_brief_thread'))} ${threadCounts}</div>${threadHtml}`;
+  if (compCount > 0) threadBlock += `<div class="ctx-brief-compressions">${compCount} ${esc(t('context_brief_compressions'))}</div>`;
+  parts.push(`${threadBlock}</div>`);
 
   let remHtml = '';
   const todos = brief.todos;

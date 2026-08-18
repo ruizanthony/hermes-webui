@@ -44,6 +44,9 @@ _REQUEST_CAP = 8
 _REQUEST_EXCERPT_CHARS = 240
 _CONCLUSION_CAP = 5
 _CONCLUSION_EXCERPT_CHARS = 220
+# Interleaved request→conclusion thread shown by the panel. Capped on its own
+# budget: it carries both roles, so it must hold more entries than either list.
+_TIMELINE_CAP = _REQUEST_CAP + _CONCLUSION_CAP
 _COMPRESSION_CAP = 6
 _COMPRESSION_EXCERPT_CHARS = 160
 _LAST_REPLY_EXCERPT_CHARS = 280
@@ -337,7 +340,7 @@ def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
 
     requests = []
     seen_requests: set[str] = set()
-    for msg in messages:
+    for idx, msg in enumerate(messages):
         if not _is_user_request(msg):
             continue
         # The workspace tag is runtime plumbing prepended to every message;
@@ -356,12 +359,12 @@ def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
         if key in seen_requests:
             continue
         seen_requests.add(key)
-        requests.append({"ts": ts, "text": text})
+        requests.append({"ts": ts, "text": text, "_idx": idx})
 
     conclusions = []
     compressions = []
     last_assistant = None
-    for msg in messages:
+    for idx, msg in enumerate(messages):
         if msg.get("role") != "assistant":
             continue
         text = _message_text(msg.get("content")).strip()
@@ -379,7 +382,9 @@ def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
         if "# CONCLUSION" in text:
             excerpt = _conclusion_excerpt(text)
             if excerpt:
-                conclusions.append({"ts": msg.get("timestamp") or msg.get("_ts"), "excerpt": excerpt})
+                conclusions.append(
+                    {"ts": msg.get("timestamp") or msg.get("_ts"), "excerpt": excerpt, "_idx": idx}
+                )
         last_assistant = {"ts": msg.get("timestamp") or msg.get("_ts"), "excerpt": _excerpt(text, _LAST_REPLY_EXCERPT_CHARS)}
 
     # Preserve the mission's ORIGIN under capping: a long session can carry
@@ -391,6 +396,24 @@ def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
         if cap <= 0 or len(items) <= cap:
             return items[-cap:] if cap > 0 else []
         return [items[0]] + items[-(cap - 1):]
+
+    # Conversation thread: the panel reads the mission as a dialogue
+    # (ask → answer → next ask), so the pairing must be computed here, on the
+    # transcript order, not re-derived client-side from two capped lists that
+    # each drop different turns. Order on the transcript INDEX, never on the
+    # timestamp: replayed/merged copies carry missing or duplicated stamps.
+    timeline = sorted(
+        [{"role": "request", "ts": r["ts"], "text": r["text"], "_idx": r["_idx"]} for r in requests]
+        + [
+            {"role": "conclusion", "ts": c["ts"], "text": c["excerpt"], "_idx": c["_idx"]}
+            for c in conclusions
+        ],
+        key=lambda item: item["_idx"],
+    )
+    timeline = [
+        {"role": item["role"], "ts": item["ts"], "text": item["text"]}
+        for item in _cap_keep_first(timeline, _TIMELINE_CAP)
+    ]
 
     return {
         "session_id": sid,
@@ -406,10 +429,16 @@ def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
         },
         "goal": _extract_goal(sid, session),
         "todos": _extract_todos(messages),
-        "requests": _cap_keep_first(requests, _REQUEST_CAP),
+        "timeline": timeline,
+        "requests": [
+            {"ts": r["ts"], "text": r["text"]} for r in _cap_keep_first(requests, _REQUEST_CAP)
+        ],
         "request_count": len(requests),
         "accomplished": {
-            "conclusions": _cap_keep_first(conclusions, _CONCLUSION_CAP),
+            "conclusions": [
+                {"ts": c["ts"], "excerpt": c["excerpt"]}
+                for c in _cap_keep_first(conclusions, _CONCLUSION_CAP)
+            ],
             "conclusion_count": len(conclusions),
             "compressions": compressions[-_COMPRESSION_CAP:],
             "compression_count": len(compressions),
