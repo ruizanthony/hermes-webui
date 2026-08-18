@@ -203,7 +203,9 @@ def test_requests_strip_workspace_tag_and_dedupe(tmp_path):
     """The workspace tag is plumbing, and one ask must appear once.
 
     A single turn can be persisted more than once (api_content mirror,
-    startup recovery replay); the brief must not show it twice.
+    startup recovery replay, lineage/state.db merge). The merged copies carry
+    drifted timestamps, so dedupe is by TEXT alone (user report 2026-08-18):
+    identical asks collapse to one entry keeping the first timestamp.
     """
     ws = "[Workspace::v1: /a0/usr/projects/MES]\n"
     messages = [
@@ -216,9 +218,11 @@ def test_requests_strip_workspace_tag_and_dedupe(tmp_path):
 
     texts = [r["text"] for r in brief["requests"]]
     assert all(not t.startswith("[Workspace::v") for t in texts)
-    # Same text at the same timestamp collapses; a genuine repeat later stays.
-    assert texts == ["corrige le brief", "corrige le brief"]
-    assert [r["ts"] for r in brief["requests"]] == [10.0, 11.0]
+    # Identical text collapses to a single entry even across drifted
+    # timestamps (persistence replays and lineage merges re-emit the same
+    # typed turn with slightly different ts values).
+    assert texts == ["corrige le brief"]
+    assert [r["ts"] for r in brief["requests"]] == [10.0]
 
 
 def test_goal_block_included_when_active(tmp_path):

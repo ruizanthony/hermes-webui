@@ -165,6 +165,11 @@ _AUTOMATED_USER_PREFIXES = (
     "[context compaction",
     "[prior context",
     "[system]",
+    # Task-list / skill markers re-injected around compression boundaries are
+    # runtime plumbing, not something Anthony typed (2026-08-18).
+    "[your active task list was preserved",
+    "[skills pruned during compression",
+    "[skill_pruned",
 )
 
 
@@ -331,7 +336,7 @@ def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
     messages = _session_messages(session)
 
     requests = []
-    seen_requests: set[tuple] = set()
+    seen_requests: set[str] = set()
     for msg in messages:
         if not _is_user_request(msg):
             continue
@@ -344,8 +349,10 @@ def build_deterministic_brief(session, sid: str, *, source: str) -> dict:
             continue
         ts = msg.get("timestamp") or msg.get("_ts")
         # The same turn can be persisted several times (api_content mirror,
-        # recovery replay); dedupe on (timestamp, text) so one ask shows once.
-        key = (round(float(ts), 3) if isinstance(ts, (int, float)) else ts, text)
+        # recovery replay, lineage/state.db merge where parent and child copies
+        # carry slightly different timestamps); dedupe on the text alone so one
+        # ask shows once.
+        key = text
         if key in seen_requests:
             continue
         seen_requests.add(key)

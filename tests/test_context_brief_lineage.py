@@ -108,6 +108,46 @@ def test_no_parent_session_unchanged(brief_env):
     assert [m["content"] for m in msgs] == ["simple ask", "simple answer"]
 
 
+def test_requests_exclude_synthetic_user_messages(brief_env):
+    """Only messages Anthony actually typed may appear as requests.
+
+    User report (2026-08-18): the brief showed '[Your active task list was
+    preserved across context compression]' blocks as if they were his prompts.
+    Those user-role messages are injected by the runtime around compression
+    boundaries, as are pruned-skill markers; both must be filtered out.
+    The same typed prompt persisted twice with different timestamps (lineage /
+    state.db merge) must also collapse to a single request entry.
+    """
+    models = brief_env.models
+    now = time.time()
+    s = models.Session(session_id="20260101_000500_synth0")
+    s.messages = [
+        {"role": "user", "content": "vraie demande de correction", "timestamp": now},
+        {
+            "role": "user",
+            "content": "[Your active task list was preserved across context compression]\n- [>] 1. tâche",
+            "timestamp": now + 1,
+        },
+        {
+            "role": "user",
+            "content": "[Skills pruned during compression — reload before acting on these tasks]",
+            "timestamp": now + 2,
+        },
+        {
+            "role": "user",
+            "content": "[SKILL_PRUNED: content lost in compression]",
+            "timestamp": now + 3,
+        },
+        # Same typed prompt duplicated with a drifted timestamp (lineage merge).
+        {"role": "user", "content": "vraie demande de correction", "timestamp": now + 4.5},
+        {"role": "assistant", "content": "ok", "timestamp": now + 5},
+    ]
+    s.save()
+    payload = brief_env.brief.build_deterministic_brief(s, s.session_id, source="webui")
+    texts = [r["text"] for r in payload["requests"]]
+    assert texts == ["vraie demande de correction"]
+
+
 def test_fork_parent_not_stitched(brief_env):
     """Ordinary forks share parent_session_id but must stay independent."""
     models = brief_env.models
