@@ -1818,3 +1818,37 @@ def test_xai_oauth_aliases_supported_by_account_usage_probe():
 
     for alias in ("xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth"):
         assert alias in providers._ACCOUNT_USAGE_PROVIDERS
+
+
+def test_zai_aliases_supported_by_account_usage_probe():
+    import api.providers as providers
+
+    for alias in ("zai", "glm", "zai-coding", "zai-coding-plan", "glm-coding"):
+        assert alias in providers._ACCOUNT_USAGE_PROVIDERS
+
+
+def test_zai_coding_slug_routes_to_zai_quota_probe(monkeypatch, tmp_path):
+    """A custom provider slug pointing at the Z.AI coding endpoint must
+    surface the zai account-limits probe instead of an unsupported status."""
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
+    old_cfg, old_mtime = _with_config(
+        providers={
+            "my-glm-custom": {
+                "name": "My GLM Custom",
+                "api": "https://api.z.ai/api/coding/paas/v4",
+                "key_env": "GLM_API_KEY",
+                "transport": "openai_chat",
+            }
+        }
+    )
+    try:
+        import api.providers as providers
+
+        # an unlisted slug pointing at the coding endpoint routes to zai
+        resolved = providers._resolve_quota_provider("my-glm-custom")
+        assert resolved == "zai"
+        # a slug pointing elsewhere stays itself (no false routing)
+        resolved2 = providers._resolve_quota_provider("zai-coding")
+        assert resolved2 == "zai-coding"
+    finally:
+        _restore_config(old_cfg, old_mtime)

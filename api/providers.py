@@ -104,6 +104,14 @@ _ACCOUNT_USAGE_PROVIDERS = frozenset({
     "grok-oauth",
     "x-ai-oauth",
     "xai-grok-oauth",
+    # Z.AI GLM Coding Plan quotas come from Hermes Agent's
+    # fetch_account_usage() (GET api.z.ai/api/monitor/usage/quota/limit):
+    # plan tier plus rolling 5h and weekly credit windows.
+    "zai",
+    "glm",
+    "zai-coding",
+    "zai-coding-plan",
+    "glm-coding",
 })
 
 # Upper bound on simultaneous profile-isolated quota probe subprocesses.
@@ -2160,6 +2168,7 @@ def _resolve_quota_provider(provider_id: str | None) -> str:
     if provider in _ACCOUNT_USAGE_PROVIDERS:
         return provider
     markers = ("token-plan", "maas.aliyuncs.com")
+    zai_markers = ("api.z.ai/api/coding/",)
     try:
         cfg = get_config()
     except Exception:
@@ -2179,6 +2188,8 @@ def _resolve_quota_provider(provider_id: str | None) -> str:
         lowered = base.strip().lower()
         if any(marker in lowered for marker in markers):
             return "alibaba"
+        if any(marker in lowered for marker in zai_markers):
+            return "zai"
     return provider
 
 
