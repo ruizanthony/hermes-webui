@@ -15561,6 +15561,14 @@ function _loadedCompactionMarkerRawIdxs(messages){
   }
   return out;
 }
+// A settled compaction whose marker sits before the server-loaded tail must
+// remain visible at the top of that tail. Anchoring it to an old assistant/tool
+// turn can bury it inside a hidden worklog, which makes compaction look absent.
+function _pinSettledCompressionReferenceAtTop(inner,node,referenceMessageRawIdx){
+  if(!inner||!node||referenceMessageRawIdx>=0) return false;
+  inner.appendChild(node);
+  return true;
+}
 function _compressionReferenceCardHtml(text, open=false){
   const copy=_engineAwareCompressionCopy();
   const preview=_compactionCardPreview(text)||text.split(/\n+/).filter(Boolean).slice(0,2).join(' ');
@@ -17238,6 +17246,7 @@ function renderMessages(options){
   const referenceNode=(!compressionState && !compactionCardNodes.length && _shouldShowSettledCompressionReference(referenceText) && (sessionCompressionAnchor!==null || sessionCompressionAnchorKey || sessionCompressionSummary))
     ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_compressionReferenceCardHtml(referenceText,false)}${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
     : null;
+  let referenceNodePinnedAtTop=false;
   let preservedCompressionTaskCardsAttached=!!referenceNode||compactionCardNodes.length>0;
   const preservedCompressionRawIdxs=[];
   let rawIdx=0;
@@ -17276,6 +17285,9 @@ function renderMessages(options){
       : (typeof t==='function'?t('load_older_messages'):'Load earlier messages');
     inner.appendChild(indicator);
     _wireMessageWindowLoadEarlierButton();
+    // Keep the settled compacted-context card immediately visible in a long,
+    // tail-loaded conversation. Put it in flow (not inside an old tool turn).
+    referenceNodePinnedAtTop=_pinSettledCompressionReferenceAtTop(inner,referenceNode,referenceMessageRawIdx);
     if(typeof _contextBriefBannerNode==='function') inner.appendChild(_contextBriefBannerNode());
   }
   let lastUserRawIdx=-1;
@@ -17901,8 +17913,10 @@ function renderMessages(options){
 
   _insertCompressionLikeNode(compressionNode);
   for(const entry of compactionCardNodes) _insertCompressionLikeNodeByRawIdx(entry.node, entry.rawIdx);
-  if(referenceNode&&referenceMessageRawIdx>=0) _insertCompressionLikeNodeByRawIdx(referenceNode, referenceMessageRawIdx);
-  else _insertCompressionLikeNode(referenceNode);
+  if(!referenceNodePinnedAtTop){
+    if(referenceNode&&referenceMessageRawIdx>=0) _insertCompressionLikeNodeByRawIdx(referenceNode, referenceMessageRawIdx);
+    else _insertCompressionLikeNode(referenceNode);
+  }
   _insertCompressionLikeNode(preservedOnlyNode, preservedOnlyAnchor);
   _insertCompressionLikeNode(handoffState?_handoffCardsNode(handoffState):null, renderVisWithIdx.length?renderVisWithIdx.length-1:null);
   for(const entry of handoffSummaryStates){
