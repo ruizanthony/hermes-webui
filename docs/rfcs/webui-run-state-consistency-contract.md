@@ -146,27 +146,7 @@ and 5; it does not mark every run-state boundary implemented.
 8. **Every mutation names its layer.** A PR touching streaming, recovery,
    context reconstruction, compression, replay, or sidebar metadata should state
    which layer it changes and what regression proves the invariant still holds.
-9. **Lifecycle-busy is not client-attachable.** `ACTIVE_RUNS` answers "may a new
-   turn start?", not "may a browser attach a renderer?". Cancellation splits the
-   two: `cancel_stream()` keeps the row as `phase="cancelling"` so a successor
-   cannot overlap the unwinding worker, but the client has already reached a
-   terminal state for that stream because its run journal ends in a terminal
-   event. Recovery paths that hand a stream id to a renderer — session SSE
-   recovery and hidden-tab status polling — must therefore exclude cancelling
-   rows, while busy/admission checks must keep counting them. Reading the
-   registry with a single meaning resurrects a cancelled run on every fresh
-   subscription: the client attaches, consumes the terminal event, tears the
-   renderer down, resubscribes, and the loop repeats indefinitely.
-
-   Because a cancelling row can otherwise persist forever, cancellation unwind is
-   bounded: a cancelling row older than that window **and** owning no live
-   `STREAMS` channel is reclaimed from `ACTIVE_RUNS` along with its stream-owner
-   entry, so a wedged worker cannot suppress background wakeups permanently.
-   Reclamation requires both conditions — age alone must not evict a row that
-   still owns a live channel. Staleness is measured from the cancellation
-   timestamp (falling back to run start), so a long-running turn cancelled
-   moments ago is never mistaken for an orphan.
-10. **Sidecar writes are generation-fenced.** A writer may replace a session JSON
+9. **Sidecar writes are generation-fenced.** A writer may replace a session JSON
    sidecar only while the exact durable revision it observed is still current.
    Text publication must use canonical LF bytes so the stored digest matches the
    file on native Windows. First creation must use an atomic create-only primitive:
@@ -199,6 +179,27 @@ and 5; it does not mark every run-state boundary implemented.
    both cancellation and normal completion, with the agent lock acquired before
    the SID authority. Its response-level cleanup may remain best-effort, but a
    protocol failure must be logged and must not fall back to a raw unlink.
+
+10. **Lifecycle-busy is not client-attachable.** `ACTIVE_RUNS` answers "may a new
+   turn start?", not "may a browser attach a renderer?". Cancellation splits the
+   two: `cancel_stream()` keeps the row as `phase="cancelling"` so a successor
+   cannot overlap the unwinding worker, but the client has already reached a
+   terminal state for that stream because its run journal ends in a terminal
+   event. Recovery paths that hand a stream id to a renderer — session SSE
+   recovery and hidden-tab status polling — must therefore exclude cancelling
+   rows, while busy/admission checks must keep counting them. Reading the
+   registry with a single meaning resurrects a cancelled run on every fresh
+   subscription: the client attaches, consumes the terminal event, tears the
+   renderer down, resubscribes, and the loop repeats indefinitely.
+
+   Because a cancelling row can otherwise persist forever, cancellation unwind is
+   bounded: a cancelling row older than that window **and** owning no live
+   `STREAMS` channel is reclaimed from `ACTIVE_RUNS` along with its stream-owner
+   entry, so a wedged worker cannot suppress background wakeups permanently.
+   Reclamation requires both conditions — age alone must not evict a row that
+   still owns a live channel. Staleness is measured from the cancellation
+   timestamp (falling back to run start), so a long-running turn cancelled
+   moments ago is never mistaken for an orphan.
 
 ## Review Checklist
 

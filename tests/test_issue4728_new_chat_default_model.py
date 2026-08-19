@@ -13,9 +13,9 @@ NODE = shutil.which("node")
 _DRIVER_SRC = r"""
 const fs = require('fs');
 
-function extractFunction(src, signature) {
-  const start = src.indexOf(signature);
-  if (start < 0) throw new Error(signature + ' not found');
+function extractNewSession(src) {
+  const start = src.indexOf('async function newSession(');
+  if (start < 0) throw new Error('newSession not found');
   let depth = 0;
   let bodyStart = src.indexOf('{', src.indexOf(')', start));
   for (let i = bodyStart; i < src.length; i++) {
@@ -26,7 +26,7 @@ function extractFunction(src, signature) {
       if (depth === 0) return src.slice(start, i + 1);
     }
   }
-  throw new Error(signature + ' body not closed');
+  throw new Error('newSession body not closed');
 }
 
 const src = fs.readFileSync(process.argv[2], 'utf8');
@@ -156,8 +156,7 @@ globalThis.api = async (url, opts) => {
   };
 };
 
-eval(extractFunction(src, 'function _adoptRegenerationRevision('));
-eval(extractFunction(src, 'async function newSession('));
+eval(extractNewSession(src));
 
 (async () => {
   await newSession(false, {});

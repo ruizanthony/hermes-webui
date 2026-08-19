@@ -672,7 +672,11 @@ def _guard_request_session_visibility(handler, parsed, body=None, method="GET") 
 
 def _request_worktree_ownership_exempt(method: str, path: str | None) -> bool:
     """Return whether a request mutates session metadata but not its worktree."""
-    return method == "POST" and path == "/api/session/archive"
+    return method == "POST" and path in {
+        "/api/session/archive",
+        "/api/share/create",
+        "/api/share/revoke",
+    }
 
 
 def _guard_request_worktree_ownership(handler, body=None, *, method="POST", path=None) -> bool:
@@ -863,52 +867,12 @@ def _get_disabled_skill_names_for_profile() -> set:
     return _normalize_disabled_set(skills_cfg.get("disabled"))
 
 
-def _parse_config_string_list(value) -> list:
-    """Decode a config value that may hold a JSON-array string into a list.
-
-    ``hermes config set`` (and JSON-mode editor saves) store lists as quoted
-    JSON strings (``'[\"a\",\"b\"]'`` or the Python-literal ``\"['a']\"``), so a
-    disabled list read from ``config.yaml`` can arrive as a single string
-    instead of a YAML list. Treating it as one literal name makes the Skills
-    panel show every skill as enabled and makes the toggle write a destructive
-    single-entry list (hermes-webui#7120).
-
-    Reuses ``agent.skill_utils.parse_config_string_list`` (hermes-agent #86661
-    fix) when the bundled agent source is importable, and mirrors its logic
-    otherwise so the two surfaces cannot drift. A scalar string still means one
-    name.
-    """
-    try:
-        from agent.skill_utils import parse_config_string_list
-
-        return parse_config_string_list(value)
-    except ImportError:
-        pass
-    import ast
-
-    if value is None:
-        return []
-    if isinstance(value, str):
-        stripped = value.strip()
-        if stripped.startswith("["):
-            try:
-                parsed = ast.literal_eval(stripped)
-            except (ValueError, SyntaxError):
-                parsed = None
-            if isinstance(parsed, list):
-                return [str(item) for item in parsed]
-        return [value]
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [str(item) for item in value]
-    return []
-
-
 def _normalize_disabled_set(values) -> set:
     """Normalize a YAML disabled list into a set of stripped strings."""
     if values is None:
         return set()
     if isinstance(values, str):
-        values = _parse_config_string_list(values)
+        values = [values]
     return {str(v).strip() for v in values if str(v).strip()}
 
 
@@ -9955,11 +9919,6 @@ from api.models import (
     _record_webui_zero_message_orphan_tombstone,
     _clear_webui_zero_message_orphan_tombstone,
     _load_webui_deleted_session_tombstone,
-    _delete_session_recovery_artifacts_locked,
-    _delete_session_sidecar_artifacts_locked,
-    _read_bounded_session_metadata,
-    _read_sidecar_revision,
-    _session_sidecar_authority,
     ensure_cron_project,
     _profile_has_user_projects,
     is_cron_session,
@@ -10251,23 +10210,16 @@ from api.route_approvals import (  # noqa: F401 — re-exports for backward comp
     _approval_sse_unsubscribe,
     _approval_sse_notify_locked,
     _approval_sse_notify,
-    _GATEWAY_AGENT_IDENTITY_V1,
     _GATEWAY_MIRROR_FLAG,
     _GATEWAY_MIRROR_TOKEN,
     _gateway_mirror_entry_token,
-    gateway_yolo_handoff,
-    begin_session_yolo_transition,
     claim_gateway_approval_relay_owner,
-    finish_session_yolo_transition,
     gateway_pending_mirror,
-    gateway_pending_mirrors,
     release_gateway_approval_relay_owner,
     retire_gateway_pending_mirror,
     reconcile_gateway_pending_mirror_locked,
     resolve_gateway_pending_local,
-    resolve_gateway_pending_local_all,
     resolve_gateway_pending_local_no_run_mirror,
-    set_session_yolo_enabled,
     submit_gateway_pending_mirror,
     submit_pending,
 )
@@ -13542,26 +13494,6 @@ def handle_get(handler, parsed) -> bool:
             ):
                 raw["is_cli_session"] = False
                 raw["read_only"] = True
-            imported_turn_marker = any(
-                isinstance(row, dict) and row.get("_active_turn_token")
-                for row in _all_msgs
-            )
-            if (
-                not raw.get("read_only")
-                and not _truncated
-                and (not raw.get("is_cli_session") or imported_turn_marker)
-            ):
-                from api.session_ops import regeneration_authority, regeneration_state
-                canonical_state = regeneration_state(s)
-                revision = regeneration_authority(
-                    s,
-                    rows=canonical_state[0],
-                    context=canonical_state[1],
-                    full_transcript=True,
-                    canonical_state=canonical_state,
-                )
-                if revision:
-                    raw["regeneration_revision"] = revision
             redact = redact_session_data(raw)
             _t5 = _time.monotonic()
             if _diag: _diag.stage("t5_after_redact")
@@ -15642,24 +15574,46 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session busy, try again", 503)
         sidecar_authority = None
         try:
+            from api.models import (
+                SessionDeleteTombstoneError,
+                _delete_session_sidecar_artifacts_locked,
+                _session_sidecar_authority,
+            )
+
+            sidecar_authority = _session_sidecar_authority(sid)
+            sidecar_authority.__enter__()
             try:
                 p = (SESSION_DIR / f"{sid}.json").resolve()
                 p.relative_to(SESSION_DIR.resolve())
             except Exception:
                 return bad(handler, "Invalid session_id", 400)
             try:
-                with _session_sidecar_authority(sid):
-                    _delete_session_sidecar_artifacts_locked(
-                        sid,
-                        record_tombstone=not is_messaging_session,
-                    )
-            except Exception as exc:
-                logger.exception("Failed to durably delete session sidecar %s", sid)
-                return bad(
-                    handler,
-                    f"Session deletion failed; retry is required: {_sanitize_error(exc)}",
-                    500,
+                _delete_session_sidecar_artifacts_locked(
+                    sid,
+                    record_tombstone=not is_messaging_session,
                 )
+            except SessionDeleteTombstoneError:
+                logger.warning(
+                    "Failed to durably tombstone deleted WebUI session %s",
+                    sid,
+                    exc_info=True,
+                )
+                return bad(handler, "Failed to persist session deletion", 500)
+            except Exception:
+                logger.warning(
+                    "Failed to delete required session file for %s",
+                    sid,
+                    exc_info=True,
+                )
+                return bad(handler, "Failed to delete session files", 500)
+            # Remove the derivable context-brief cache with the session it
+            # summarizes (best-effort; never blocks the durable deletion).
+            try:
+                from api.context_brief import delete_stored_brief
+
+                delete_stored_brief(SESSION_DIR.parent, sid)
+            except Exception:
+                logger.debug("context brief cleanup failed for deleted session %s", sid, exc_info=True)
             try:
                 prune_session_from_index(sid)
             except Exception:
@@ -15906,28 +15860,14 @@ def handle_post(handler, parsed) -> bool:
                     else _read_sidecar_revision(s.path)
                 )
                 try:
-                    with _session_sidecar_authority(sid):
-                        retired = _delete_session_recovery_artifacts_locked(
-                            sid,
-                            expected_live_revision=live_revision,
-                        )
-                    if not retired:
-                        return bad(
-                            handler,
-                            "Session changed while retiring clear recovery artifacts; retry",
-                            409,
-                        )
-                except Exception as exc:
-                    logger.exception(
-                        "session clear could not remove recovery artifacts for %s",
+                    _retire_backup_if_owned(
                         sid,
+                        s.path.with_suffix('.json.bak'),
+                        backup_receipt,
+                        committed_receipt,
                     )
-                    return bad(
-                        handler,
-                        f"Session clear recovery cleanup failed; retry is required: "
-                        f"{_sanitize_error(exc)}",
-                        500,
-                    )
+                except OSError:
+                    logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
         # Evict cached agent outside the per-session lock.  Eviction may run a
         # boundary memory commit for batch-extraction providers, and provider
         # I/O must not hold the session mutation lock.
@@ -16200,15 +16140,22 @@ def handle_post(handler, parsed) -> bool:
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
-        sid = str(body["session_id"] or "").strip()
+        sid = body["session_id"]
         enabled = bool(body.get("enabled", True))
-        if not enabled:
-            with gateway_yolo_handoff(sid):
-                set_session_yolo_enabled(sid, False)
-                return j(handler, {"ok": True, "yolo_enabled": bool(is_session_yolo_enabled(sid))})
-
-        payload, status = _enable_session_yolo_and_release_pending(sid, choice="once")
-        return j(handler, payload, status=status)
+        if enabled:
+            enable_session_yolo(sid)
+            # Also resolve any pending approvals for this session so the
+            # agent doesn't stay stuck waiting on an already-dismissed card.
+            try:
+                from tools.approval import _pending as _p, _lock as _l
+                with _l:
+                    _p.pop(sid, None)
+            except Exception:
+                pass
+            resolve_gateway_approval(sid, "once", resolve_all=True)
+        else:
+            disable_session_yolo(sid)
+        return j(handler, {"ok": True, "yolo_enabled": enabled})
 
     if parsed.path == "/api/btw":
         return _handle_btw(handler, body)
@@ -18091,126 +18038,6 @@ def _parse_run_journal_event_id(raw: str | None) -> tuple[str | None, int | None
     return _shared_parse_run_journal_event_id(raw)
 
 
-def _chat_stream_resume_cursor(handler, qs: dict, stream_id: str | None = None) -> tuple[int | None, bool, str | None, str | None]:
-    """Resolve the client's resume cursor for ``/api/chat/stream``.
-
-    Returns ``(after_seq, resume_requested, raw_cursor, runner_cursor)``:
-
-    - ``after_seq``: the parsed same-run cursor seq, or ``None`` when there is
-      no usable same-run (journal-shaped) cursor.
-    - ``resume_requested``: True when the client SUPPLIED any cursor — via the
-      ``after_event_id`` / ``after_seq`` query params, ``replay=1``, or the
-      ``Last-Event-ID`` header — regardless of whether it parsed.
-    - ``raw_cursor``: the opaque cursor string exactly as the client supplied it
-      (the ``Last-Event-ID`` value, or the explicit ``after_event_id``).
-    - ``runner_cursor``: the cursor to hand to the runner observe path, resolved
-      with PROVENANCE so the runner adapter (whose cursors are opaque, not
-      journal-shaped) gets a cursor it can actually use:
-
-        * a valid ``after_seq`` pairs with whatever ``after_event_id`` was
-          supplied — even an opaque runner id like ``event:2`` that the
-          journal parser reads as a foreign run — so the paired runner cursor
-          resumes at the seq (never ``None`` / full replay, which would
-          duplicate events);
-        * a header-only opaque runner id (``Last-Event-ID: event:2``) is
-          preserved as-is so the runner resumes from it;
-        * a malformed or foreign explicit cursor WITHOUT a valid paired
-          ``after_seq`` yields ``None`` — it must block the header and replay
-          from start (this preserves the r2 malformed-blocks-header rule and
-          never forwards an unusable cursor to the runner).
-
-    The presence flag must stay separate from validity: a malformed, foreign-run,
-    or ahead-of-stream cursor resolves to ``after_seq=None`` but still means the
-    client *asked* to resume. That request must be honored with a
-    replay-from-start so no journal events are silently skipped — whereas a
-    genuinely cursor-less request is a fresh subscribe (no replay).
-
-    Precedence is decided by query-parameter PRESENCE, not successful parsing:
-    when an explicit ``after_seq`` / ``after_event_id`` is supplied (even an
-    unparseable one), the ``Last-Event-ID`` header is never consulted, so a
-    header can never override an explicit cursor and silently skip events.
-
-    ``Last-Event-ID`` is the cursor every spec-compliant SSE client (browser
-    ``EventSource`` auto-reconnect, Android/CLI clients) sends automatically on
-    reconnect, carrying the ``id:`` of the last event it received. Every
-    journaled event on this stream already emits ``id: stream_id:seq`` via
-    ``_sse_with_id()``. Same resolution-chain precedent as
-    ``api/kanban_bridge.py`` (``?since=`` → ``Last-Event-ID``).
-    """
-    after_seq_raw = qs.get("after_seq", [None])[0]
-    has_explicit_query = (
-        after_seq_raw not in (None, "")
-        or bool(qs.get("after_event_id", [None])[0])
-        or bool(qs.get("replay", [""])[0])
-    )
-    if has_explicit_query:
-        explicit_raw = str(qs.get("after_event_id", [None])[0] or "").strip() or None
-        after_seq = _parse_run_journal_after_seq(qs, stream_id)
-        # Runner cursor provenance. ``after_seq`` is authoritative when it
-        # parses — it pairs with whatever ``after_event_id`` shape was
-        # supplied, including opaque runner ids (``event:2``) that the journal
-        # parser reads as a foreign run. Read it directly here (not via
-        # ``_parse_run_journal_after_seq``, which checks ``after_event_id``
-        # FIRST and would swallow a paired opaque runner id as "foreign").
-        paired_seq = _parse_run_journal_after_seq_value(after_seq_raw)
-        if paired_seq is not None:
-            runner_cursor = str(paired_seq)
-        else:
-            event_run_id, event_seq = _parse_run_journal_event_id(explicit_raw)
-            runner_cursor = (
-                explicit_raw
-                if explicit_raw and event_seq is not None and (not stream_id or event_run_id == stream_id)
-                else None
-            )
-        return after_seq, True, explicit_raw, runner_cursor
-    headers = getattr(handler, "headers", None)
-    if headers is None:
-        return None, False, None, None
-    try:
-        raw = headers.get("Last-Event-ID")
-    except Exception:
-        return None, False, None, None
-    raw = str(raw or "").strip()
-    if not raw:
-        return None, False, None, None
-    event_run_id, event_seq = _parse_run_journal_event_id(raw)
-    if event_run_id and event_seq is not None:
-        if stream_id and event_run_id != stream_id:
-            # Foreign-run journal cursor: asked to resume THIS run but the cursor
-            # names a different journal run — can't honor it for the journal
-            # path (after_seq stays None → replay-from-start). The runner path
-            # keys cursors by run_id independently (the cursor is forwarded as
-            # an opaque per-run query param), so a ``run:seq`` header still
-            # reaches it as-is; this mirrors how a foreign after_event_id on
-            # the journal path is rejected while the same client's explicit
-            # opaque cursor= would still reach the runner.
-            return None, True, raw, raw
-        return event_seq, True, raw, raw
-    # Malformed as a JOURNAL cursor. A colon-less opaque value is a plausible
-    # runner cursor (runner ids need not be journal-shaped), so preserve it for
-    # the runner; a value that merely fails int() parsing is unusable anywhere.
-    runner_cursor = raw if ":" not in raw else None
-    return None, True, raw, runner_cursor
-
-
-def _parse_run_journal_after_seq_value(raw) -> int | None:
-    """Parse a bare ``after_seq`` value, independent of any ``after_event_id``.
-
-    Used by the runner-cursor provenance path, where ``after_seq`` is
-    authoritative on its own and must NOT be gated behind the
-    ``after_event_id``-first ordering of ``_parse_run_journal_after_seq`` (a
-    paired opaque runner id like ``event:2`` would otherwise be read as a
-    foreign run and swallow the seq). Mirrors the ``after_seq`` tail of that
-    parser: absent/blank → None, non-numeric → 0.
-    """
-    if raw in (None, ""):
-        return None
-    try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        return 0
-
-
 def _parse_run_journal_after_seq(qs: dict, stream_id: str | None = None) -> int | None:
     event_run_id, event_seq = _parse_run_journal_event_id(qs.get("after_event_id", [None])[0])
     if event_run_id:
@@ -18322,8 +18149,7 @@ def _run_journal_covers_offline_gap(
 
 
 def _sse_replay_run_journal_gap_checked(
-    handler, qs: dict, stream_id: str, stream_snapshot: dict,
-    *, resume_cursor: tuple[int | None, bool] | None = None,
+    handler, qs: dict, stream_id: str, stream_snapshot: dict
 ) -> tuple[bool, int | None]:
     """Journal-replay for a reconnecting client, enforcing offline-gap coverage.
 
@@ -18333,30 +18159,12 @@ def _sse_replay_run_journal_gap_checked(
     (see ``_run_journal_covers_offline_gap``), a recovery_control apperror has
     been emitted and the caller must return instead of draining the retained
     tail (``gap_recovered=True``).
-
-    ``resume_cursor`` is the caller-resolved ``(after_seq, resume_requested)``
-    pair from ``_chat_stream_resume_cursor``. Presence and validity are kept
-    separate: an invalid / foreign-run / unparseable cursor means the client
-    *asked* to resume but we couldn't honor it, so it is normalized to
-    replay-from-start (``after_seq=None`` inside the replay) rather than
-    treated as "no cursor" — which would skip replay and silently drain a
-    truncated buffer. A genuinely cursor-less request (``resume_requested``
-    False) is a fresh subscribe and returns ``(False, None)`` with no replay.
-
-    Direct callers that only supply ``qs`` keep the historical behavior: the
-    cursor is derived from the query params (presence of ``replay`` /
-    ``after_seq`` / ``after_event_id`` counts as resume-requested).
     """
-    if resume_cursor is None:
-        after_seq = _parse_run_journal_after_seq(qs, stream_id)
-        resume_requested = (
-            bool(qs.get("replay", [""])[0])
-            or qs.get("after_seq", [None])[0] not in (None, "")
-            or bool(qs.get("after_event_id", [None])[0])
-        )
-    else:
-        after_seq, resume_requested = resume_cursor
-    if not resume_requested:
+    if not (
+        qs.get("replay", [""])[0]
+        or qs.get("after_seq", [None])[0] not in (None, "")
+        or qs.get("after_event_id", [None])[0]
+    ):
         return False, None
     try:
         offline_dropped = int(stream_snapshot.get("offline_dropped_events") or 0)
@@ -18366,33 +18174,7 @@ def _sse_replay_run_journal_gap_checked(
         str(stream_snapshot.get("last_event_id") or ""),
         stream_id,
     )
-    # Normalize an unparseable / foreign cursor (asked to resume, but no usable
-    # same-run seq) to replay-from-start so the gap check and dedup operate on
-    # a real cursor instead of silently skipping the whole journal.
-    if after_seq is None:
-        after_seq = 0
-    # Normalize a numeric cursor strictly AHEAD of the snapshot's last known
-    # frame to replay-from-start too: the client believes it already holds
-    # everything, so on a truncated buffer the coverage check's
-    # ``floor >= replay_max_seq`` would falsely declare the gap covered, replay
-    # nothing, and drain only the retained tail — silently losing every event
-    # before it (Codex r2 #2). ``>`` (not ``>=``) — a cursor EQUAL to the
-    # cutoff is a valid in-range cursor (see the dedup bound below).
-    #
-    # An UNKNOWN snapshot cutoff (no parseable ``last_event_id`` — e.g. the
-    # channel has not seen an id-bearing frame yet) is treated as fence 0:
-    # with no cutoff to bound it, any positive client cursor would otherwise
-    # be installed verbatim as the live dedup bound and filter EVERY queued
-    # frame — including the terminal ``stream_end`` fence — leaving the
-    # reconnect stalled on heartbeats with an empty body (Codex r4). Failing
-    # closed to replay-from-start delivers the buffered events (at worst
-    # duplicating what the client already holds) instead of silently losing
-    # them. Frames dropped while the cutoff is unknown still cannot prove
-    # coverage below (``cutoff_seq is None`` → not covered), so the
-    # recovery_control fail-closed path is preserved.
-    effective_cutoff = snapshot_cutoff_seq if snapshot_cutoff_seq is not None else 0
-    if after_seq > effective_cutoff:
-        after_seq = 0
+    after_seq = _parse_run_journal_after_seq(qs, stream_id)
     # The subscribe snapshot already queued the retained offline tail, which
     # covers [first buffered frame → snapshot cutoff] by itself. The journal
     # only has to bridge (client cursor → first buffered frame) — and the
@@ -18440,21 +18222,18 @@ def _sse_replay_run_journal_gap_checked(
     # tail (after_seq >= first buffered frame) would otherwise get the queued
     # copy of frames it already rendered — a double-render, since this filter
     # is the only dedup for replayed streams.
-    #
-    # Dedup bound semantics: the drain filter skips ``seq <= replay_cutoff_seq``.
-    # The event AT the cursor (seq == after_seq) was already delivered to this
-    # client, so the cursor must itself enter the bound — equality included —
-    # otherwise the buffered copy of that event double-sends. A cursor strictly
-    # ahead of the snapshot was already normalized to 0 above; here only
-    # in-range cursors (after_seq <= snapshot_cutoff_seq) contribute a bound,
-    # and the terminal frame must always survive.
-    if after_seq is not None and after_seq > 0:
-        if snapshot_cutoff_seq is None or after_seq <= snapshot_cutoff_seq:
-            replay_cutoff_seq = (
-                after_seq
-                if replay_cutoff_seq is None
-                else max(replay_cutoff_seq, after_seq)
-            )
+    if after_seq is not None:
+        cursor_bound = after_seq
+        if snapshot_cutoff_seq is not None:
+            # A legitimate cursor can never exceed the channel's last known
+            # frame; clamping keeps a bogus/corrupt cursor from filtering the
+            # queued terminal frame and pinning the loop on heartbeats.
+            cursor_bound = min(cursor_bound, snapshot_cutoff_seq)
+        replay_cutoff_seq = (
+            cursor_bound
+            if replay_cutoff_seq is None
+            else max(replay_cutoff_seq, cursor_bound)
+        )
     return False, replay_cutoff_seq
 
 
@@ -18616,47 +18395,16 @@ def _handle_sse_stream(handler, parsed):
     stream_id = qs.get("stream_id", [""])[0]
     if not _stream_id_visible_to_request_profile(handler, stream_id):
         return True
-    # Resume cursor: explicit query params (after_event_id/after_seq/replay)
-    # win; the Last-Event-ID header that spec-compliant SSE clients auto-send
-    # on reconnect is the fallback. Presence is tracked separately from the
-    # parsed seq — a client that supplied ANY cursor asked to resume, and an
-    # unusable (invalid/foreign/ahead-of-stream) cursor must replay from start
-    # rather than silently skip journal events.
-    resume_cursor = _chat_stream_resume_cursor(handler, qs, stream_id)
-    resume_after_seq, resume_requested, resume_raw_cursor, runner_resume_cursor = resume_cursor
     stream = STREAMS.get(stream_id)
     if stream is None:
-        # Runner-observe path: consume the ALREADY-RESOLVED cursor — do not
-        # re-parse query params or re-read the header (Codex r2 #3 / r3). The
-        # explicit opaque ``cursor`` query param still wins for runner clients
-        # that speak that contract. Otherwise use the resolver's
-        # provenance-resolved runner cursor: a valid ``after_seq`` pairs with
-        # opaque runner ids (event:2), a header-only opaque runner id resumes
-        # as-is, and a malformed/foreign cursor without a valid paired seq
-        # yields None (replay from start, never forwarding an unusable cursor).
-        runner_cursor = str(qs.get("cursor", [""])[0] or "").strip() or None
-        if runner_cursor is None and resume_requested:
-            runner_cursor = runner_resume_cursor
-        if _stream_runner_run_events(handler, stream_id, runner_cursor):
+        if _stream_runner_run_events(handler, stream_id, _runner_stream_cursor_from_query(qs)):
             return True
         try:
-            journal_summary = find_run_summary(stream_id) if stream_id else None
+            journal_available = bool(find_run_summary(stream_id)) if stream_id else False
         except Exception:
-            journal_summary = None
-        if not journal_summary:
+            journal_available = False
+        if not journal_available:
             return j(handler, {"error": "stream not found"}, status=404)
-        # Normalize a cursor strictly AHEAD of the dead stream's authoritative
-        # last_seq to replay-from-start: passing it straight through would make
-        # the journal reader emit an empty SSE body for a journal that actually
-        # holds events (Codex r2 #2). Equality is in-range — the event at the
-        # cursor was already delivered, so the replay correctly resumes after it.
-        dead_after_seq = resume_after_seq
-        try:
-            last_seq = int(journal_summary.get("last_seq") or 0)
-        except (TypeError, ValueError):
-            last_seq = 0
-        if dead_after_seq is not None and dead_after_seq > last_seq:
-            dead_after_seq = 0
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
         handler.send_header("Cache-Control", "no-cache")
@@ -18664,7 +18412,7 @@ def _handle_sse_stream(handler, parsed):
         handler.send_header("Connection", "close")
         end_sse_headers(handler)
         try:
-            _replay_run_journal(handler, stream_id, dead_after_seq)
+            _replay_run_journal(handler, stream_id, _parse_run_journal_after_seq(qs, stream_id))
         except _CLIENT_DISCONNECT_ERRORS:
             pass
         return True
@@ -18683,8 +18431,7 @@ def _handle_sse_stream(handler, parsed):
     # Replay shares the drain loop's try/finally so every exit path unsubscribes.
     try:
         gap_recovered, replay_cutoff_seq = _sse_replay_run_journal_gap_checked(
-            handler, qs, stream_id, stream_snapshot,
-            resume_cursor=(resume_after_seq, resume_requested),
+            handler, qs, stream_id, stream_snapshot
         )
         if gap_recovered:
             return True
@@ -19083,14 +18830,6 @@ def _gateway_sse_probe_payload(settings, watcher):
         'fallback_poll_ms': 30000,
         'ok': enabled and watcher_alive,
         'watcher_running': watcher_alive,
-        # Cross-client scope markers (hermes-webui/hermes-android#58 follow-up):
-        # this probe ONLY describes the optional gateway/agent-sessions stream.
-        # Persistent per-session streaming (GET /api/session/stream) is always
-        # available and is NOT gated by show_cli_sessions, so a negative gateway
-        # probe result must not be read as "session SSE unavailable".
-        'scope': 'gateway_sessions',
-        'session_stream_available': True,
-        'session_stream_path': '/api/session/stream',
     }
     if not enabled:
         payload['error'] = 'agent sessions not enabled'
@@ -19105,12 +18844,6 @@ def _handle_gateway_sse_stream(handler, parsed):
     """SSE endpoint for real-time gateway session updates.
     Streams change events from the gateway watcher background thread.
     Only active when show_cli_sessions (show_agent_sessions) setting is enabled.
-
-    Probe mode (``?probe=1``) reports the status of THIS optional stream only.
-    Its result says nothing about the always-on persistent per-session stream
-    (``/api/session/stream``) — the probe payload carries explicit
-    ``scope`` / ``session_stream_available`` markers so cross-client consumers
-    do not misclassify usable session streaming as unavailable.
     """
     settings = load_settings()
 
@@ -22063,8 +21796,7 @@ def _handle_memory_read(handler, parsed=None):
 
 def _handle_sessions_cleanup(handler, body, zero_only=False):
     cleaned = 0
-    phase1_removed_ids = set()
-    cleanup_failures = []
+    phase1_delete_candidate_ids = set()
 
     # Phase 1: classify and delete under the same SID authority as writers.
     for p in SESSION_DIR.glob("*.json"):
@@ -22072,56 +21804,35 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
             continue
         sid = p.stem
         try:
-            with _get_session_agent_lock(sid):
-                with _session_sidecar_authority(sid):
-                    revision = _read_sidecar_revision(p)
-                    if revision is None:
-                        continue
-                    metadata = _read_bounded_session_metadata(p)
-                    if metadata.get('session_id') != sid:
-                        continue
-                    message_count = metadata.get('message_count')
-                    if type(message_count) is not int:
-                        # Legacy/minimal sidecars can omit both messages and the
-                        # derived count. Keep the fallback hard-bounded and fail
-                        # closed for malformed or large unknown shapes.
-                        if p.stat().st_size > 1024 * 1024:
-                            continue
-                        legacy_payload = json.loads(p.read_text(encoding='utf-8'))
-                        if not isinstance(legacy_payload, dict):
-                            continue
-                        legacy_messages = legacy_payload.get('messages', [])
-                        if not isinstance(legacy_messages, list):
-                            continue
-                        message_count = len(legacy_messages)
-                    if zero_only:
-                        should_delete = message_count == 0
-                    else:
-                        should_delete = (
-                            metadata.get('title') == "Untitled"
-                            and message_count == 0
-                        )
-                    if not should_delete:
-                        continue
-                    if not _delete_session_sidecar_artifacts_locked(
-                        sid,
-                        expected_revision=revision,
-                    ):
-                        continue
-                    cleaned += 1
-                    phase1_removed_ids.add(sid)
-        except Exception as exc:
-            cleanup_failures.append((sid, exc))
-            logger.exception("Failed to durably clean up session file %s", p)
+            from api.models import (
+                _delete_session_sidecar_artifacts_locked,
+                _read_sidecar_snapshot,
+                _session_sidecar_authority,
+            )
 
-    if cleanup_failures:
-        failed_sid, failed_exc = cleanup_failures[0]
-        return bad(
-            handler,
-            f"Session cleanup failed for {failed_sid}; retry is required: "
-            f"{_sanitize_error(failed_exc)}",
-            500,
-        )
+            sid = p.stem
+            with _session_sidecar_authority(sid):
+                revision, payload = _read_sidecar_snapshot(p, sid)
+                messages = payload.get("messages")
+                if messages is None:
+                    messages = []
+                if not isinstance(messages, list):
+                    continue
+                title = payload.get("title", "Untitled")
+                should_delete = not messages and (
+                    zero_only or title == "Untitled"
+                )
+                if not should_delete:
+                    continue
+                phase1_delete_candidate_ids.add(sid)
+                if not _delete_session_sidecar_artifacts_locked(
+                    sid,
+                    expected_revision=revision,
+                ):
+                    continue
+                cleaned += 1
+        except Exception:
+            logger.debug("Failed to clean up session file %s", p, exc_info=True)
 
     phase1_touched = bool(cleaned)
     phase2_rewrote_index = False
@@ -22274,15 +21985,23 @@ def _handle_btw(handler, body):
     return j(handler, {"stream_id": stream_id, "session_id": ephemeral.session_id, "parent_session_id": body["session_id"]})
 
 
-def _delete_hidden_background_session_sidecar(sid: str) -> bool:
-    """Durably remove a hidden background sidecar and every recovery artifact."""
-    with _get_session_agent_lock(sid):
-        with _session_sidecar_authority(sid):
-            sidecar = SESSION_DIR / f'{sid}.json'
-            revision = _read_sidecar_revision(sidecar)
-            return _delete_session_sidecar_artifacts_locked(
-                sid,
-                expected_revision=revision,
+def _delete_hidden_background_session_sidecar(session_id: str) -> None:
+    """Delete a completed hidden session through the normal SID authorities."""
+    if not is_safe_session_id(session_id):
+        raise ValueError(f"Unsafe hidden background session_id {session_id!r}")
+    with _get_session_agent_lock(session_id):
+        from api.models import (
+            _delete_session_sidecar_artifacts_locked,
+            _session_sidecar_authority,
+            delete_cli_session,
+        )
+
+        with _session_sidecar_authority(session_id):
+            _delete_session_sidecar_artifacts_locked(session_id)
+        if not delete_cli_session(session_id):
+            logger.warning(
+                "Hidden background session %s remains in state.db; durable tombstone prevents recovery",
+                session_id,
             )
 
 
@@ -22409,8 +22128,6 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
             latest_text = " ".join(str(latest.get("content") or "").split())
             msg_text = " ".join(str(msg or "").split())
             if latest_text == msg_text:
-                if str(source or "").strip().lower() == "fork":
-                    latest["_fork_child_turn"] = s.session_id
                 return
     user_msg = {"role": "user", "content": msg}
     from api.process_event_utils import build_active_turn_token, stamp_message_source
@@ -22420,8 +22137,6 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
         source,
         active_turn_token=build_active_turn_token(getattr(s, "active_stream_id", None), started_at),
     )
-    if str(source or "").strip().lower() == "fork":
-        user_msg["_fork_child_turn"] = s.session_id
     if isinstance(started_at, (int, float)) and started_at > 0:
         user_msg["timestamp"] = float(started_at)
     if attachments:
@@ -22449,9 +22164,6 @@ def _provisional_title_from_prompt(prompt: str, fallback: str = "Untitled") -> s
     return title_from([{"role": "user", "content": text}], fallback) or fallback
 
 
-_RETAINED_CONTEXT_USER_UNSET = object()
-
-
 def _prepare_chat_start_session_for_stream(
     s,
     *,
@@ -22463,9 +22175,6 @@ def _prepare_chat_start_session_for_stream(
     stream_id: str,
     started_at: float | None = None,
     source: str = "webui",
-    retained_user=None,
-    retained_context_user=_RETAINED_CONTEXT_USER_UNSET,
-    defer_save: bool = False,
 ):
     """Persist chat-start state according to webui.session_save_mode.
 
@@ -22476,11 +22185,6 @@ def _prepare_chat_start_session_for_stream(
     a normal session message. Empty sessions are never saved here because this
     helper only runs after a non-empty message is validated.
     """
-    effective_source = (
-        "fork"
-        if str(getattr(s, "session_source", None) or "").strip().lower() == "fork"
-        else source
-    )
     s.workspace = workspace
     s.model = model
     s.model_provider = model_provider
@@ -22490,62 +22194,21 @@ def _prepare_chat_start_session_for_stream(
     s.pending_user_message = msg
     s.pending_attachments = attachments
     s.pending_started_at = started_at if started_at is not None else time.time()
-    s.pending_user_source = effective_source
-    if retained_user is not None:
-        from api.process_event_utils import build_active_turn_token
-
-        retained_user["timestamp"] = s.pending_started_at
-        active_turn_token = build_active_turn_token(stream_id, s.pending_started_at)
-        retained_user["_active_turn_token"] = active_turn_token
-        if str(effective_source or "").strip().lower() == "fork":
-            retained_user["_fork_child_turn"] = s.session_id
-        if retained_context_user is not _RETAINED_CONTEXT_USER_UNSET:
-            if retained_context_user is not None and not any(
-                row is retained_context_user
-                for row in list(getattr(s, "context_messages", None) or [])
-            ):
-                raise RuntimeError("regeneration retained context row is not installed")
-            if isinstance(retained_context_user, dict):
-                retained_context_user["timestamp"] = s.pending_started_at
-                retained_context_user["_active_turn_token"] = active_turn_token
-                if str(effective_source or "").strip().lower() == "fork":
-                    retained_context_user["_fork_child_turn"] = s.session_id
-        else:
-            retained_id = retained_user.get("id") or retained_user.get("message_id")
-            retained_old_timestamp = retained_user.get("timestamp")
-            retained_old_content = retained_user.get("content")
-            for context_row in reversed(list(getattr(s, "context_messages", None) or [])):
-                if not isinstance(context_row, dict) or context_row.get("role") != "user":
-                    continue
-                context_id = context_row.get("id") or context_row.get("message_id")
-                id_match = retained_id is not None and context_id == retained_id
-                old_shape_match = (
-                    retained_old_timestamp is not None
-                    and context_row.get("timestamp") == retained_old_timestamp
-                    and context_row.get("content") == retained_old_content
-                )
-                if not (id_match or old_shape_match):
-                    continue
-                context_row["timestamp"] = s.pending_started_at
-                context_row["_active_turn_token"] = active_turn_token
-                if str(effective_source or "").strip().lower() == "fork":
-                    context_row["_fork_child_turn"] = s.session_id
-                break
+    s.pending_user_source = source
     current_title = getattr(s, "title", None)
-    if retained_user is None and _is_default_or_empty_session_title(current_title):
+    if _is_default_or_empty_session_title(current_title):
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
         if provisional_title and not _is_default_or_empty_session_title(provisional_title):
             s.title = provisional_title
-    if retained_user is None and get_webui_session_save_mode() == "eager":
+    if get_webui_session_save_mode() == "eager":
         _checkpoint_user_message_for_eager_session_save(
             s,
             msg,
             attachments,
             s.pending_started_at,
-            source=effective_source,
+            source=source,
         )
-    if not defer_save:
-        s.save()
+    s.save()
 
 
 def _is_hidden_empty_session(s) -> bool:
@@ -22591,247 +22254,6 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
         if pending_started_at and time.time() - pending_started_at < grace_seconds:
             return True
     return False
-
-
-def _start_regeneration_stream_locked(
-    s,
-    *,
-    turn,
-    workspace: str,
-    model: str,
-    model_provider,
-    normalized_model: bool,
-    diag,
-    goal_related: bool,
-    source: str,
-    moa_config,
-    backend_is_gateway: bool,
-):
-    """Commit a retained-row regeneration before releasing its real worker."""
-    from api.session_ops import (
-        RegenerationUnavailable,
-        apply_regeneration_plan,
-        plan_regeneration,
-        restore_regeneration_state,
-        snapshot_regeneration_state,
-    )
-
-    try:
-        plan = plan_regeneration(
-            s, expected_revision=turn.revision, lock_held=True
-        )
-        turn = plan.turn
-    except RegenerationUnavailable as exc:
-        return {
-            "error": str(exc),
-            "code": exc.code,
-            "_status": exc.status,
-        }
-    # Snapshot only after lock-held authority validation, before mutation.
-    snapshot = snapshot_regeneration_state(s)
-    if compression_recovery_payload_for_session(s):
-        clear_compression_recovery(s)
-    stream_id = uuid.uuid4().hex
-    gateway_starting = False
-    thread_started = False
-    save_attempted = False
-    accepted = False
-    journal_event = {}
-    release_worker = threading.Event()
-    abort_worker = threading.Event()
-    worker_thread = None
-
-    worker_target = (
-        _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
-    )
-    worker_kwargs = {
-        "model_provider": model_provider,
-        "goal_related": goal_related,
-    }
-    if backend_is_gateway:
-        worker_kwargs["regeneration"] = True
-    if moa_config and not backend_is_gateway:
-        worker_kwargs["moa_config"] = moa_config
-
-    def _gated_worker():
-        release_worker.wait()
-        if abort_worker.is_set():
-            return
-        worker_target(
-            s.session_id,
-            turn.message_text,
-            model,
-            workspace,
-            stream_id,
-            copy.deepcopy(turn.attachments),
-            **worker_kwargs,
-        )
-
-    def _cleanup_owned_start():
-        if goal_related:
-            STREAM_GOAL_RELATED.pop(stream_id, None)
-        with STREAMS_LOCK:
-            STREAMS.pop(stream_id, None)
-        unregister_stream_owner(stream_id)
-        clear_session_writeback_owner_if_owned(s.session_id, stream_id)
-        if gateway_starting:
-            try:
-                from api.gateway_chat import (
-                    _clear_gateway_run_starting,
-                    _finish_gateway_run_starting,
-                )
-
-                _finish_gateway_run_starting(stream_id)
-                _clear_gateway_run_starting(stream_id)
-            except Exception:
-                logger.debug(
-                    "Failed to clear compensated gateway start %s",
-                    stream_id,
-                    exc_info=True,
-                )
-
-    try:
-        applied, retained_context_user = apply_regeneration_plan(
-            s,
-            plan,
-            return_context_user=True,
-        )
-        if not applied:
-            restore_regeneration_state(s, snapshot)
-            return {
-                "error": "Session changed while regeneration was being prepared.",
-                "code": "stale_regeneration_revision",
-                "_status": 409,
-            }
-        retained_user = s.messages[-1]
-        msg = turn.message_text
-        attachments = copy.deepcopy(turn.attachments)
-        was_hidden_empty_session = _is_hidden_empty_session(s)
-        _prepare_chat_start_session_for_stream(
-            s,
-            msg=msg,
-            attachments=attachments,
-            workspace=workspace,
-            model=model,
-            model_provider=model_provider,
-            stream_id=stream_id,
-            source=turn.source,
-            retained_user=retained_user,
-            retained_context_user=retained_context_user,
-            defer_save=True,
-        )
-
-        diag.stage("turn_journal_submitted") if diag else None
-        from api.turn_journal import append_turn_journal_event
-
-        journal_event = append_turn_journal_event(
-            s.session_id,
-            {
-                "event": "submitted",
-                "stream_id": stream_id,
-                "role": "user",
-                "content": msg,
-                "attachments": attachments,
-                "workspace": workspace,
-                "model": model,
-                "model_provider": model_provider,
-                "created_at": s.pending_started_at,
-            },
-        )
-        diag.stage("stream_registration") if diag else None
-        stream = create_stream_channel()
-        register_stream_owner(stream_id, s.session_id)
-        with STREAMS_LOCK:
-            STREAMS[stream_id] = stream
-        if goal_related:
-            STREAM_GOAL_RELATED[stream_id] = True
-        if backend_is_gateway:
-            from api.gateway_chat import _mark_gateway_run_starting
-
-            gateway_starting = True
-            _mark_gateway_run_starting(stream_id)
-
-        diag.stage("worker_thread_start") if diag else None
-        worker_thread = threading.Thread(target=_gated_worker, daemon=True)
-        worker_thread.start()
-        thread_started = True
-        save_attempted = True
-        s.save()
-        accepted = True
-        set_last_workspace(workspace)
-        release_worker.set()
-    except Exception as exc:
-        abort_worker.set()
-        release_worker.set()
-        if (
-            thread_started
-            and worker_thread is not None
-            and callable(getattr(worker_thread, "join", None))
-        ):
-            worker_thread.join(timeout=1)
-        _cleanup_owned_start()
-        if accepted:
-            if journal_event:
-                try:
-                    append_turn_journal_event(
-                        s.session_id,
-                        {
-                            "event": "interrupted",
-                            "stream_id": stream_id,
-                            "turn_id": journal_event.get("turn_id"),
-                            "reason": "post_acceptance_workspace_failure",
-                        },
-                    )
-                except Exception:
-                    logger.warning("Failed to close accepted regeneration journal", exc_info=True)
-            exc._regeneration_accepted = True
-            raise
-        restore_regeneration_state(s, snapshot)
-        if save_attempted:
-            try:
-                s.save(touch_updated_at=False)
-            except Exception:
-                logger.exception(
-                    "Failed to persist compensated regeneration for %s",
-                    s.session_id,
-                )
-        if journal_event:
-            try:
-                append_turn_journal_event(
-                    s.session_id,
-                    {
-                        "event": "interrupted",
-                        "stream_id": stream_id,
-                        "turn_id": journal_event.get("turn_id"),
-                        "reason": "start_compensated",
-                    },
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to close compensated turn journal event",
-                    exc_info=True,
-                )
-        raise
-
-    release_worker.set()
-    if was_hidden_empty_session:
-        publish_session_list_changed(
-            "session_new",
-            profile=getattr(s, "profile", None),
-            session_id=getattr(s, "session_id", None),
-        )
-    response = {
-        "stream_id": stream_id,
-        "session_id": s.session_id,
-        "pending_started_at": s.pending_started_at,
-        "turn_id": journal_event.get("turn_id"),
-        "title": s.title,
-    }
-    if normalized_model:
-        response["effective_model"] = model
-    if model_provider:
-        response["effective_model_provider"] = model_provider
-    return response
 
 
 def _active_run_stream_for_session(session_id: str | None) -> str | None:
@@ -23005,7 +22427,6 @@ def _start_chat_stream_for_session(
     source: str = "webui",
     moa_config=None,
     external_runtime_owned: bool | None = None,
-    regeneration=None,
     continuation_claim_id: str | None = None,
     maintenance_handoff=None,
 ):
@@ -23095,20 +22516,6 @@ def _start_chat_stream_for_session(
                         "_status": 409,
                     }
                 needs_stale_cleanup = False
-                if regeneration is not None:
-                    return _start_regeneration_stream_locked(
-                        s,
-                        turn=regeneration,
-                        workspace=workspace,
-                        model=model,
-                        model_provider=model_provider,
-                        normalized_model=normalized_model,
-                        diag=diag,
-                        goal_related=goal_related,
-                        source=source,
-                        moa_config=moa_config,
-                        backend_is_gateway=backend_is_gateway,
-                    )
                 stream_id = uuid.uuid4().hex
                 if source == "goal_continuation":
                     from api.goal_continuations import bind_goal_continuation_stream
@@ -23285,7 +22692,6 @@ def _chat_start_response_from_run_start(result):
         "effective_model",
         "effective_model_provider",
         "error",
-        "code",
         "active_stream_id",
         "_status",
     ):
@@ -23322,7 +22728,6 @@ def _start_run(
     diag=None,
     moa_config=None,
     gateway_chat_enabled: bool | None = None,
-    regeneration=None,
     goal_related: bool = False,
     continuation_claim_id: str | None = None,
     maintenance_handoff=None,
@@ -23381,8 +22786,6 @@ def _start_run(
         return _direct_start()
 
     if runtime_adapter_enabled() or runtime_adapter_runner_enabled():
-        if regeneration is not None and runtime_adapter_runner_enabled():
-            return {"error": "Regeneration is not supported by the runner backend.", "code": "unsupported_regeneration_backend", "_status": 409}
         def _legacy_start_run(request: StartRunRequest) -> dict:
             request_source = request.source or source
             return _start_chat_stream_for_session(
@@ -23400,7 +22803,6 @@ def _start_run(
                 source=request_source,
                 moa_config=moa_config,
                 external_runtime_owned=gateway_chat_enabled,
-                regeneration=regeneration,
                 continuation_claim_id=continuation_claim_id,
                 maintenance_handoff=maintenance_handoff,
             )
@@ -23448,7 +22850,6 @@ def _start_run(
         source=source,
         moa_config=moa_config,
         external_runtime_owned=gateway_chat_enabled,
-        regeneration=regeneration,
         continuation_claim_id=continuation_claim_id,
         maintenance_handoff=maintenance_handoff,
     )
@@ -24004,7 +23405,6 @@ def _handle_goal_command(handler, body):
         and not stream_running
     )
     workspace = model = model_provider = normalized_model = None
-    explicit_model_pick = bool(body.get("explicit_model_pick"))
     previous_goal_state = None
     if will_kickoff:
         try:
@@ -24019,11 +23419,6 @@ def _handle_goal_command(handler, body):
             if "model_provider" in body
             else getattr(s, "model_provider", None)
         )
-        # #6703: carry the explicit-pick marker through goal kickoffs. The
-        # frontend marks a session-level provider/model choice as explicit (same
-        # signal /api/chat/start receives); without it the model resolver treats
-        # a persisted cross-provider pick as stale and "repairs" it back to the
-        # profile default, silently switching providers mid-session.
         _pp_provider, _pp_default, _pp_cfg = _read_profile_model_config(s, requested_provider)
         model, model_provider, normalized_model = _resolve_compatible_session_model_state(
             requested_model,
@@ -24031,20 +23426,7 @@ def _handle_goal_command(handler, body):
             profile_provider=_pp_provider,
             profile_default_model=_pp_default,
             profile_config=_pp_cfg,
-            explicit_model_pick=explicit_model_pick,
         )
-        # #5979/#6703 parity with chat-start: record a SIGNATURE of the
-        # deliberately-picked model+provider so the streaming resolver can
-        # preserve a custom-proxy vendor namespace on a cold catalog. A first
-        # /goal launch after a deliberate custom-provider pick must survive a
-        # cold streaming catalog exactly like /api/chat/start does; otherwise the
-        # provider reverts to the profile default mid-session.
-        try:
-            if explicit_model_pick:
-                from api.models import model_explicit_pick_signature as _mk_sig
-                s.model_explicit_pick_signature = _mk_sig(model, model_provider)
-        except Exception:
-            pass
         previous_goal_state = goal_state_snapshot(s.session_id, profile_home=profile_home)
 
     from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
@@ -24098,16 +23480,7 @@ def _handle_goal_command(handler, body):
                 profile_provider=_pp_provider,
                 profile_default_model=_pp_default,
                 profile_config=_pp_cfg,
-                explicit_model_pick=explicit_model_pick,
             )
-            # #6703 parity: same explicit-pick signature stamping on the
-            # kickoff-prompt fallback resolution path as /api/chat/start.
-            try:
-                if explicit_model_pick:
-                    from api.models import model_explicit_pick_signature as _mk_sig
-                    s.model_explicit_pick_signature = _mk_sig(model, model_provider)
-            except Exception:
-                pass
         stream_response = _start_chat_stream_for_session(
             s,
             msg=kickoff_prompt,
@@ -24154,14 +23527,6 @@ def _handle_chat_start(handler, body, diag=None):
                 {"status": "suppressed", "reason": "silent_control_message"},
                 status=200,
             )
-        if body.get("regenerate") is True:
-            from api.runtime_adapter import runtime_adapter_runner_enabled
-
-            if runtime_adapter_runner_enabled():
-                return j(handler, {
-                    "error": "Regeneration is not supported by the runner backend.",
-                    "code": "unsupported_regeneration_backend",
-                }, status=409)
         # Reject a stale local Agent runtime before materialising, claiming, or
         # mutating any session state. Gateway-backed turns run in the gateway's
         # process and do not depend on this WebUI process's imported checkout.
@@ -24170,10 +23535,7 @@ def _handle_chat_start(handler, body, diag=None):
             return j(handler, stale_response, status=409)
         diag.stage("get_session") if diag else None
         try:
-            s = _get_or_materialize_session(
-                body["session_id"],
-                refresh_cli_messages=body.get("regenerate") is not True,
-            )
+            s = _get_or_materialize_session(body["session_id"], refresh_cli_messages=True)
         except KeyError:
             # No WebUI sidecar. If this is a foreign-origin session (CLI,
             # TUI, Desktop) with recoverable state.db messages, claim it by
@@ -24264,36 +23626,18 @@ def _handle_chat_start(handler, body, diag=None):
             ):
                 # Empty placeholders can still be retagged when the
                 # requested profile matches the active request profile.
-                s.profile = requested_profile
-            else:
-                return bad(handler, "Session not found", 404)
-        regeneration = None
-        if body.get("regenerate") is True:
-            if any(key in body for key in ("message", "attachments", "keep_count", "prompt", "prompt_index")):
-                return j(handler, {"error": "regeneration accepts only regeneration_revision", "code": "invalid_regeneration_request"}, status=400)
-            if not isinstance(body.get("regeneration_revision"), str):
-                return j(handler, {"error": "regeneration_revision is required", "code": "stale_regeneration_revision"}, status=409)
-            try:
-                from api.session_ops import plan_regeneration, RegenerationUnavailable
-                regeneration = plan_regeneration(
-                    s, expected_revision=body["regeneration_revision"]
-                )
-            except RegenerationUnavailable as exc:
-                return j(handler, {"error": str(exc), "code": exc.code}, status=exc.status)
-            msg = regeneration.turn.message_text
-            attachments = copy.deepcopy(regeneration.turn.attachments)[:20]
-        else:
-            msg = None
-            attachments = None
+                candidate.profile = requested_profile
+                return True
+            return False
+
         if not _authorize_chat_start_session(s):
             return bad(handler, "Session not found", 404)
         diag.stage("normalize_message") if diag else None
-        msg = str(msg if msg is not None else body.get("message", "")).strip()
+        msg = str(body.get("message", "")).strip()
         if not msg:
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
-        if attachments is None:
-            attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
+        attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
 
         def _compression_recovery_required_response(candidate_recovery):
             return j(
@@ -24313,10 +23657,7 @@ def _handle_chat_start(handler, body, diag=None):
         candidate_recovery = compression_recovery_payload_for_session(s)
         diag.stage("resolve_workspace") if diag else None
         try:
-            if regeneration is not None:
-                workspace = _resolve_chat_workspace_for_regeneration(s, body.get("workspace"))
-            else:
-                workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
+            workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
             s = getattr(workspace, "session", s)
             workspace = str(workspace)
         except WorkspaceBindingPersistenceError as e:
@@ -24372,7 +23713,7 @@ def _handle_chat_start(handler, body, diag=None):
         # compares). This survives same-model follow-up sends (the onchange marker
         # is one-shot) yet can't outlive a real switch.
         try:
-            if explicit_model_pick and regeneration is None:
+            if explicit_model_pick:
                 from api.models import model_explicit_pick_signature as _mk_sig
                 s.model_explicit_pick_signature = _mk_sig(model, model_provider)
         except Exception:
@@ -24431,7 +23772,6 @@ def _handle_chat_start(handler, body, diag=None):
             "route": "/api/chat/start",
             "diag": diag,
             "gateway_chat_enabled": gateway_chat_enabled,
-            "regeneration": regeneration,
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config
@@ -24448,7 +23788,7 @@ def _handle_chat_start(handler, body, diag=None):
                 return restore_err
             return None
 
-        if recovery and regeneration is None:
+        if recovery:
             recovery_cleared_for_start = copy.deepcopy(recovery)
             clear_compression_recovery(s)
         try:
@@ -24456,9 +23796,8 @@ def _handle_chat_start(handler, body, diag=None):
                 s,
                 **start_run_kwargs,
             )
-        except Exception as exc:
-            if not getattr(exc, "_regeneration_accepted", False):
-                _restore_cleared_recovery()
+        except Exception:
+            _restore_cleared_recovery()
             raise
         # Map adapter-selection NotImplementedError (501) onto the legacy
         # bad-request response shape that this route exposed historically
@@ -24503,20 +23842,24 @@ def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> _ResolvedCh
 
     explicit = requested_workspace not in (None, "")
     if explicit:
-        return _ResolvedChatWorkspace(resolve_trusted_workspace(requested_workspace), s)
+        workspace = _validated_target(resolve_trusted_workspace(requested_workspace))
+        return _ResolvedChatWorkspace(workspace, s)
     stored_workspace = getattr(s, "workspace", None)
     workspace, recovered = resolve_implicit_workspace_with_recovery(
         stored_workspace,
         get_last_workspace,
     )
     if not recovered:
+        workspace = _validated_target(workspace)
         return _ResolvedChatWorkspace(workspace, s)
+    workspace = _validated_target(workspace)
     persisted = persist_recovered_workspace_binding(
         s,
         workspace,
         expected_workspace=stored_workspace,
     )
-    return _ResolvedChatWorkspace(persisted.workspace, persisted)
+    persisted_workspace = _validated_target(persisted.workspace)
+    return _ResolvedChatWorkspace(persisted_workspace, persisted)
 
 
 def _normalize_chat_attachments(raw_attachments):
@@ -26123,25 +25466,10 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: st
                 if gw_approval_id == approval_id and (not run_id or gw_run_id == run_id):
                     local_gateway_approval_id = approval_id
                 elif not run_id and found_target and pending:
-                    # The no-run mirror may belong to a NON-head producer
-                    # (multiple parked entries, #7093). The queue head's own
-                    # token won't match a non-head mirror, so scan every live
-                    # producer for a token/approval_id match instead of only
-                    # comparing against `_gateway_queues[0]`.
                     pending_token = str(pending.get(_GATEWAY_MIRROR_TOKEN) or "").strip()
-                    matched_data = None
-                    for _cand in gw_queue:
-                        _cand_data = getattr(_cand, "data", None) or {}
-                        _cand_token = str(_cand_data.get("_webui_mirror_token") or "").strip()
-                        if pending_token and _cand_token == pending_token:
-                            matched_data = _cand_data
-                            break
-                        if (str(_cand_data.get("approval_id") or "").strip() == approval_id
-                                and not str(_cand_data.get("run_id") or "").strip()):
-                            matched_data = _cand_data
-                            break
-                    if matched_data is not None:
-                        matched_data["approval_id"] = approval_id
+                    gateway_token = str(gw_data.get("_webui_mirror_token") or "").strip()
+                    if pending_token and pending_token == gateway_token:
+                        gw_data["approval_id"] = approval_id
                         local_gateway_approval_id = approval_id
         # Notify SSE subscribers of the new head (or empty state) so the UI
         # surfaces any trailing approvals that were queued behind this one
@@ -26202,269 +25530,6 @@ _GATEWAY_APPROVAL_RELAY_IN_PROGRESS = (
 )
 
 
-def _gateway_approval_failure(
-    sid: str,
-    choice: str,
-    *,
-    code: str,
-    error: str,
-    status: int,
-    enable_yolo: bool,
-    relayed: bool = False,
-) -> tuple[dict, int]:
-    """Build a failed relay response with authoritative session-YOLO state."""
-    payload = {
-        "ok": False,
-        "choice": choice,
-        "relayed": relayed,
-        "code": code,
-        "error": error,
-    }
-    if enable_yolo:
-        payload["yolo_enabled"] = bool(is_session_yolo_enabled(sid))
-    return payload, status
-
-
-def _relay_gateway_run_approval(
-    sid: str,
-    mirror: dict,
-    choice: str,
-    *,
-    enable_yolo: bool,
-) -> tuple[dict, int]:
-    """Relay one exact run-backed mirror under the shared `(session, run)` owner.
-
-    The mirror remains actionable unless the remote Runs API confirms success.
-    Both the approval-card endpoint and the ordinary session-YOLO endpoint use
-    this chokepoint so one tab cannot retire another tab's parked remote run.
-    """
-    from api.config import gateway_supports_approval_identity_v1, get_config as _get_config
-    from api.gateway_chat import _gateway_api_key, _gateway_base_url
-    from api.runner_client import HttpRunnerClient, RunnerClientError
-
-    run_id = str(mirror.get("run_id") or "").strip()
-    approval_id = str(mirror.get("approval_id") or "").strip()
-    mirror_token = str(mirror.get(_GATEWAY_MIRROR_TOKEN) or "").strip()
-    if not run_id or not approval_id:
-        return _gateway_approval_failure(
-            sid,
-            choice,
-            code="gateway_run_unavailable",
-            error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-            status=409,
-            enable_yolo=enable_yolo,
-        )
-    if not claim_gateway_approval_relay_owner(sid, run_id, approval_id):
-        return _gateway_approval_failure(
-            sid,
-            choice,
-            code="gateway_approval_in_progress",
-            error=_GATEWAY_APPROVAL_RELAY_IN_PROGRESS,
-            status=409,
-            enable_yolo=enable_yolo,
-        )
-
-    try:
-        current_mirror = gateway_pending_mirror(
-            sid,
-            approval_id=approval_id,
-            run_id=run_id,
-            mirror_token=mirror_token,
-        )
-        if not current_mirror:
-            return _gateway_approval_failure(
-                sid,
-                choice,
-                code="gateway_run_unavailable",
-                error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-                status=409,
-                enable_yolo=enable_yolo,
-            )
-
-        base_url = _gateway_base_url(_get_config())
-        api_key = _gateway_api_key()
-        identity_v1 = bool(current_mirror.get(_GATEWAY_AGENT_IDENTITY_V1)) and (
-            gateway_supports_approval_identity_v1(base_url, api_key)
-        )
-        if not identity_v1:
-            run_head = gateway_pending_mirror(sid, run_id=run_id)
-            if not run_head or str(run_head.get("approval_id") or "").strip() != approval_id:
-                return _gateway_approval_failure(
-                    sid,
-                    choice,
-                    code="gateway_run_unavailable",
-                    error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-                    status=409,
-                    enable_yolo=enable_yolo,
-                )
-
-        yolo_transition = begin_session_yolo_transition(sid) if enable_yolo else None
-        relay_error = None
-        relay_succeeded = False
-        try:
-            HttpRunnerClient(base_url=base_url, api_key=api_key).respond_approval(
-                run_id,
-                approval_id if identity_v1 else "",
-                choice,
-            )
-            relay_succeeded = True
-        except (RunnerClientError, ValueError) as exc:
-            relay_error = str(exc)
-        finally:
-            finish_session_yolo_transition(sid, yolo_transition, succeeded=relay_succeeded)
-
-        if relay_error is not None:
-            return _gateway_approval_failure(
-                sid,
-                choice,
-                code="gateway_approval_relay_failed",
-                error=relay_error,
-                status=502,
-                enable_yolo=enable_yolo,
-                relayed=True,
-            )
-
-        # The outbound relay resumes the remote run. Retire the local projection
-        # only after that succeeds, then settle any matching in-process mirror.
-        _resolve_approval_legacy(sid, approval_id, choice, run_id=run_id)
-        retire_gateway_pending_mirror(
-            sid,
-            approval_id=approval_id,
-            run_id=run_id,
-            mirror_token=mirror_token,
-        )
-        return {
-            "ok": True,
-            "choice": choice,
-            "relayed": True,
-            **(
-                {"yolo_enabled": bool(is_session_yolo_enabled(sid))}
-                if enable_yolo
-                else {}
-            ),
-        }, 200
-    finally:
-        release_gateway_approval_relay_owner(sid, run_id, approval_id)
-
-
-def _pending_approval_owner_state(
-    sid: str,
-    approval_id: str,
-    run_id: str = "",
-    mirror_token: str = "",
-) -> tuple[bool, bool]:
-    """Return `(exact_owner_exists, any_pending_exists)` under queue authority."""
-    approval_id = str(approval_id or "").strip()
-    run_id = str(run_id or "").strip()
-    mirror_token = str(mirror_token or "").strip()
-    with _lock:
-        reconcile_gateway_pending_mirror_locked(sid)
-        queue = _pending.get(sid)
-        entries = queue if isinstance(queue, list) else [queue] if queue else []
-        exact = False
-        for entry in entries:
-            if not isinstance(entry, dict) or str(entry.get("approval_id") or "") != approval_id:
-                continue
-            entry_run_id = str(entry.get("run_id") or "").strip()
-            entry_mirror_token = str(entry.get(_GATEWAY_MIRROR_TOKEN) or "").strip()
-            if run_id and entry_run_id != run_id:
-                continue
-            if mirror_token and entry_mirror_token != mirror_token:
-                continue
-            if (run_id or mirror_token) and not entry.get(_GATEWAY_MIRROR_FLAG):
-                continue
-            exact = True
-            break
-        return exact, bool(entries or _gateway_queues.get(sid))
-
-
-def _enable_session_yolo_and_release_pending(
-    sid: str,
-    *,
-    choice: str,
-    approval_id: str = "",
-    run_id: str = "",
-    mirror_token: str = "",
-    include_choice: bool = False,
-) -> tuple[dict, int]:
-    """Relay every parked remote approval, drain local waiters, then commit YOLO."""
-    approval_id = str(approval_id or "").strip()
-    run_id = str(run_id or "").strip()
-    mirror_token = str(mirror_token or "").strip()
-    has_exact_remote_owner = bool(run_id or mirror_token)
-    if has_exact_remote_owner and (not approval_id or not run_id or not mirror_token):
-        return _gateway_approval_failure(
-            sid,
-            choice,
-            code="gateway_run_unavailable",
-            error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-            status=409,
-            enable_yolo=True,
-        )
-
-    yolo_transition = None
-    try:
-        with gateway_yolo_handoff(sid):
-            yolo_transition = begin_session_yolo_transition(sid)
-            stale_cleared = False
-            if approval_id:
-                exact_owner, any_pending = _pending_approval_owner_state(
-                    sid,
-                    approval_id,
-                    run_id,
-                    mirror_token,
-                )
-                if not exact_owner and (has_exact_remote_owner or any_pending):
-                    return _gateway_approval_failure(
-                        sid,
-                        choice,
-                        code="gateway_run_unavailable",
-                        error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-                        status=409,
-                        enable_yolo=True,
-                    )
-                stale_cleared = not exact_owner
-
-            run_mirrors = gateway_pending_mirrors(sid)
-            relayed = 0
-            for mirror in run_mirrors:
-                relay_payload, relay_status = _relay_gateway_run_approval(
-                    sid,
-                    mirror,
-                    choice,
-                    enable_yolo=False,
-                )
-                if relay_status != 200 or not relay_payload.get("ok"):
-                    finish_session_yolo_transition(
-                        sid,
-                        yolo_transition,
-                        succeeded=False,
-                    )
-                    yolo_transition = None
-                    return {
-                        **relay_payload,
-                        "yolo_enabled": bool(is_session_yolo_enabled(sid)),
-                    }, relay_status
-                relayed += 1
-
-            resolve_gateway_pending_local_all(
-                sid,
-                choice,
-            )
-            finish_session_yolo_transition(sid, yolo_transition, succeeded=True)
-            yolo_transition = None
-            return {
-                "ok": True,
-                "yolo_enabled": bool(is_session_yolo_enabled(sid)),
-                **({"choice": choice} if include_choice or relayed else {}),
-                **({"relayed": True} if relayed else {}),
-                **({"stale_cleared": True} if stale_cleared else {}),
-            }, 200
-    finally:
-        if yolo_transition is not None:
-            finish_session_yolo_transition(sid, yolo_transition, succeeded=False)
-
-
 def _gateway_pending_approval_without_run_id(sid: str, approval_id: str) -> bool:
     with _lock:
         reconcile_gateway_pending_mirror_locked(sid)
@@ -26514,55 +25579,6 @@ def _handle_approval_respond(handler, body):
     if choice not in ("once", "session", "always", "deny"):
         return bad(handler, f"Invalid choice: {choice}")
     approval_id = body.get("approval_id", "")
-    enable_yolo = body.get("yolo") is True
-    requested_run_id = str(body.get("run_id") or "").strip()
-    requested_mirror_token = str(body.get("mirror_token") or "").strip()
-
-    if enable_yolo:
-        payload, status = _enable_session_yolo_and_release_pending(
-            sid,
-            choice=choice,
-            approval_id=approval_id,
-            run_id=requested_run_id,
-            mirror_token=requested_mirror_token,
-            include_choice=True,
-        )
-        return j(handler, payload, status=status)
-
-    if requested_run_id or requested_mirror_token:
-        if not approval_id or not requested_run_id or not requested_mirror_token:
-            relay_payload, relay_status = _gateway_approval_failure(
-                sid,
-                choice,
-                code="gateway_run_unavailable",
-                error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-                status=409,
-                enable_yolo=False,
-            )
-            return j(handler, relay_payload, status=relay_status)
-        exact_mirror = gateway_pending_mirror(
-            sid,
-            approval_id=approval_id,
-            run_id=requested_run_id,
-            mirror_token=requested_mirror_token,
-        )
-        if exact_mirror is None:
-            relay_payload, relay_status = _gateway_approval_failure(
-                sid,
-                choice,
-                code="gateway_run_unavailable",
-                error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-                status=409,
-                enable_yolo=False,
-            )
-            return j(handler, relay_payload, status=relay_status)
-        relay_payload, relay_status = _relay_gateway_run_approval(
-            sid,
-            exact_mirror,
-            choice,
-            enable_yolo=False,
-        )
-        return j(handler, relay_payload, status=relay_status)
 
     # Gateway relay: forward choice to the runs API when session has an active run,
     # or recover the run_id from the mirrored gateway approval entry if the
@@ -26570,9 +25586,12 @@ def _handle_approval_respond(handler, body):
     try:
         from api.gateway_chat import (
             _STREAM_RUN_IDS,
+            _gateway_base_url,
+            _gateway_api_key,
             webui_gateway_chat_enabled,
         )
-        from api.config import get_config as _get_config
+        from api.config import get_config as _get_config, gateway_supports_approval_identity_v1
+        from api.route_approvals import _GATEWAY_AGENT_IDENTITY_V1
         s = get_session(sid)
         _candidate_run_id = None
         if s is not None:
@@ -26641,15 +25660,17 @@ def _handle_approval_respond(handler, body):
         if local_match:
             _candidate_run_id = None
         if approval_id and not local_match and same_run_stale_without_token:
-            relay_payload, relay_status = _gateway_approval_failure(
-                sid,
-                choice,
-                code="gateway_run_unavailable",
-                error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
+            return j(
+                handler,
+                {
+                    "ok": False,
+                    "choice": choice,
+                    "relayed": False,
+                    "code": "gateway_run_unavailable",
+                    "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
+                },
                 status=409,
-                enable_yolo=enable_yolo,
             )
-            return j(handler, relay_payload, status=relay_status)
         matched_mirror = (
             gateway_pending_mirror(sid, approval_id=approval_id, run_id=_candidate_run_id)
             if approval_id and not local_match
@@ -26660,61 +25681,88 @@ def _handle_approval_respond(handler, body):
             if local_match:
                 _candidate_run_id = None
             elif run_backed_gateway_matches > 1 and not _candidate_run_id:
-                relay_payload, relay_status = _gateway_approval_failure(
-                    sid,
-                    choice,
-                    code="gateway_run_unavailable",
-                    error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
+                return j(
+                    handler,
+                    {
+                        "ok": False,
+                        "choice": choice,
+                        "relayed": False,
+                        "code": "gateway_run_unavailable",
+                        "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
+                    },
                     status=409,
-                    enable_yolo=enable_yolo,
                 )
-                return j(handler, relay_payload, status=relay_status)
         if _run_id:
-            if enable_yolo:
-                # The visible card path must serialize the same session-wide
-                # handoff as the ordinary /api/session/yolo route and the Runs
-                # stream. Revalidate the exact mirror after acquiring it so a
-                # later approval cannot be parked while this relay commits YOLO.
-                with gateway_yolo_handoff(sid):
-                    current_mirror = gateway_pending_mirror(
-                        sid,
-                        approval_id=approval_id,
-                        run_id=_run_id,
-                    )
-                    if current_mirror is None:
-                        relay_payload, relay_status = _gateway_approval_failure(
-                            sid,
-                            choice,
-                            code="gateway_run_unavailable",
-                            error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-                            status=409,
-                            enable_yolo=True,
-                        )
-                    else:
-                        relay_payload, relay_status = _relay_gateway_run_approval(
-                            sid,
-                            current_mirror,
-                            choice,
-                            enable_yolo=True,
-                        )
-            else:
-                relay_payload, relay_status = _relay_gateway_run_approval(
-                    sid,
-                    matched_mirror or {},
-                    choice,
-                    enable_yolo=False,
+            from api.runner_client import HttpRunnerClient, RunnerClientError
+            _cfg = _get_config()
+            _base = _gateway_base_url(_cfg)
+            _key = _gateway_api_key()
+            claimed_approval_id = str(matched_mirror.get("approval_id") or "").strip()
+            if not claim_gateway_approval_relay_owner(sid, _run_id, claimed_approval_id):
+                return j(
+                    handler,
+                    {
+                        "ok": False,
+                        "choice": choice,
+                        "relayed": False,
+                        "code": "gateway_approval_in_progress",
+                        "error": _GATEWAY_APPROVAL_RELAY_IN_PROGRESS,
+                    },
+                    status=409,
                 )
-            return j(handler, relay_payload, status=relay_status)
+            try:
+                current_mirror = gateway_pending_mirror(
+                    sid,
+                    approval_id=claimed_approval_id,
+                    run_id=_run_id,
+                )
+                if not current_mirror:
+                    return j(
+                        handler,
+                        {
+                            "ok": False,
+                            "choice": choice,
+                            "relayed": False,
+                            "code": "gateway_run_unavailable",
+                            "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
+                        },
+                        status=409,
+                    )
+                identity_v1 = bool(current_mirror.get(_GATEWAY_AGENT_IDENTITY_V1)) and gateway_supports_approval_identity_v1(_base, _key)
+                if not identity_v1:
+                    run_head = gateway_pending_mirror(sid, run_id=_run_id)
+                    if not run_head or str(run_head.get("approval_id") or "").strip() != claimed_approval_id:
+                        return j(
+                            handler,
+                            {
+                                "ok": False,
+                                "choice": choice,
+                                "relayed": False,
+                                "code": "gateway_run_unavailable",
+                                "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
+                            },
+                            status=409,
+                        )
+                matched_mirror = current_mirror
+                try:
+                    HttpRunnerClient(base_url=_base, api_key=_key).respond_approval(
+                        _run_id, matched_mirror["approval_id"] if identity_v1 else "", choice
+                    )
+                except (RunnerClientError, ValueError) as exc:
+                    return j(handler, {"ok": False, "choice": choice, "relayed": True, "error": str(exc)}, status=502)
+                # The outbound relay only resumes the remote run; the local mirror
+                # still needs the same cleanup path so the parked entry, mirrored
+                # card, and agent signal all settle here too.
+                cleanup_approval_id = matched_mirror["approval_id"]
+                _resolve_approval_legacy(sid, cleanup_approval_id, choice, run_id=_run_id)
+                retire_gateway_pending_mirror(sid, approval_id=cleanup_approval_id, run_id=_run_id)
+                return j(handler, {"ok": True, "choice": choice, "relayed": True})
+            finally:
+                release_gateway_approval_relay_owner(sid, _run_id, claimed_approval_id)
         if _candidate_run_id:
-            relay_payload, relay_status = _gateway_approval_failure(
-                sid,
-                choice,
-                code="gateway_run_unavailable",
-                error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-                status=409,
-                enable_yolo=enable_yolo,
-            )
-            return j(handler, relay_payload, status=relay_status)
+            return j(handler, {"ok": False, "choice": choice, "relayed": False,
+                               "code": "gateway_run_unavailable",
+                               "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE}, status=409)
         # A no-run mirror is local visibility state only. Resolve it only while
         # the exact parked producer still exists; otherwise keep the card live
         # and fail closed instead of claiming success.
@@ -26723,28 +25771,11 @@ def _handle_approval_respond(handler, body):
                 sid, approval_id, choice
             )
             if handled_no_run_mirror and resolved_count == 1:
-                if enable_yolo:
-                    set_session_yolo_enabled(sid, True)
-                return j(handler, {
-                    "ok": True,
-                    "choice": choice,
-                    "local_retired": True,
-                    **(
-                        {"yolo_enabled": bool(is_session_yolo_enabled(sid))}
-                        if enable_yolo
-                        else {}
-                    ),
-                })
+                return j(handler, {"ok": True, "choice": choice, "local_retired": True})
             if handled_no_run_mirror:
-                relay_payload, relay_status = _gateway_approval_failure(
-                    sid,
-                    choice,
-                    code="gateway_run_unavailable",
-                    error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
-                    status=409,
-                    enable_yolo=enable_yolo,
-                )
-                return j(handler, relay_payload, status=relay_status)
+                return j(handler, {"ok": False, "choice": choice, "relayed": False,
+                                   "code": "gateway_run_unavailable",
+                                   "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE}, status=409)
     except Exception:
         pass  # fall through to local approval path
 
@@ -26776,29 +25807,8 @@ def _handle_approval_respond(handler, body):
         # card instead of dead-ending. When something IS still pending, keep
         # the protective ok:false. `stale_cleared` lets the frontend log/branch
         # without showing an error toast.
-        if enable_yolo:
-            set_session_yolo_enabled(sid, True)
-        return j(handler, {
-            "ok": True,
-            "choice": choice,
-            "stale_cleared": True,
-            **(
-                {"yolo_enabled": bool(is_session_yolo_enabled(sid))}
-                if enable_yolo
-                else {}
-            ),
-        })
-    if ok and enable_yolo:
-        set_session_yolo_enabled(sid, True)
-    return j(handler, {
-        "ok": ok,
-        "choice": choice,
-        **(
-            {"yolo_enabled": bool(is_session_yolo_enabled(sid))}
-            if ok and enable_yolo
-            else {}
-        ),
-    })
+        return j(handler, {"ok": True, "choice": choice, "stale_cleared": True})
+    return j(handler, {"ok": ok, "choice": choice})
 
 
 def _resolve_clarify_legacy(sid: str, clarify_id: str, response: str) -> bool:
@@ -27365,37 +26375,18 @@ def _handle_session_compress(handler, body):
             if not preserves_automatic_tail_lineage:
                 s.compression_anchor_mode = "manual"
             s.last_prompt_tokens = new_tokens
-            s.save()
-            # Retire every stale recovery copy only if this live revision still owns
-            # the SID; otherwise a concurrent writer's backup must survive.
-            live_revision = (
-                s._sidecar_revision_v1
-                if getattr(s, '_sidecar_revision_session_id_v1', None) == sid
-                else _read_sidecar_revision(s.path)
-            )
+            backup_receipt = s.save()
+            # Drop stale backups that would undo an intentional manual compress.
             try:
-                with _session_sidecar_authority(sid):
-                    retired = _delete_session_recovery_artifacts_locked(
-                        sid,
-                        expected_live_revision=live_revision,
-                    )
-                if not retired:
-                    return bad(
-                        handler,
-                        "Session changed while retiring compression artifacts; retry",
-                        409,
-                    )
-            except Exception as exc:
-                logger.exception(
-                    "Manual compression could not remove recovery artifacts for %s",
-                    sid,
+                from api.models import _read_sidecar_revision, _retire_backup_if_owned
+                _retire_backup_if_owned(
+                    s.session_id,
+                    s.path.with_suffix(".json.bak"),
+                    backup_receipt,
+                    _read_sidecar_revision(s.path, s.session_id),
                 )
-                return bad(
-                    handler,
-                    f"Compression recovery cleanup failed; retry is required: "
-                    f"{_sanitize_error(exc)}",
-                    500,
-                )
+            except OSError:
+                pass
 
         session_payload = redact_session_data(
             s.compact() | {
@@ -28168,7 +27159,7 @@ def _normalize_names_list(names) -> list[str]:
     if names is None:
         return []
     if isinstance(names, str):
-        names = _parse_config_string_list(names)
+        names = [names]
     elif not isinstance(names, list):
         names = list(names) if names else []
     return list(dict.fromkeys(str(d).strip() for d in names if str(d).strip()))

@@ -471,7 +471,7 @@ def test_save_writes_index_from_same_collapsed_snapshot(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("first_generation", ["one", "two"])
-def test_same_sid_saves_publish_one_complete_generation_in_both_orders(
+def test_same_sid_stale_alias_is_rejected_after_first_complete_generation(
     tmp_path, monkeypatch, first_generation
 ):
     from api import models
@@ -504,6 +504,7 @@ def test_same_sid_saves_publish_one_complete_generation_in_both_orders(
     second_started = threading.Event()
     real_write_index = models._write_session_index
     first_thread_id = {"value": None}
+    second_errors = []
 
     def gated_write_index(*args, **kwargs):
         if threading.get_ident() == first_thread_id["value"]:
@@ -519,7 +520,10 @@ def test_same_sid_saves_publish_one_complete_generation_in_both_orders(
 
     def save_second():
         second_started.set()
-        generations[second_generation].save(touch_updated_at=False)
+        try:
+            generations[second_generation].save(touch_updated_at=False)
+        except Exception as exc:
+            second_errors.append(exc)
 
     first = threading.Thread(target=save_first)
     second = threading.Thread(target=save_second)
@@ -532,11 +536,13 @@ def test_same_sid_saves_publish_one_complete_generation_in_both_orders(
     second.join(timeout=2)
     assert not first.is_alive()
     assert not second.is_alive()
+    assert len(second_errors) == 1
+    assert isinstance(second_errors[0], models.StaleSessionGenerationError)
 
     sidecar = json.loads((session_dir / "shared-save-authority.json").read_text(encoding="utf-8"))
     index = json.loads(index_file.read_text(encoding="utf-8"))
     row = next(entry for entry in index if entry["session_id"] == "shared-save-authority")
-    expected = generations[second_generation]
+    expected = generations[first_generation]
     assert sidecar["title"] == row["title"] == expected.title
     assert sidecar["model"] == row["model"] == expected.model
     assert sidecar["message_count"] == row["message_count"] == len(expected.messages)
@@ -551,9 +557,16 @@ def test_recovery_restores_the_collapsed_backup_payload(tmp_path):
     backup_path = tmp_path / "restored.json.bak"
     first = _incomplete_reasoning_only(1701, reasoning="first")
     unique = {"role": "user", "content": "must survive", "id": 1702}
-    session_path.write_text(json.dumps({"messages": [first]}), encoding="utf-8")
+    session_path.write_text(
+        json.dumps({"session_id": "restored", "messages": [first]}),
+        encoding="utf-8",
+    )
     backup_path.write_text(
-        json.dumps({"messages": [first, dict(first), unique], "message_count": 3}),
+        json.dumps({
+            "session_id": "restored",
+            "messages": [first, dict(first), unique],
+            "message_count": 3,
+        }),
         encoding="utf-8",
     )
 

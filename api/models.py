@@ -216,6 +216,8 @@ _INDEX_WRITE_LOCK = threading.RLock()
 _SESSION_SAVE_AUTHORITIES_LOCK = threading.Lock()
 _SESSION_SAVE_AUTHORITIES: "weakref.WeakValueDictionary[str, threading.RLock]" = weakref.WeakValueDictionary()
 _INLINE_REPLAY_REPAIR_MAX_BYTES = 128 * 1024 * 1024
+_SESSION_SAVE_AUTHORITIES_LOCK = threading.Lock()
+_SESSION_SAVE_AUTHORITIES: "weakref.WeakValueDictionary[str, threading.RLock]" = weakref.WeakValueDictionary()
 _WORKSPACE_BINDING_REVISION_RECEIPTS_LOCK = threading.Lock()
 _WORKSPACE_BINDING_REVISION_RECEIPTS: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
 _WORKSPACE_BINDING_REVISION_RECEIPTS_MAX = 2000
@@ -224,15 +226,14 @@ _SESSION_INDEX_REBUILD_THREAD = None
 _SESSION_INDEX_REBUILD_THREAD_TARGET: tuple[Path, Path] | None = None
 
 
-def _session_save_authority(authority_id: str) -> threading.RLock:
-    """Return one process-local reentrant mutation authority."""
+def _session_save_authority(session_id: str) -> threading.RLock:
+    """Return the process-wide reentrant save authority for one session ID."""
     with _SESSION_SAVE_AUTHORITIES_LOCK:
-        authority = _SESSION_SAVE_AUTHORITIES.get(authority_id)
+        authority = _SESSION_SAVE_AUTHORITIES.get(session_id)
         if authority is None:
             authority = threading.RLock()
-            _SESSION_SAVE_AUTHORITIES[authority_id] = authority
+            _SESSION_SAVE_AUTHORITIES[session_id] = authority
         return authority
-
 
 class StaleSessionGenerationError(RuntimeError):
     """A sidecar changed after this Session observed its generation."""
@@ -244,10 +245,17 @@ class SidecarRevision:
     state: str
     generation: int
     digest_sha256: str | None
+    epoch: str | None = None
 
     @classmethod
     def absent(cls, sid: str) -> "SidecarRevision":
-        return cls(sid=sid, state="ABSENT", generation=0, digest_sha256=None)
+        return cls(
+            sid=sid,
+            state="ABSENT",
+            generation=0,
+            digest_sha256=None,
+            epoch=None,
+        )
 
 
 def _sidecar_revision_record(revision: SidecarRevision) -> dict:
@@ -257,6 +265,7 @@ def _sidecar_revision_record(revision: SidecarRevision) -> dict:
         "state": revision.state,
         "generation": revision.generation,
         "digest_sha256": revision.digest_sha256,
+        "epoch": revision.epoch,
     }
 
 
@@ -268,10 +277,15 @@ def _coerce_sidecar_revision(value, sid: str) -> SidecarRevision | None:
     state = value.get("state")
     generation = value.get("generation")
     digest = value.get("digest_sha256")
+    epoch = value.get("epoch")
     if (
         not isinstance(state, str)
         or type(generation) is not int
         or (digest is not None and not isinstance(digest, str))
+        or (
+            epoch is not None
+            and (type(epoch) is not str or re.fullmatch(r"[0-9a-f]{32}", epoch) is None)
+        )
     ):
         return None
     return SidecarRevision(
@@ -279,56 +293,443 @@ def _coerce_sidecar_revision(value, sid: str) -> SidecarRevision | None:
         state=state,
         generation=generation,
         digest_sha256=digest,
+        epoch=epoch,
     )
 
 
-def _record_workspace_binding_revision_receipt(
-    session_id: str,
-    revision_before,
-    revision_after,
-    workspace: str,
+def _sidecar_revision_from_bytes(
+    sid: str,
+    raw: bytes,
     *,
-    session_dir: Path | None = None,
-) -> None:
-    """Remember one trusted metadata-only revision for same-process rebasing."""
-    if revision_before is None or revision_after is None:
+    parsed=None,
+) -> SidecarRevision:
+    if parsed is None:
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            parsed = None
+    raw_generation = (
+        parsed.get("_sidecar_generation_v1")
+        if isinstance(parsed, dict)
+        else None
+    )
+    generation = (
+        raw_generation
+        if type(raw_generation) is int and raw_generation >= 0
+        else 0
+    )
+    raw_epoch = parsed.get("_sidecar_epoch_v1") if isinstance(parsed, dict) else None
+    if (
+        raw_epoch is not None
+        and (type(raw_epoch) is not str or re.fullmatch(r"[0-9a-f]{32}", raw_epoch) is None)
+    ):
+        raise RuntimeError(f"Invalid sidecar epoch: {raw_epoch!r}")
+    return SidecarRevision(
+        sid=sid,
+        state="PRESENT",
+        generation=generation,
+        digest_sha256=hashlib.sha256(raw).hexdigest(),
+        epoch=raw_epoch,
+    )
+
+
+def _read_sidecar_revision(path: Path, sid: str | None = None) -> SidecarRevision:
+    resolved_sid = sid or path.stem
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return SidecarRevision.absent(resolved_sid)
+    return _sidecar_revision_from_bytes(resolved_sid, raw)
+
+
+def _read_sidecar_snapshot(path: Path, sid: str) -> tuple[SidecarRevision, dict]:
+    """Read one validated payload and its exact durable revision."""
+    raw = path.read_bytes()
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Session sidecar for {sid!r} is not an object")
+    if payload.get("session_id") != sid:
+        raise ValueError(f"Session sidecar for {sid!r} has a foreign embedded SID")
+    return _sidecar_revision_from_bytes(sid, raw, parsed=payload), payload
+
+
+def _fsync_sidecar_directory(directory: Path) -> None:
+    """Persist a sidecar directory entry where POSIX supports directory fsync.
+
+    Native Windows Python does not expose an equivalent directory handle here;
+    file contents remain flushed and publication remains atomic, but power-loss
+    durability of the directory entry is a POSIX-only guarantee.
+    """
+    if os.name == "nt":
         return
-    key = (
-        str(Path(session_dir or SESSION_DIR).resolve()),
-        session_id,
-        tuple(revision_after),
-    )
-    value = (tuple(revision_before), str(workspace))
-    with _WORKSPACE_BINDING_REVISION_RECEIPTS_LOCK:
-        _WORKSPACE_BINDING_REVISION_RECEIPTS[key] = value
-        _WORKSPACE_BINDING_REVISION_RECEIPTS.move_to_end(key)
-        while (
-            len(_WORKSPACE_BINDING_REVISION_RECEIPTS)
-            > _WORKSPACE_BINDING_REVISION_RECEIPTS_MAX
-        ):
-            _WORKSPACE_BINDING_REVISION_RECEIPTS.popitem(last=False)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(Path(directory), flags)
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                raise
+    finally:
+        os.close(fd)
 
 
-def _trusted_workspace_binding_rebase(
-    session_id: str,
-    expected_revision,
-    durable_revision,
+def _publish_sidecar_no_replace(source: Path, destination: Path) -> None:
+    """Publish *source* only when *destination* is still absent.
+
+    Hard links provide an atomic create-only primitive on POSIX. Native Windows
+    rename is also create-only. If neither primitive is available, fail closed:
+    opening the destination with ``O_EXCL`` before copying would expose a
+    partial sidecar to lock-free readers.
+    """
+    try:
+        os.link(str(source), str(destination))
+        _fsync_sidecar_directory(destination.parent)
+        return
+    except FileExistsError:
+        raise
+    except OSError:
+        if os.name != "nt":
+            raise
+        os.rename(source, destination)
+        _fsync_sidecar_directory(destination.parent)
+
+
+_BACKUP_SNAPSHOT_DOMINANCE_MAX_FIELDS = 512
+_BACKUP_SNAPSHOT_DOMINANCE_MAX_LIST_ROWS = 200_000
+_BACKUP_SNAPSHOT_DOMINANCE_MAX_CANONICAL_BYTES = 64 * 1024 * 1024
+_BACKUP_SNAPSHOT_DOMINANCE_MAX_DEPTH = 64
+_BACKUP_SNAPSHOT_DOMINANCE_MAX_ITEMS = 1_000_000
+
+
+class _SnapshotDominanceBudgetExceeded(ValueError):
+    """Canonical snapshot comparison exceeded its fail-closed work budget."""
+
+
+class _SnapshotDominanceBudget:
+    def __init__(self, max_canonical_bytes: int):
+        self.remaining_bytes = max_canonical_bytes
+        self.remaining_rows = _BACKUP_SNAPSHOT_DOMINANCE_MAX_LIST_ROWS
+        self.remaining_items = _BACKUP_SNAPSHOT_DOMINANCE_MAX_ITEMS
+        self._active_containers = set()
+
+    def consume_rows(self, count: int) -> None:
+        if count > self.remaining_rows:
+            raise _SnapshotDominanceBudgetExceeded
+        self.remaining_rows -= count
+
+    def _consume_items(self, count: int) -> None:
+        if count > self.remaining_items:
+            raise _SnapshotDominanceBudgetExceeded
+        self.remaining_items -= count
+
+    @staticmethod
+    def _add_size(total: int, amount: int, limit: int) -> int:
+        if amount > limit - total:
+            raise _SnapshotDominanceBudgetExceeded
+        return total + amount
+
+    def _measure_string(self, value: str, limit: int) -> int:
+        size = len(value) + 2  # one UTF-8 byte minimum per codepoint, plus quotes
+        if size > limit:
+            raise _SnapshotDominanceBudgetExceeded
+        if value.isascii():
+            for match in re.finditer(r'["\\\x00-\x1f]', value):
+                codepoint = ord(match.group())
+                size = self._add_size(
+                    size,
+                    1 if codepoint in {8, 9, 10, 12, 13, 34, 92} else 5,
+                    limit,
+                )
+            return size
+
+        size = 2
+        for char in value:
+            codepoint = ord(char)
+            if char in {'"', '\\'} or char in {'\b', '\f', '\n', '\r', '\t'}:
+                encoded_size = 2
+            elif codepoint < 0x20:
+                encoded_size = 6
+            elif codepoint < 0x80:
+                encoded_size = 1
+            elif codepoint < 0x800:
+                encoded_size = 2
+            elif 0xD800 <= codepoint <= 0xDFFF:
+                raise UnicodeError("surrogate is not valid UTF-8 JSON")
+            elif codepoint < 0x10000:
+                encoded_size = 3
+            else:
+                encoded_size = 4
+            size = self._add_size(size, encoded_size, limit)
+        return size
+
+    def _measure_json(self, value, *, depth: int, limit: int) -> int:
+        if depth > _BACKUP_SNAPSHOT_DOMINANCE_MAX_DEPTH:
+            raise _SnapshotDominanceBudgetExceeded
+
+        value_type = type(value)
+        if value_type is str:
+            return self._measure_string(value, limit)
+        if value is None:
+            if limit < 4:
+                raise _SnapshotDominanceBudgetExceeded
+            return 4
+        if value_type is bool:
+            size = 4 if value else 5
+            if size > limit:
+                raise _SnapshotDominanceBudgetExceeded
+            return size
+        if value_type is int:
+            bit_count = abs(value).bit_length()
+            digit_upper_bound = max(1, (bit_count * 30103 + 99_999) // 100_000)
+            size = digit_upper_bound + int(value < 0)
+            if size > limit:
+                raise _SnapshotDominanceBudgetExceeded
+            return size
+        if value_type is float:
+            # CPython's JSON float spellings are bounded by the longest finite
+            # repr (24 ASCII bytes); NaN and infinities are shorter.
+            if limit < 24:
+                raise _SnapshotDominanceBudgetExceeded
+            return 24
+        if value_type not in {list, dict}:
+            raise TypeError("snapshot value is not canonical JSON")
+
+        container_id = id(value)
+        if container_id in self._active_containers:
+            raise ValueError("circular snapshot value")
+        self._active_containers.add(container_id)
+        try:
+            self._consume_items(len(value))
+            size = 2  # [] or {}
+            if size > limit:
+                raise _SnapshotDominanceBudgetExceeded
+            if value_type is list:
+                for index, item in enumerate(value):
+                    if index:
+                        size = self._add_size(size, 1, limit)
+                    item_size = self._measure_json(
+                        item,
+                        depth=depth + 1,
+                        limit=limit - size,
+                    )
+                    size = self._add_size(size, item_size, limit)
+                return size
+
+            for index, (key, item) in enumerate(value.items()):
+                if type(key) is not str:
+                    raise TypeError("snapshot object key is not a string")
+                if index:
+                    size = self._add_size(size, 1, limit)
+                key_size = self._measure_string(key, limit - size)
+                size = self._add_size(size, key_size, limit)
+                size = self._add_size(size, 1, limit)  # colon
+                item_size = self._measure_json(
+                    item,
+                    depth=depth + 1,
+                    limit=limit - size,
+                )
+                size = self._add_size(size, item_size, limit)
+            return size
+        finally:
+            self._active_containers.remove(container_id)
+
+    def consume_json(self, value) -> str:
+        encoded_size = self._measure_json(
+            value,
+            depth=0,
+            limit=self.remaining_bytes,
+        )
+        self.remaining_bytes -= encoded_size
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+
+def _ordered_json_rows_cover(candidate, baseline, *, _budget=None) -> bool:
+    """Return whether baseline is an ordered canonical-row subsequence."""
+    if type(candidate) is not list or type(baseline) is not list:
+        return False
+    try:
+        budget = _budget or _SnapshotDominanceBudget(
+            _BACKUP_SNAPSHOT_DOMINANCE_MAX_CANONICAL_BYTES
+        )
+        budget.consume_rows(len(candidate) + len(baseline))
+        candidate_rows = iter(budget.consume_json(row) for row in candidate)
+        baseline_rows = (budget.consume_json(row) for row in baseline)
+        return all(
+            any(candidate_row == baseline_row for candidate_row in candidate_rows)
+            for baseline_row in baseline_rows
+        )
+    except (
+        MemoryError,
+        OverflowError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        return False
+
+
+_BACKUP_SNAPSHOT_BOOKKEEPING_FIELDS = frozenset({
+    "_sidecar_generation_v1",
+    "message_count",
+    "updated_at",
+})
+
+
+def _session_snapshot_covers(
+    candidate,
+    baseline,
     *,
-    session_dir: Path | None = None,
-):
-    """Return the trusted workspace for exactly one metadata-only revision."""
-    if expected_revision is None or durable_revision is None:
-        return None
-    key = (
-        str(Path(session_dir or SESSION_DIR).resolve()),
-        session_id,
-        tuple(durable_revision),
+    max_canonical_bytes=_BACKUP_SNAPSHOT_DOMINANCE_MAX_CANONICAL_BYTES,
+) -> bool:
+    """Return whether candidate covers the complete recoverable baseline.
+
+    Top-level lists use ordered canonical-row coverage; every other durable
+    field must remain canonically equal.  Storage generation, derived count,
+    and the superseded activity timestamp are bookkeeping rather than recovery
+    content.  Missing fields in legacy baselines are therefore compatible,
+    while an unknown baseline field can never be silently discarded.
+
+    Comparison work is capped.  Oversized, deeply nested, or non-canonical
+    payloads are incomparable and therefore take the archive/keep path.
+    """
+    if type(candidate) is not dict or type(baseline) is not dict:
+        return False
+    if (
+        type(max_canonical_bytes) is not int
+        or max_canonical_bytes <= 0
+        or len(candidate) > _BACKUP_SNAPSHOT_DOMINANCE_MAX_FIELDS
+        or len(baseline) > _BACKUP_SNAPSHOT_DOMINANCE_MAX_FIELDS
+    ):
+        return False
+    try:
+        if any(type(key) is not str for key in candidate) or any(
+            type(key) is not str for key in baseline
+        ):
+            return False
+        budget = _SnapshotDominanceBudget(max_canonical_bytes)
+        for key, baseline_value in baseline.items():
+            if key in _BACKUP_SNAPSHOT_BOOKKEEPING_FIELDS:
+                continue
+            if key not in candidate:
+                return False
+            candidate_value = candidate[key]
+            if isinstance(baseline_value, list):
+                if not _ordered_json_rows_cover(
+                    candidate_value,
+                    baseline_value,
+                    _budget=budget,
+                ):
+                    return False
+                continue
+            if budget.consume_json(candidate_value) != budget.consume_json(
+                baseline_value
+            ):
+                return False
+    except (
+        MemoryError,
+        OverflowError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        return False
+    return True
+
+
+def _archive_incomparable_backup(
+    session_id: str,
+    backup_path: Path,
+    backup_receipt: SidecarRevision,
+) -> Path:
+    """Preserve an incomparable primary backup before promoting a newer one."""
+    if (
+        not isinstance(backup_receipt, SidecarRevision)
+        or backup_receipt.state != "PRESENT"
+        or not backup_receipt.digest_sha256
+    ):
+        raise RuntimeError(
+            f"Cannot archive unverified recoverable backup for {session_id!r}"
+        )
+    archive_path = backup_path.with_name(
+        f"{backup_path.name}.archive-{backup_receipt.digest_sha256}"
     )
-    with _WORKSPACE_BINDING_REVISION_RECEIPTS_LOCK:
-        receipt = _WORKSPACE_BINDING_REVISION_RECEIPTS.get(key)
-    if receipt is None or receipt[0] != tuple(expected_revision):
-        return None
-    return receipt[1]
+    if not archive_path.exists():
+        archive_tmp = backup_path.parent / (
+            f".sidecar-archive-{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            digest = hashlib.sha256()
+            with open(backup_path, "rb") as source, open(archive_tmp, "xb") as target:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+                    target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            if digest.hexdigest() != backup_receipt.digest_sha256:
+                raise RuntimeError(
+                    f"Recoverable backup changed while archiving {session_id!r}"
+                )
+            _safe_replace(archive_tmp, archive_path)
+            _fsync_sidecar_directory(archive_path.parent)
+        finally:
+            archive_tmp.unlink(missing_ok=True)
+    archived_receipt = _read_sidecar_revision(archive_path, session_id)
+    if archived_receipt != backup_receipt:
+        raise RuntimeError(
+            f"Archived recoverable backup failed verification for {session_id!r}"
+        )
+    return archive_path
+
+
+def _retire_backup_if_owned(
+    session_id: str,
+    backup_path: Path,
+    backup_receipt,
+    live_receipt,
+) -> bool:
+    """Delete a backup only while both save receipts still own the generation."""
+    if not isinstance(backup_receipt, SidecarRevision):
+        return False
+    if not isinstance(live_receipt, SidecarRevision):
+        return False
+    with _session_sidecar_authority(
+        session_id,
+        session_dir=backup_path.parent,
+    ):
+        live_path = backup_path.with_suffix("")
+        if _read_sidecar_revision(live_path, session_id) != live_receipt:
+            return False
+        if _read_sidecar_revision(backup_path, session_id) != backup_receipt:
+            return False
+        backup_path.unlink(missing_ok=True)
+        for archive_path in backup_path.parent.glob(
+            f"{backup_path.name}.archive-*"
+        ):
+            archive_path.unlink(missing_ok=True)
+        return not backup_path.exists()
+
+
+def _invalidate_cached_session_generation(session_id: str) -> None:
+    """Evict and fence an alias after an out-of-band sidecar replacement."""
+    with LOCK:
+        cached = SESSIONS.pop(session_id, None)
+        if cached is not None:
+            cached._sidecar_revisions[session_id] = _sidecar_revision_record(
+                SidecarRevision(
+                    sid=session_id,
+                    state="INVALIDATED",
+                    generation=-1,
+                    digest_sha256=None,
+                )
+            )
 
 
 @contextmanager
@@ -336,26 +737,32 @@ def _cross_process_sidecar_file_authority(
     lock_id: str,
     *,
     session_dir: Path | None = None,
-    lock_domain: str = 'session',
+    lock_domain: str = "session",
 ):
-    """Serialize one sidecar-store mutation key across threads and processes."""
+    """Serialize one sidecar-store mutation key across threads/processes."""
     if not is_safe_session_id(lock_id):
         raise ValueError(f"Unsafe sidecar lock id {lock_id!r}")
-    directory = Path(session_dir or SESSION_DIR)
-    if lock_domain == 'session':
-        authority_id = f"session:{directory.resolve()}:{lock_id}"
-        lock_dir = directory / '.sidecar-locks'
-    elif lock_domain == 'deleted-session-tombstone':
-        # Keep the global tombstone namespace disjoint from valid session SIDs.
-        authority_id = f"deleted-tombstone:{directory.resolve()}:{lock_id}"
-        lock_dir = directory / '.sidecar-locks' / '.deleted-session-tombstone'
+    if lock_domain == "session":
+        thread_lock_id = lock_id
+        lock_dir = (session_dir or SESSION_DIR) / ".sidecar-locks"
+    elif lock_domain == "deleted-session-tombstone":
+        # Domain separation is mandatory: ``lock_id`` is also a valid session
+        # SID, so sharing the session lock path would self-deadlock when that
+        # SID saves while clearing the global tombstone set.
+        thread_lock_id = f"deleted-session-tombstone:{lock_id}"
+        lock_dir = (
+            (session_dir or SESSION_DIR)
+            / ".sidecar-locks"
+            / ".deleted-session-tombstone"
+        )
     else:
         raise ValueError(f"Unknown sidecar lock domain {lock_domain!r}")
-    with _session_save_authority(authority_id):
+    thread_authority = _session_save_authority(thread_lock_id)
+    with thread_authority:
         lock_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = lock_dir / f'{lock_id}.lock'
+        lock_path = lock_dir / f"{lock_id}.lock"
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        with os.fdopen(fd, 'r+b', buffering=0) as lock_file:
+        with os.fdopen(fd, "r+b", buffering=0) as lock_file:
             if _fcntl is not None:
                 _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
                 try:
@@ -365,7 +772,7 @@ def _cross_process_sidecar_file_authority(
                 return
             if _msvcrt is not None:  # pragma: no cover - Windows only.
                 if os.fstat(lock_file.fileno()).st_size == 0:
-                    lock_file.write(b'\0')
+                    lock_file.write(b"\0")
                 lock_file.seek(0)
                 _msvcrt.locking(  # type: ignore[attr-defined]
                     lock_file.fileno(), _msvcrt.LK_LOCK, 1  # type: ignore[attr-defined]
@@ -378,7 +785,7 @@ def _cross_process_sidecar_file_authority(
                         lock_file.fileno(), _msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined]
                     )
                 return
-            raise RuntimeError('cross-process sidecar locking is unavailable')
+            raise RuntimeError("cross-process sidecar locking is unavailable")
 
 
 @contextmanager
@@ -408,15 +815,20 @@ def _session_sidecar_authority(
 # WebUI sidebar polling path is single-process) but must wrap the WHOLE
 # load-modify-write/unlink sequence in both helpers.
 _WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_LOCK = threading.Lock()
-_WEBUI_DELETED_SESSION_TOMBSTONE_LOCK_SID = '_webui_deleted_sessions_global'
+_WEBUI_DELETED_SESSION_TOMBSTONE_LOCK_SID = "_webui_deleted_sessions_global"
 
 
 @contextmanager
 def _webui_deleted_session_tombstone_authority():
-    """Serialize the deleted-session tombstone RMW across processes."""
+    """Serialize the deleted-session tombstone RMW across processes.
+
+    Lock order is an optional per-session sidecar authority first, then this
+    global tombstone authority. No path may acquire a SID authority while this
+    global authority is held.
+    """
     with _cross_process_sidecar_file_authority(
         _WEBUI_DELETED_SESSION_TOMBSTONE_LOCK_SID,
-        lock_domain='deleted-session-tombstone',
+        lock_domain="deleted-session-tombstone",
     ):
         yield
 
@@ -442,6 +854,29 @@ def is_safe_session_id(sid) -> bool:
     if not sid or not isinstance(sid, str):
         return False
     return all(c in _SAFE_SID_CHARS for c in sid)
+
+
+def _offline_replay_artifact_paths(sidecar: Path):
+    """Yield replay-v10 artifacts owned by one safe session sidecar."""
+    sidecar = Path(sidecar)
+    if sidecar.suffix != '.json' or not is_safe_session_id(sidecar.stem):
+        raise ValueError(f'Unsafe session sidecar path: {sidecar}')
+    name = sidecar.name
+    patterns = (
+        f'{name}.replay-v10.*.bak',
+        f'_replay-v10.{name}.*.manifest.json',
+        f'.{name}.replay-v10.tmp.*',
+        f'.{name}.replay-v10.restore.*',
+        f'._replay-v10.{name}.*.manifest.json.tmp.*',
+    )
+    seen = set()
+    for pattern in patterns:
+        for candidate in sidecar.parent.glob(pattern):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.is_file() or candidate.is_symlink():
+                yield candidate
 
 
 def _delete_offline_replay_artifacts(sidecar: Path) -> int:
@@ -506,6 +941,59 @@ def _delete_session_recovery_artifacts_locked(
         cause = failures[0] if failures else None
         raise RuntimeError(
             f"Failed to delete required recovery artifacts for {sid!r}"
+        ) from cause
+    return True
+
+
+class SessionDeleteTombstoneError(RuntimeError):
+    """A sidecar delete could not durably fence stale writers."""
+
+
+def _delete_session_sidecar_artifacts_locked(
+    sid: str,
+    *,
+    session_dir: Path | None = None,
+    expected_revision=None,
+    record_tombstone: bool = True,
+) -> bool:
+    """Delete one SID's complete sidecar family while its authority is held."""
+    if not is_safe_session_id(sid):
+        raise ValueError(f"Unsafe session_id {sid!r}")
+    directory = Path(session_dir or SESSION_DIR)
+    sidecar = directory / f'{sid}.json'
+    if expected_revision is not None:
+        if _read_sidecar_revision(sidecar) != expected_revision:
+            return False
+    if record_tombstone:
+        try:
+            _record_webui_deleted_session_tombstone(sid)
+        except Exception as exc:
+            raise SessionDeleteTombstoneError(
+                f"Failed to durably tombstone deleted WebUI session {sid!r}"
+            ) from exc
+
+    _invalidate_cached_session_generation(sid)
+    failures = []
+    required = [sidecar, sidecar.with_suffix('.json.bak')]
+    required.extend(directory.glob(f'{sidecar.name}.bak.archive-*'))
+    for artifact in required:
+        try:
+            artifact.unlink(missing_ok=True)
+        except Exception as exc:
+            failures.append(exc)
+    try:
+        _delete_offline_replay_artifacts(sidecar)
+    except Exception as exc:
+        failures.append(exc)
+
+    remaining = any(path.exists() for path in required)
+    remaining = remaining or any(_offline_replay_artifact_paths(sidecar))
+    remaining = remaining or any(directory.glob(f'{sidecar.name}.bak.archive-*'))
+    _fsync_sidecar_directory(directory)
+    if failures or remaining:
+        cause = failures[0] if failures else None
+        raise RuntimeError(
+            f"Failed to delete required sidecar artifacts for {sid!r}"
         ) from cause
     return True
 
@@ -1151,19 +1639,32 @@ def _webui_deleted_session_is_tombstoned(
     )
 
 
-def _save_webui_deleted_session_tombstone(ids) -> None:
-    try:
-        ordered_ids = []
-        seen = set()
-        for value in ids or []:
-            sid = str(value or '').strip()
-            if sid and sid not in seen:
-                seen.add(sid)
-                ordered_ids.append(sid)
-    except TypeError as exc:
-        raise ValueError('deleted-session tombstone ids are not iterable') from exc
-    if len(ordered_ids) > WEBUI_DELETED_SESSION_TOMBSTONE_CAP:
-        ordered_ids = ordered_ids[-WEBUI_DELETED_SESSION_TOMBSTONE_CAP:]
+def _save_webui_deleted_session_tombstone(
+    ids,
+    *,
+    required_sid: str | None = None,
+) -> None:
+    sorted_ids = sorted(set(
+        str(sid).strip() for sid in (ids or []) if str(sid or "").strip()
+    ))
+    required_sid = str(required_sid or "").strip()
+    if required_sid and required_sid not in sorted_ids:
+        raise ValueError("required deleted-session tombstone SID is missing")
+    if len(sorted_ids) > WEBUI_DELETED_SESSION_TOMBSTONE_CAP:
+        if required_sid:
+            if WEBUI_DELETED_SESSION_TOMBSTONE_CAP < 1:
+                raise RuntimeError("deleted-session tombstone cannot retain required SID")
+            other_ids = [candidate for candidate in sorted_ids if candidate != required_sid]
+            retained_other_count = WEBUI_DELETED_SESSION_TOMBSTONE_CAP - 1
+            sorted_ids = (
+                other_ids[-retained_other_count:]
+                if retained_other_count
+                else []
+            )
+            sorted_ids.append(required_sid)
+            sorted_ids.sort()
+        else:
+            sorted_ids = sorted_ids[-WEBUI_DELETED_SESSION_TOMBSTONE_CAP:]
     payload = {
         "version": WEBUI_DELETED_SESSION_TOMBSTONE_VERSION,
         "ids": sorted_ids,
@@ -1197,17 +1698,16 @@ def _record_webui_deleted_session_tombstone(sid: str) -> None:
     if not sid:
         return
     with _webui_deleted_session_tombstone_authority():
-        # Keep this public load in the RMW path: tests and diagnostics can gate
-        # the exact read while the persisted order remains independently retained.
-        current = _load_webui_deleted_session_tombstone(strict=True)
+        current = set(_load_webui_deleted_session_tombstone(strict=True))
         if sid in current:
             _fsync_sidecar_directory(SESSION_DIR)
-            return
-        ordered = _load_webui_deleted_session_tombstone_ids(strict=True)
-        ordered.append(sid)
-        _save_webui_deleted_session_tombstone(ordered)
+        else:
+            current.add(sid)
+            _save_webui_deleted_session_tombstone(current, required_sid=sid)
         if sid not in _load_webui_deleted_session_tombstone(strict=True):
-            raise RuntimeError(f"Deleted-session tombstone dropped new SID {sid!r}")
+            raise RuntimeError(
+                f"Deleted-session tombstone did not retain current SID {sid!r}"
+            )
 
 
 def _clear_webui_deleted_session_tombstone(sid: str) -> None:
@@ -1215,7 +1715,7 @@ def _clear_webui_deleted_session_tombstone(sid: str) -> None:
     if not sid:
         return
     with _webui_deleted_session_tombstone_authority():
-        current = _load_webui_deleted_session_tombstone(strict=True)
+        current = set(_load_webui_deleted_session_tombstone(strict=True))
         if sid not in current:
             return
         ordered = [
@@ -1556,7 +2056,7 @@ def _message_role(message):
 
 _SESSION_METADATA_FIELDS = [
     'session_id', 'title', 'workspace', 'created_workspace', 'model',
-    'model_provider', 'model_explicit_pick_signature', 'created_at',
+    'model_provider', 'reasoning_effort', 'model_explicit_pick_signature', 'created_at',
     'updated_at', 'pinned', 'archived', 'project_id', 'profile',
     'input_tokens', 'output_tokens', 'estimated_cost', 'cache_read_tokens',
     'cache_write_tokens', 'personality', 'active_stream_id',
@@ -1570,9 +2070,8 @@ _SESSION_METADATA_FIELDS = [
     'post_compression_context_tokens_estimate', 'compression_recovery',
     'recommended_recovery_action', 'compression_recovery_source_session_id',
     'compression_recovery_action', 'truncation_watermark',
-    'truncation_boundary', 'clear_generation',
-    'intentional_shrink_generation', 'compaction_generation',
-    'gateway_routing',
+    'truncation_boundary', 'clear_generation', 'compaction_generation',
+    'intentional_shrink_generation', 'gateway_routing',
     'gateway_routing_history', 'llm_title_generated', 'manual_title',
     'parent_session_id', 'worktree_path', 'worktree_branch',
     'worktree_repo_root', 'worktree_created_at', 'is_cli_session',
@@ -1879,30 +2378,6 @@ def _validated_sidecar_epoch(value):
     return value
 
 
-def _sidecar_content_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open('rb') as handle:
-        for chunk in iter(lambda: handle.read(4 << 20), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _read_sidecar_revision(path: Path):
-    if not path.exists():
-        return None
-    try:
-        metadata = _read_bounded_session_metadata(path)
-        generation = metadata.get('_sidecar_generation_v1', 0)
-        if type(generation) is not int or generation < 0:
-            raise RuntimeError(f'Invalid sidecar generation: {generation!r}')
-        epoch = _validated_sidecar_epoch(metadata.get('_sidecar_epoch_v1'))
-        return (generation, epoch, _sidecar_content_digest(path))
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise RuntimeError(
-            f'Cannot verify sidecar revision for {path.name!r}'
-        ) from exc
-
-
 def _find_top_level_json_key(text, key):
     """Return the byte offset of a top-level JSON object key, if present."""
     depth = 0
@@ -2022,7 +2497,6 @@ def _load_session_from_path(path: Path) -> "Session | None":
     ):
         return None
     data, _, _ = _repair_session_message_projections(data)
-    data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
     return Session(**data)
 
 
@@ -2126,8 +2600,8 @@ class Session:
                  truncation_watermark=None,
                  truncation_boundary=None,
                  clear_generation=None,
-                 intentional_shrink_generation=None,
                  compaction_generation=None,
+                 intentional_shrink_generation=None,
                  gateway_routing=None, gateway_routing_history=None,
                  llm_title_generated: bool=False,
                  manual_title: bool=False,
@@ -2226,10 +2700,10 @@ class Session:
         self.truncation_watermark = truncation_watermark
         self.truncation_boundary = truncation_boundary
         self.clear_generation = clear_generation
-        self.intentional_shrink_generation = intentional_shrink_generation
         self.compaction_generation = (
             str(compaction_generation).strip() if compaction_generation else None
         )
+        self.intentional_shrink_generation = intentional_shrink_generation
         self.gateway_routing = gateway_routing if isinstance(gateway_routing, dict) else None
         self.gateway_routing_history = gateway_routing_history if isinstance(gateway_routing_history, list) else []
         self.llm_title_generated = bool(llm_title_generated)
@@ -2287,16 +2761,14 @@ class Session:
             if raw_sidecar_epoch is not None
             else uuid.uuid4().hex
         )
-        self._sidecar_revision_v1 = None
-        self._sidecar_revision_session_id_v1 = None
 
     @property
     def path(self):
         return SESSION_DIR / f'{self.session_id}.json'
 
-    def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
+    def save(self, touch_updated_at: bool = True, skip_index: bool = False):
         with _session_sidecar_authority(self.session_id):
-            return self._save_with_sidecar_authority(
+            return self._save_owned_generation(
                 touch_updated_at=touch_updated_at,
                 skip_index=skip_index,
             )
@@ -2317,17 +2789,17 @@ class Session:
             self._sidecar_revisions[self.session_id] = _sidecar_revision_record(
                 expected_revision
             )
-            self._save_with_sidecar_authority(
+            self._save_owned_generation(
                 touch_updated_at=touch_updated_at,
                 skip_index=skip_index,
             )
             return True
 
-    def _save_with_sidecar_authority(
+    def _save_owned_generation(
         self,
         touch_updated_at: bool = True,
         skip_index: bool = False,
-    ) -> None:
+    ):
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
         # Reject intrinsically unsafe partial objects before checking ownership.
@@ -2339,6 +2811,10 @@ class Session:
                 f"would atomically overwrite on-disk messages with []. "
                 f"Reload with metadata_only=False before mutating state. "
                 f"See #1558."
+            )
+        if getattr(self, '_replay_repair_deferred', False):
+            raise RuntimeError(
+                f"Session {self.session_id!r} requires offline replay repair before saving"
             )
         expected_record = self._sidecar_revisions.get(self.session_id)
         expected_revision = (
@@ -2367,78 +2843,29 @@ class Session:
                 f"Stale session generation for {self.session_id!r}; reload before saving"
             )
         next_sidecar_generation = current_revision.generation + 1
-        # ── #1558 P0 guard ──────────────────────────────────────────────
-        if getattr(self, '_replay_repair_deferred', False):
-            raise RuntimeError(
-                f"Session {self.session_id!r} requires offline replay repair before saving"
-            )
-        if (
-            not self.messages
-            and (self.active_stream_id or self.pending_user_message)
-            and self.path.exists()
+        output_epoch = self._sidecar_epoch_v1
+        if expected_record is None and current_revision.state == "ABSENT" and any(
+            str(known_sid) != str(self.session_id)
+            for known_sid in (self._sidecar_revisions or {})
         ):
-            try:
-                durable_payload = json.loads(self.path.read_text(encoding='utf-8'))
-            except (OSError, json.JSONDecodeError, ValueError):
-                durable_payload = None
-            if isinstance(durable_payload, dict) and durable_payload.get('messages'):
-                logger.warning(
-                    "refusing to overwrite session %s messages with empty active/pending snapshot",
-                    self.session_id,
-                )
-                return
-        durable_revision = _read_sidecar_revision(self.path)
-        expected_revision = getattr(self, '_sidecar_revision_v1', None)
-        expected_revision_sid = getattr(
-            self,
-            '_sidecar_revision_session_id_v1',
-            None,
-        )
-        if (
-            expected_revision_sid == self.session_id
-            and durable_revision != expected_revision
-        ):
-            rebased_workspace = _trusted_workspace_binding_rebase(
-                self.session_id,
-                expected_revision,
-                durable_revision,
-                session_dir=self.path.parent,
-            )
-            if rebased_workspace is None:
-                raise RuntimeError(
-                    f'stale sidecar revision for session {self.session_id!r}; '
-                    'reload before saving'
-                )
-            # A same-process workspace recovery patched metadata only while this
-            # canonical save waited for sidecar authority. Preserve that trusted
-            # binding, then publish this session's transcript as the next CAS
-            # generation instead of discarding it as a generic stale writer.
-            self.workspace = rebased_workspace
-            expected_revision = durable_revision
-        if (
-            durable_revision is not None
-            and _webui_deleted_session_is_tombstoned(
-                self.session_id,
-                strict=True,
-            )
-        ):
-            raise RuntimeError(
-                f'deleted sidecar generation for session {self.session_id!r}; '
-                'explicit recreation is required'
-            )
-        if expected_revision_sid != self.session_id:
-            durable_epoch = durable_revision[1] if durable_revision else None
-            if durable_epoch is not None:
-                self._sidecar_epoch_v1 = durable_epoch
-            elif expected_revision_sid is not None:
-                self._sidecar_epoch_v1 = uuid.uuid4().hex
-        persisted_generation = durable_revision[0] if durable_revision else 0
-        output_generation = persisted_generation + 1
+            # This object still carries revision state for another session id
+            # (e.g. a renamed continuation): the epoch belongs to that other
+            # SID lineage and must not leak into the new sidecar, otherwise the
+            # ABA fence could confuse the two lineages.
+            output_epoch = uuid.uuid4().hex
+            self._sidecar_epoch_v1 = output_epoch
+        _validated_sidecar_epoch(output_epoch)
         source_mode = (
             stat_module.S_IMODE(self.path.stat().st_mode)
             if self.path.exists()
             else 0o600
         )
+        # Persist a collapsed snapshot without rebinding or mutating the live
+        # list. Active workers can hold an alias to ``self.messages``; replacing
+        # it here would detach an append that lands while save() prepares the
+        # payload. Own the complete snapshot before duplicate selection so a
+        # nested mutation cannot invalidate the equality decision (#6600).
+
         if touch_updated_at:
             self.updated_at = time.time()
         # Freeze every persisted/indexed field, not only messages.  The sidecar
@@ -2463,27 +2890,53 @@ class Session:
         # Write metadata fields first so load_metadata_only() can read them
         # without parsing the full messages array (which may be 400KB+).
         # Fields are listed in the order they should appear in the JSON file.
-        meta = {k: getattr(self, k, None) for k in _SESSION_METADATA_FIELDS}
+        METADATA_FIELDS = [
+            'session_id', 'title', 'workspace', 'created_workspace', 'model', 'model_provider', 'reasoning_effort', 'model_explicit_pick_signature', 'created_at', 'updated_at',
+            'pinned', 'archived', 'project_id', 'profile',
+            'input_tokens', 'output_tokens', 'estimated_cost',
+            'cache_read_tokens', 'cache_write_tokens',
+            'personality', 'active_stream_id',
+            'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_user_source',
+            'compression_anchor_visible_idx', 'compression_anchor_message_key',
+            'compression_anchor_summary', 'pre_compression_snapshot',
+            'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
+            'compression_anchor_details', 'context_engine_state',
+            'context_length', 'threshold_tokens', 'last_prompt_tokens',
+            'post_compression_context_tokens_estimate',
+            'compression_recovery', 'recommended_recovery_action',
+            'compression_recovery_source_session_id', 'compression_recovery_action',
+            'truncation_watermark',
+            'truncation_boundary',
+            'clear_generation', 'compaction_generation', 'intentional_shrink_generation',
+            'gateway_routing', 'gateway_routing_history', 'llm_title_generated', 'manual_title',
+            'parent_session_id',
+            'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
+            'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
+            'enabled_toolsets', 'composer_draft',
+            'process_wakeup_pause',
+            'share_token', 'share_created_at',
+        ]
+        meta = {k: getattr(generation, k, None) for k in METADATA_FIELDS}
+        meta['_sidecar_generation_v1'] = next_sidecar_generation
         # #5854: message_count and a compact anchor-scene fingerprint go in the
         # metadata prefix (BEFORE messages) so load_metadata_only() and the
         # sidebar-poll freshness check never have to parse the full (250-480KB)
         # scene bodies. message_count is placed BEFORE anchor_scene_index so a
         # legacy-format reader that stops at a scene key still finds the count.
         # The full anchor_activity_scenes bodies serialize AFTER messages.
-        meta['message_count'] = len(self.messages or [])
-        meta['anchor_scene_index'] = _anchor_scene_index_from_records(self.anchor_activity_scenes)
-        meta['_sidecar_epoch_v1'] = self._sidecar_epoch_v1
-        meta['_sidecar_generation_v1'] = output_generation
+        meta['message_count'] = len(messages_to_persist or [])
+        meta['anchor_scene_index'] = _anchor_scene_index_from_records(generation.anchor_activity_scenes)
+        meta['_sidecar_epoch_v1'] = output_epoch
         # Keep the in-memory fingerprint aligned with what we just persisted, so a
         # later metadata-only reload of THIS object (or any fingerprint reader)
         # sees the current value rather than a stale load-time snapshot (#5854
         # defense-in-depth; the cached-side freshness check reads real records,
         # not this, so this is belt-and-suspenders).
         self._anchor_scene_index = dict(meta['anchor_scene_index'])
-        meta['messages'] = self.messages
-        meta['tool_calls'] = self.tool_calls
-        meta['anchor_activity_scenes'] = self.anchor_activity_scenes if isinstance(self.anchor_activity_scenes, dict) else {}
-        # Fields not in _SESSION_METADATA_FIELDS (e.g. last_usage) go at the end. Exclude
+        meta['messages'] = messages_to_persist
+        meta['tool_calls'] = generation.tool_calls
+        meta['anchor_activity_scenes'] = generation.anchor_activity_scenes if isinstance(generation.anchor_activity_scenes, dict) else {}
+        # Fields not in METADATA_FIELDS (e.g. last_usage) go at the end. Exclude
         # the keys we placed explicitly above so they aren't emitted twice.
         _placed = {
             'message_count',
@@ -2494,8 +2947,8 @@ class Session:
             'tool_calls',
             'anchor_activity_scenes',
         }
-        extra = {k: v for k, v in self.__dict__.items()
-                 if k not in _SESSION_METADATA_FIELDS and k not in _placed
+        extra = {k: v for k, v in generation.__dict__.items()
+                 if k not in METADATA_FIELDS and k not in _placed
                  and not k.startswith('_')}
         payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
 
@@ -2519,8 +2972,8 @@ class Session:
                     existing = json.loads(existing_text)
                     existing_msg_count = len(existing.get('messages') or [])
                 except (json.JSONDecodeError, ValueError):
-                    existing_msg_count = -1
-                incoming_msg_count = len(self.messages or [])
+                    existing_msg_count = -1  # corrupt → always back up
+                incoming_msg_count = len(messages_to_persist or [])
                 if (
                     existing_msg_count > 0
                     and incoming_msg_count == 0
@@ -2537,23 +2990,13 @@ class Session:
                     return None
                 if existing_msg_count > incoming_msg_count:
                     bak_path = self.path.with_suffix('.json.bak')
-                    try:
-                        bak_tmp = bak_path.with_suffix(
-                            f'.bak.tmp.{os.getpid()}.{threading.current_thread().ident}'
+                    replace_backup = not bak_path.exists()
+                    if bak_path.exists():
+                        current_backup_receipt = _read_sidecar_revision(
+                            bak_path,
+                            self.session_id,
                         )
-                        with open(bak_tmp, 'w', encoding='utf-8') as bf:
-                            _set_file_descriptor_mode(bf.fileno(), source_mode)
-                            bf.write(existing_text)
-                            bf.flush()
-                            os.fsync(bf.fileno())
-                        _safe_replace(bak_tmp, bak_path)
-                        _fsync_sidecar_directory(bak_path.parent)
-                    except OSError:
-                        # Backup is best-effort; main save proceeds regardless.
-                        try:
-                            bak_tmp.unlink(missing_ok=True)
-                        except Exception:
-                            pass
+
                         try:
                             backup = json.loads(bak_path.read_text(encoding='utf-8'))
                             if not isinstance(backup, dict):
@@ -2604,6 +3047,7 @@ class Session:
                                 f'.bak.tmp.{os.getpid()}.{threading.current_thread().ident}'
                             )
                             with open(bak_tmp, 'w', encoding='utf-8') as bf:
+                                _set_file_descriptor_mode(bf.fileno(), source_mode)
                                 bf.write(existing_text)
                                 bf.flush()
                                 os.fsync(bf.fileno())
@@ -2629,26 +3073,45 @@ class Session:
 
         tmp = self.path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
         try:
-            with open(tmp, 'w', encoding='utf-8') as f:
+            with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
                 _set_file_descriptor_mode(f.fileno(), source_mode)
                 f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
-            _safe_replace(tmp, self.path)
-            _fsync_sidecar_directory(self.path.parent)
+            if expected_revision.state == "ABSENT":
+                try:
+                    _publish_sidecar_no_replace(tmp, self.path)
+                except FileExistsError as exc:
+                    raise StaleSessionGenerationError(
+                        f"Stale session generation for {self.session_id!r}; "
+                        "sidecar appeared during first save"
+                    ) from exc
+                tmp.unlink(missing_ok=True)
+            else:
+                _safe_replace(tmp, self.path)
+                _fsync_sidecar_directory(self.path.parent)
+            published_revision = _read_sidecar_revision(
+                self.path,
+                self.session_id,
+            )
+            if (
+                published_revision.generation != next_sidecar_generation
+                or published_revision.epoch != output_epoch
+            ):
+                raise RuntimeError(
+                    f"Published sidecar revision mismatch for {self.session_id!r}"
+                )
+            self._sidecar_revisions[self.session_id] = _sidecar_revision_record(
+                published_revision
+            )
         except Exception:
             try:
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
             raise
-        self._sidecar_generation_v1 = output_generation
-        self._sidecar_revision_v1 = (
-            output_generation,
-            self._sidecar_epoch_v1,
-            _sidecar_content_digest(self.path),
-        )
-        self._sidecar_revision_session_id_v1 = self.session_id
+        self._sidecar_generation_v1 = next_sidecar_generation
+        self._sidecar_epoch_v1 = output_epoch
         if not skip_index:
             # #6600: project the sidebar index from the SAME detached snapshot
             # just serialized — never from the live list — so _index.json can
@@ -2700,14 +3163,24 @@ class Session:
                 raw,
                 parsed=data,
             )
-            data['messages'], collapsed_partials = _collapse_adjacent_duplicate_partials(
-                data.get('messages')
-            )
+            inline_repair = len(raw) <= _INLINE_REPLAY_REPAIR_MAX_BYTES
+            if inline_repair:
+                data, messages_changed, context_changed = _repair_session_message_projections(data)
+            else:
+                messages_changed = False
+                context_changed = False
             session = cls(**data)
+            session._replay_repair_deferred = bool(
+                not inline_repair
+                and (
+                    _has_adjacent_duplicate_partials(data.get('messages'))
+                    or _has_adjacent_duplicate_partials(data.get('context_messages'))
+                )
+            )
             session._sidecar_revisions[sid] = _sidecar_revision_record(
                 pre_read_revision
             )
-            if collapsed_partials:
+            if messages_changed or context_changed:
                 try:
                     repaired = session._save_if_sidecar_unchanged(
                         pre_read_revision,
@@ -2716,7 +3189,7 @@ class Session:
                     )
                 except Exception:
                     logger.debug(
-                        "Failed to persist collapsed duplicate partials for %s",
+                        "Failed to persist collapsed duplicate assistant rows for %s",
                         sid,
                         exc_info=True,
                     )
@@ -2737,58 +3210,8 @@ class Session:
             session._sidecar_revisions[sid] = _sidecar_revision_record(
                 post_read_revision
             )
-        inline_repair = p.stat().st_size <= _INLINE_REPLAY_REPAIR_MAX_BYTES
-        # #5854: snapshot the stat signature BEFORE reading so a legacy-facts
-        # cache write is only committed if the file didn't change under us
-        # during the parse (TOCTOU guard against an atomic replace mid-read).
-        _pre_read_sig = _sidecar_stat_signature(p)
-        source_bytes = p.read_bytes()
-        data = json.loads(source_bytes.decode('utf-8'))
-        if inline_repair:
-            data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(
-                data.get('messages')
-            )
-        else:
-            _collapsed_partials = False
-        session = cls(**data)
-        loaded_generation = data.get('_sidecar_generation_v1', 0)
-        if type(loaded_generation) is not int or loaded_generation < 0:
-            raise RuntimeError(
-                f'Invalid sidecar generation for {p.name!r}: {loaded_generation!r}'
-            )
-        loaded_epoch = _validated_sidecar_epoch(data.get('_sidecar_epoch_v1'))
-        session._sidecar_revision_v1 = (
-            loaded_generation,
-            loaded_epoch,
-            hashlib.sha256(source_bytes).hexdigest(),
-        )
-        session._sidecar_revision_session_id_v1 = session.session_id
-        session._replay_repair_deferred = bool(
-            not inline_repair
-            and (
-                _has_adjacent_duplicate_partials(data.get('messages'))
-                or _has_adjacent_duplicate_partials(data.get('context_messages'))
-            )
-        )
-        if _collapsed_partials:
-            try:
-                # Self-heal bloated sessions on first full load without touching
-                # recency/index ordering; save() creates a .bak because this
-                # intentionally shrinks the transcript (#2592).
-                session.save(touch_updated_at=False, skip_index=True)
-            except Exception:
-                logger.debug("Failed to persist collapsed duplicate partials for %s", sid, exc_info=True)
-        else:
-            # #5854: for a LEGACY sidecar (no modern anchor_scene_index key), the
-            # cheap metadata-prefix read cannot recover message_count/scenes when
-            # scenes serialize before them, so cache the authoritative facts we
-            # just parsed. This keeps the metadata-only path and the eviction
-            # check from full-parsing this unchanged file again on every poll.
-            # Keyed by stat signature, so any edit invalidates it; the next
-            # save() rewrites the modern layout and the fallback stops firing.
-            # expected_sig guards against an atomic replace during the read.
-            # (When _collapsed_partials fired, save() above already rewrote the
-            # modern layout, so no legacy caching is needed.)
+            # For a legacy sidecar, cache authoritative metadata facts only
+            # after the exact sidecar revision has been verified stable.
             if 'anchor_scene_index' not in data:
                 try:
                     _legacy_sidecar_facts_put(
@@ -5597,17 +6020,7 @@ def _sync_sidecar_from_state_db_if_newer(session) -> bool | Session:
         # Only an alias that owned the exact pre-save revision may inherit the
         # post-save authority. Otherwise return the freshly-saved owner so the
         # caller replaces the stale alias instead of blessing unsaved fields.
-        # Transfer the exact CAS observation made by the locked writer as well
-        # as its public fields: otherwise the caller would carry the new
-        # transcript with the old byte revision and its next legitimate save
-        # would be rejected as stale.
         if alias_owned_pre_save_revision:
-            session._sidecar_generation_v1 = locked._sidecar_generation_v1
-            session._sidecar_epoch_v1 = locked._sidecar_epoch_v1
-            session._sidecar_revision_v1 = locked._sidecar_revision_v1
-            session._sidecar_revision_session_id_v1 = (
-                locked._sidecar_revision_session_id_v1
-            )
             session.messages = merged_messages
             session.context_messages = merged_context
             session.active_stream_id = None
@@ -6429,46 +6842,7 @@ def get_session_for_scan(sid):
         return None
 
 
-class _FullSessionResolveRequired(RuntimeError):
-    """Internal signal that a full sidecar load must enter the bounded path."""
-
-
-_FULL_SESSION_RESOLVE_MAX_CONCURRENT = 2
-_FULL_SESSION_RESOLVE_SLOTS = threading.BoundedSemaphore(
-    _FULL_SESSION_RESOLVE_MAX_CONCURRENT
-)
-_FULL_SESSION_RESOLVE_INFLIGHT: dict[str, threading.Event] = {}
-_FULL_SESSION_RESOLVE_INFLIGHT_LOCK = threading.Lock()
-_FULL_SESSION_RESOLVE_LOCAL = threading.local()
-
-
-def _claim_full_session_resolve(session_id: str) -> tuple[bool, threading.Event]:
-    """Return whether this caller owns the single-flight for ``session_id``."""
-    with _FULL_SESSION_RESOLVE_INFLIGHT_LOCK:
-        event = _FULL_SESSION_RESOLVE_INFLIGHT.get(session_id)
-        if event is not None:
-            return False, event
-        event = threading.Event()
-        _FULL_SESSION_RESOLVE_INFLIGHT[session_id] = event
-        return True, event
-
-
-def _finish_full_session_resolve(session_id: str, event: threading.Event) -> None:
-    """Release one single-flight owner and wake every waiter."""
-    with _FULL_SESSION_RESOLVE_INFLIGHT_LOCK:
-        if _FULL_SESSION_RESOLVE_INFLIGHT.get(session_id) is event:
-            _FULL_SESSION_RESOLVE_INFLIGHT.pop(session_id, None)
-    event.set()
-
-
-def _resolve_session_once(
-    sid,
-    metadata_only=False,
-    *,
-    promote_cache=True,
-    cache_on_miss=True,
-    allow_full_load=False,
-):
+def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_miss=True):
     """Resolve a session through the canonical freshness/recovery path.
 
     ``get_session_for_scan`` shares this resolver with normal reads so that
@@ -6499,8 +6873,6 @@ def _resolve_session_once(
             cached = None
     if cached is not None:
         if not metadata_only and _cached_session_lags_disk(cached):
-            if not allow_full_load:
-                raise _FullSessionResolveRequired
             try:
                 disk_session = Session.load(sid)
                 with LOCK:
@@ -6513,8 +6885,6 @@ def _resolve_session_once(
                     "cached session disk-freshness check failed for session %s", sid, exc_info=True,
                 )
         if not metadata_only and _inactive_cache_tail_needs_disk_check(cached):
-            if not allow_full_load:
-                raise _FullSessionResolveRequired
             try:
                 disk_session = Session.load(sid)
                 if _cache_has_stale_unsaved_user_tail(cached, disk_session):
@@ -6555,8 +6925,6 @@ def _resolve_session_once(
         if s:
             return s
     else:
-        if not allow_full_load:
-            raise _FullSessionResolveRequired
         s = Session.load(sid)
     if s:
         if cache_on_miss:
@@ -6605,72 +6973,6 @@ def _resolve_session_once(
                 pass  # repair is best-effort
         return s
     raise KeyError(sid)
-
-
-def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_miss=True):
-    """Resolve a session while single-flighting heavyweight full sidecar loads.
-
-    Metadata-only reads and full sessions that remain current in the cache take
-    the lock-free path. A cache miss or stale cache entry elects one leader per
-    session; waiters retry the canonical resolver after that leader publishes its
-    result. Leaders for different sessions share a small global slot budget so
-    concurrent JSON parses cannot multiply a large sidecar's transient memory.
-    """
-    if metadata_only:
-        return _resolve_session_once(
-            sid,
-            metadata_only=True,
-            promote_cache=promote_cache,
-            cache_on_miss=cache_on_miss,
-        )
-
-    session_id = str(sid)
-    while True:
-        try:
-            return _resolve_session_once(
-                sid,
-                metadata_only=False,
-                promote_cache=promote_cache,
-                cache_on_miss=cache_on_miss,
-            )
-        except _FullSessionResolveRequired:
-            pass
-
-        active: set[str] = set(
-            getattr(_FULL_SESSION_RESOLVE_LOCAL, "active", ()) or ()
-        )
-        if active:
-            # Nested resolution already owns one global slot. Re-enter directly
-            # instead of waiting on this thread's own flight or consuming a
-            # second slot; the canonical resolver still owns all cache checks.
-            return _resolve_session_once(
-                sid,
-                metadata_only=False,
-                promote_cache=promote_cache,
-                cache_on_miss=cache_on_miss,
-                allow_full_load=True,
-            )
-
-        leader, event = _claim_full_session_resolve(session_id)
-        if not leader:
-            event.wait()
-            continue
-
-        active.add(session_id)
-        _FULL_SESSION_RESOLVE_LOCAL.active = active
-        try:
-            with _FULL_SESSION_RESOLVE_SLOTS:
-                return _resolve_session_once(
-                    sid,
-                    metadata_only=False,
-                    promote_cache=promote_cache,
-                    cache_on_miss=cache_on_miss,
-                    allow_full_load=True,
-                )
-        finally:
-            active.discard(session_id)
-            _FULL_SESSION_RESOLVE_LOCAL.active = active
-            _finish_full_session_resolve(session_id, event)
 
 
 def get_session(sid, metadata_only=False):
@@ -7410,75 +7712,52 @@ def persist_recovered_workspace_binding(
     )
     expected = str(expected_value or "")
     path = SESSION_DIR / f"{sid}.json"
-    with _get_session_agent_lock(sid):
+    lock = _get_session_agent_lock(sid)
+    with lock:
         with _session_sidecar_authority(sid):
-            revision_before = _read_sidecar_revision(path)
-            if revision_before is None:
+            revision = _read_sidecar_revision(path, sid)
+            if revision.state != "PRESENT":
                 raise WorkspaceBindingPersistenceError(
                     "Failed to persist recovered workspace: session sidecar is missing"
                 )
-            if _webui_deleted_session_is_tombstoned(sid, strict=True):
-                raise WorkspaceBindingPersistenceError(
-                    "Failed to persist recovered workspace: session was deleted"
-                )
+            revision_before = revision
+
             try:
-                raw = path.read_bytes()
-                payload = json.loads(raw)
+                payload = json.loads(path.read_text(encoding="utf-8"))
             except Exception as exc:
                 raise WorkspaceBindingPersistenceError(
                     "Failed to persist recovered workspace: unreadable session sidecar"
                 ) from exc
-            if not isinstance(payload, dict) or payload.get('session_id') != sid:
+            if not isinstance(payload, dict):
                 raise WorkspaceBindingPersistenceError(
                     "Failed to persist recovered workspace: invalid session sidecar"
                 )
-            if hashlib.sha256(raw).hexdigest() != revision_before[2]:
-                raise WorkspaceBindingPersistenceError(
-                    "Failed to persist recovered workspace: session changed"
-                )
             current = str(payload.get("workspace") or "")
-            revision_after = revision_before
             if current != resolved:
                 if current != expected:
                     raise WorkspaceBindingPersistenceError(
                         "Failed to persist recovered workspace: session workspace changed"
                     )
                 payload["workspace"] = resolved
-                payload['_sidecar_generation_v1'] = revision_before[0] + 1
-                payload['_sidecar_epoch_v1'] = revision_before[1] or uuid.uuid4().hex
-                serialized = json.dumps(payload, ensure_ascii=False, indent=2).encode(
-                    'utf-8'
-                )
+                payload["_sidecar_generation_v1"] = revision.generation + 1
+                serialized = json.dumps(payload, ensure_ascii=False, indent=2)
                 tmp = path.with_suffix(
                     f".tmp.{os.getpid()}.{threading.current_thread().ident}"
                 )
                 try:
-                    with open(tmp, "xb") as handle:
-                        _set_file_descriptor_mode(handle.fileno(), 0o600)
+                    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
                         handle.write(serialized)
                         handle.flush()
                         os.fsync(handle.fileno())
-                    if _read_sidecar_revision(path) != revision_before:
-                        raise RuntimeError(
+                    if _read_sidecar_revision(path, sid) != revision:
+                        raise StaleSessionGenerationError(
                             f"Session {sid!r} changed during workspace recovery"
                         )
-                    if _webui_deleted_session_is_tombstoned(sid, strict=True):
-                        raise RuntimeError(
-                            f"Session {sid!r} was deleted during workspace recovery"
-                        )
                     _safe_replace(tmp, path)
-                    _fsync_sidecar_directory(path.parent)
-                    revision_after = _read_sidecar_revision(path)
-                    if revision_after is None or revision_after[0] <= revision_before[0]:
-                        raise RuntimeError(
-                            f"Session {sid!r} generation did not advance"
-                        )
-                    _record_workspace_binding_revision_receipt(
+                    revision = _sidecar_revision_from_bytes(
                         sid,
-                        revision_before,
-                        revision_after,
-                        resolved,
-                        session_dir=path.parent,
+                        serialized.encode("utf-8"),
+                        parsed=payload,
                     )
                 except Exception as exc:
                     try:
@@ -7489,35 +7768,49 @@ def persist_recovered_workspace_binding(
                         "Failed to persist recovered workspace"
                     ) from exc
 
-        def owns_revision(candidate) -> bool:
-            return bool(
-                candidate is not None
-                and getattr(candidate, '_sidecar_revision_session_id_v1', None) == sid
-                and getattr(candidate, '_sidecar_revision_v1', None) == revision_before
-            )
-
-        session_owned = owns_revision(session)
-        metadata_view = not hasattr(session, '_sidecar_revision_v1')
-        if session_owned or metadata_view:
+        session_expected = _coerce_sidecar_revision(
+            getattr(session, "_sidecar_revisions", {}).get(sid),
+            sid,
+        )
+        session_owned = session_expected == revision_before
+        if session_owned:
             session.workspace = resolved
-            if session_owned:
-                session._sidecar_revision_v1 = revision_after
+            session._sidecar_revisions[sid] = _sidecar_revision_record(revision)
+        elif hasattr(session, "_sidecar_revisions"):
+            session._sidecar_revisions[sid] = _sidecar_revision_record(
+                SidecarRevision(
+                    sid=sid,
+                    state="INVALIDATED",
+                    generation=-1,
+                    digest_sha256=None,
+                )
+            )
         cached_owned = False
         with LOCK:
             cached = SESSIONS.get(sid)
-            cached_owned = owns_revision(cached)
-            if cached_owned and cached is not None:
-                cached.workspace = resolved
-                cached._sidecar_revision_v1 = revision_after
-            elif cached is not None:
-                SESSIONS.pop(sid, None)
-                cached._sidecar_revision_session_id_v1 = sid
-                cached._sidecar_revision_v1 = (-1, None, None)
-        result = (
-            cached
-            if cached_owned
-            else (session if session_owned or metadata_view else None)
-        )
+            if cached is not None:
+                cached_expected = _coerce_sidecar_revision(
+                    getattr(cached, "_sidecar_revisions", {}).get(sid),
+                    sid,
+                )
+                cached_owned = cached_expected == revision_before
+                if cached_owned:
+                    cached.workspace = resolved
+                    cached._sidecar_revisions[sid] = _sidecar_revision_record(
+                        revision
+                    )
+                else:
+                    SESSIONS.pop(sid, None)
+                    if hasattr(cached, "_sidecar_revisions"):
+                        cached._sidecar_revisions[sid] = _sidecar_revision_record(
+                            SidecarRevision(
+                                sid=sid,
+                                state="INVALIDATED",
+                                generation=-1,
+                                digest_sha256=None,
+                            )
+                        )
+        result = cached if cached_owned else (session if session_owned else None)
         if result is None:
             result = Session.load(sid)
             if result is None:
@@ -10477,8 +10770,7 @@ def get_state_db_session_message_keys_before_timestamp(
                         "content": row["content"],
                         "tool_calls": _json_loads_if_string(row["tool_calls"]),
                         "api_content": row["api_content"] if "api_content" in available else None,
-                    },
-                    normalize_workspace_prefix=True,
+                    }
                 )
                 for row in cur.fetchall()
             ]
@@ -11295,16 +11587,12 @@ def _loose_session_message_content(value: str) -> str:
     return " ".join(re.findall(r"\w+", str(value or "").casefold()))
 
 
-def _session_message_content_key(
-    msg: dict,
-    *,
-    normalize_workspace_prefix: bool = True,
-):
+def _session_message_content_key(msg: dict):
     if not isinstance(msg, dict):
         return ("non_dict", repr(msg))
     role = str(msg.get("role") or "")
     content = _normalized_session_message_content(msg)
-    if role == "user" and normalize_workspace_prefix:
+    if role == "user":
         # WebUI sends the model a workspace-prefixed user_message
         # ("[Workspace::v1: /path]\n<text>") while the visible/optimistic
         # bubble and the WebUI sidecar row carry only the bare "<text>". The
@@ -11332,11 +11620,7 @@ def _session_message_content_key(
     ), msg)
 
 
-def _session_message_visible_key(
-    msg: dict,
-    *,
-    normalize_workspace_prefix: bool = False,
-):
+def _session_message_visible_key(msg: dict):
     if not isinstance(msg, dict):
         return ("non_dict", repr(msg))
     # Include tool_calls so assistant messages that invoke different tools
@@ -11345,21 +11629,9 @@ def _session_message_visible_key(
     # ("assistant", "") and the merge treats state.db rows as replays.
     _tc = msg.get("tool_calls")
     _tc_key = json.dumps(_tc, sort_keys=True, default=str) if _tc else ""
-    role = str(msg.get("role") or "")
-    content = _normalized_session_message_content(msg)
-    if role == "user" and normalize_workspace_prefix:
-        # state.db stores the model-facing workspace-prefixed prompt while the
-        # WebUI sidecar owns the bare visible text. Fold that protocol wrapper
-        # into the exact key so large-session reconciliation does not depend on
-        # the bounded fuzzy fallback to recognize one logical turn.
-        from api.streaming import _strip_workspace_prefix
-
-        content = " ".join(
-            _strip_workspace_prefix(content, include_legacy=True).split()
-        )
     return _session_message_key_with_sidecar((
-        role,
-        content,
+        str(msg.get("role") or ""),
+        _normalized_session_message_content(msg),
         _tc_key,
     ), msg)
 
@@ -11381,9 +11653,6 @@ def _build_visible_duplicate_lookup(visible_keys: set[tuple]) -> dict:
     return {"keys": visible_keys, "by_role": by_role, "loose_by_key": {}}
 
 
-_VISIBLE_DUPLICATE_FUZZY_MAX_KEYS = 1000
-
-
 def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], lookup: dict | None = None):
     if visible_key in visible_keys:
         return visible_key
@@ -11391,12 +11660,6 @@ def _matching_visible_duplicate(visible_key: tuple, visible_keys: set[tuple], lo
     content = visible_key[1] if len(visible_key) > 1 else ""
     sidecar = visible_key[3] if len(visible_key) > 3 else None
     if not content:
-        return None
-    # Exact identity above remains authoritative at every size. The fallback
-    # below scans the existing keys for every candidate, so it becomes
-    # quadratic on long transcripts even when each individual message is small.
-    # Prefer an occasional near-duplicate over blocking every WebUI endpoint.
-    if len(visible_keys) > _VISIBLE_DUPLICATE_FUZZY_MAX_KEYS:
         return None
     if lookup is None:
         lookup = _build_visible_duplicate_lookup(visible_keys)
@@ -11498,14 +11761,8 @@ def state_db_delta_after_context(sidecar_context: list, state_messages: list) ->
         and str(sidecar_context[0].get('role') or '') == 'user'
     )
 
-    sidecar_keys = [
-        _session_message_content_key(m, normalize_workspace_prefix=False)
-        for m in sidecar_context
-    ]
-    state_keys = [
-        _session_message_content_key(m, normalize_workspace_prefix=True)
-        for m in state_messages
-    ]
+    sidecar_keys = [_session_message_content_key(m) for m in sidecar_context]
+    state_keys = [_session_message_content_key(m) for m in state_messages]
     max_offset = min(len(sidecar_keys), len(state_keys))
     best_len = 0
     best_offset = 0
@@ -11838,18 +12095,8 @@ def merge_session_messages_append_only(
     _message_key_helpers = {
         "merge": _session_message_merge_key,
         "dedup": _session_message_dedup_key,
-        "content_sidecar": lambda msg: _session_message_content_key(
-            msg, normalize_workspace_prefix=False
-        ),
-        "content_state": lambda msg: _session_message_content_key(
-            msg, normalize_workspace_prefix=True
-        ),
-        "visible_sidecar": lambda msg: _session_message_visible_key(
-            msg, normalize_workspace_prefix=False
-        ),
-        "visible_state": lambda msg: _session_message_visible_key(
-            msg, normalize_workspace_prefix=True
-        ),
+        "content": _session_message_content_key,
+        "visible": _session_message_visible_key,
     }
 
     def _cached_message_key(msg, kind):
@@ -11983,14 +12230,12 @@ def merge_session_messages_append_only(
     ambiguous_row_ids = set()
     max_sidecar_timestamp = None
 
-    def _remember_merged_message(message, *, source: str):
+    def _remember_merged_message(message):
         if not isinstance(message, dict):
             return
         merged_by_message_key.setdefault(_cached_message_key(message, "merge"), message)
         merged_by_dedup_key.setdefault(_cached_message_key(message, "dedup"), message)
-        merged_by_visible_key.setdefault(
-            _cached_message_key(message, f"visible_{source}"), message
-        )
+        merged_by_visible_key.setdefault(_cached_message_key(message, "visible"), message)
         row_id, row_id_valid = _state_db_row_identity_details(message)
         if row_id_valid and row_id is not None:
             if row_id in merged_by_row_id:
@@ -12005,16 +12250,16 @@ def merge_session_messages_append_only(
         key = _cached_message_key(msg, "merge")
         seen_message_keys.add(key)
         seen_dedup_keys.add(_cached_message_key(msg, "dedup"))
-        content_key = _cached_message_key(msg, "content_sidecar")
+        content_key = _cached_message_key(msg, "content")
         seen_content_keys.add(content_key)
-        visible_key = _cached_message_key(msg, "visible_sidecar")
+        visible_key = _cached_message_key(msg, "visible")
         seen_visible_keys.add(visible_key)
         sidecar_visible_keys.add(visible_key)
         sidecar_visible_counts[visible_key] = sidecar_visible_counts.get(visible_key, 0) + 1
         sidecar_visible_sequence.append(visible_key)
         sidecar_visible_messages.append(msg)
         merged_messages.append(msg)
-        _remember_merged_message(msg, source="sidecar")
+        _remember_merged_message(msg)
     if _sidecar_has_terminal_partial_error(sidecar_messages):
         return _normalize_wakeup_rows_for_display(merged_messages)
     sidecar_visible_lookup = _build_visible_duplicate_lookup(sidecar_visible_keys)
@@ -12036,8 +12281,8 @@ def merge_session_messages_append_only(
         timestamp = _message_timestamp_as_float(msg)
         key = _cached_message_key(msg, "merge")
         dedup_key = _cached_message_key(msg, "dedup")
-        visible_key = _cached_message_key(msg, "visible_state")
-        content_key = _cached_message_key(msg, "content_state")
+        visible_key = _cached_message_key(msg, "visible")
+        content_key = _cached_message_key(msg, "content")
         row_id, row_id_valid = _state_db_row_identity_details(msg)
         replays_sidecar_prefix = False
         replay_target = None
@@ -12315,7 +12560,7 @@ def merge_session_messages_append_only(
                             seen_dedup_keys.add(dedup_key)
                             seen_content_keys.add(content_key)
                             seen_visible_keys.add(visible_key)
-                            _remember_merged_message(msg, source="state")
+                            _remember_merged_message(msg)
                         continue
                     else:
                         _merge_session_display_metadata(merged_by_message_key.get(key), msg)
@@ -12327,7 +12572,7 @@ def merge_session_messages_append_only(
                             seen_dedup_keys.add(dedup_key)
                             seen_content_keys.add(content_key)
                             seen_visible_keys.add(visible_key)
-                            _remember_merged_message(msg, source="state")
+                            _remember_merged_message(msg)
                         continue
                     _merge_session_display_metadata(merged_by_message_key.get(key), msg)
                     continue
@@ -12336,7 +12581,7 @@ def merge_session_messages_append_only(
         seen_content_keys.add(content_key)
         seen_visible_keys.add(visible_key)
         merged_messages.append(msg)
-        _remember_merged_message(msg, source="state")
+        _remember_merged_message(msg)
     return _normalize_wakeup_rows_for_display(merged_messages)
 
 

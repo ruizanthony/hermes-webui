@@ -354,13 +354,16 @@ def test_server_delete_prunes_session_index(cleanup_test_sessions):
             text.find('if parsed.path == "/api/session/delete":'),
         )
         if delete_idx >= 0:
-            clear_idx = max(
-                text.find("if parsed.path == '/api/session/clear':", delete_idx),
-                text.find('if parsed.path == "/api/session/clear":', delete_idx),
-            )
-            delete_block = text[
-                delete_idx:clear_idx if clear_idx >= 0 else delete_idx + 6000
+            clear_indices = [
+                idx
+                for idx in (
+                    text.find("if parsed.path == '/api/session/clear':", delete_idx),
+                    text.find('if parsed.path == "/api/session/clear":', delete_idx),
+                )
+                if idx > delete_idx
             ]
+            delete_end = min(clear_indices) if clear_indices else len(text)
+            delete_block = text[delete_idx:delete_end]
             assert "prune_session_from_index(sid)" in delete_block, \
                 f"{label} session/delete must prune SESSION_INDEX_FILE"
             return
@@ -375,15 +378,31 @@ def test_server_delete_removes_session_bak_snapshot(cleanup_test_sessions):
         routes_src.find('if parsed.path == "/api/session/delete":'),
     )
     assert delete_idx >= 0, "session/delete handler not found in api/routes.py"
-    clear_idx = max(
-        routes_src.find("if parsed.path == '/api/session/clear':", delete_idx),
-        routes_src.find('if parsed.path == "/api/session/clear":', delete_idx),
-    )
-    delete_block = routes_src[
-        delete_idx:clear_idx if clear_idx >= 0 else delete_idx + 6000
+    clear_indices = [
+        idx
+        for idx in (
+            routes_src.find("if parsed.path == '/api/session/clear':", delete_idx),
+            routes_src.find('if parsed.path == "/api/session/clear":', delete_idx),
+        )
+        if idx > delete_idx
     ]
-    assert "_delete_session_sidecar_artifacts_locked(" in delete_block, \
-        "session/delete must remove the complete sidecar family, including <sid>.json.bak"
+    delete_end = min(clear_indices) if clear_indices else len(routes_src)
+    delete_block = routes_src[delete_idx:delete_end]
+    assert "_delete_session_sidecar_artifacts_locked(" in delete_block, (
+        "session/delete must route all sidecar removal through the canonical helper"
+    )
+
+    import inspect
+    from api.models import _delete_session_sidecar_artifacts_locked
+
+    helper_src = inspect.getsource(_delete_session_sidecar_artifacts_locked)
+    assert 'backup = sidecar.with_suffix(".json.bak")' in helper_src
+    assert "artifact.unlink(missing_ok=True)" in helper_src, (
+        "the canonical delete helper must unlink <sid>.json.bak"
+    )
+    assert "bak.archive-*" in helper_src, (
+        "the canonical delete helper must unlink versioned backup archives"
+    )
 
 # ── R9: Token/tool SSE events write to wrong session after switch ─────────────
 
@@ -430,18 +449,13 @@ def test_respond_approval_uses_approval_session_id(cleanup_test_sessions):
     if the user switched while approval was pending).
     """
     src = (REPO_ROOT / "static/messages.js").read_text()
-    # Click ownership is captured from the visible approval card, then passed
-    # immutably into respondApproval rather than re-read after an await.
-    capture_idx = src.find("function _captureApprovalResponseOwner(")
-    assert capture_idx >= 0, "approval response owner capture helper not found"
-    capture_body = src[capture_idx:capture_idx+500]
-    assert "const sid = _approvalSessionId" in capture_body
-    assert "const approvalId = _approvalCurrentId" in capture_body
+    # The fix introduces _approvalSessionId to track the correct session
+    assert "_approvalSessionId" in src,         "messages.js must use _approvalSessionId in respondApproval"
+    # respondApproval must use _approvalSessionId, not S.session.session_id directly
     idx = src.find("async function respondApproval(")
     assert idx >= 0, "respondApproval not found"
-    fn_body = src[idx:idx+500]
-    assert "options.owner || _captureApprovalResponseOwner()" in fn_body
-    assert "const {sid, approvalId} = owner" in fn_body
+    fn_body = src[idx:idx+300]
+    assert "_approvalSessionId" in fn_body,         "respondApproval must read _approvalSessionId, not S.session.session_id"
 
 
 # ── R11: Tool progress must not use shared status chrome ──────────────────

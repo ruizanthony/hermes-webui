@@ -24,7 +24,8 @@ def _read(rel_path: str) -> str:
 
 
 class _DummySession:
-    def __init__(self, path: str = '', session_id: str = ''):
+    def __init__(self, path: str = ''):
+        self.session_id = 'ephemeral-cancel-probe'
         self.path = path
         self.messages = []
         self.active_stream_id = 'stream-1'
@@ -91,20 +92,20 @@ class TestCancelledTurnFinalizer:
         assert session.messages[-1]['provider_details_label'] == 'Cancellation details'
         assert session.messages[-1]['_error'] is True
 
-    def test_ephemeral_cancel_finalizer_unlinks_temp_session_without_saving_error_marker(
+    def test_ephemeral_cancel_finalizer_delegates_without_saving_error_marker(
         self,
-        monkeypatch,
         tmp_path,
+        monkeypatch,
     ):
-        import api.models as models
-        import api.streaming as streaming
-
-        sid = 'btw-session'
-        monkeypatch.setattr(models, 'SESSION_DIR', tmp_path)
-        monkeypatch.setattr(streaming, 'SESSION_DIR', tmp_path)
-        temp_session = tmp_path / f'{sid}.json'
+        temp_session = tmp_path / 'btw-session.json'
         temp_session.write_text('{}', encoding='utf-8')
-        session = _DummySession(str(temp_session), session_id=sid)
+        session = _DummySession(str(temp_session))
+        cleanup_calls = []
+        monkeypatch.setattr(
+            streaming,
+            "_cleanup_ephemeral_session_sidecar_locked",
+            lambda candidate, *, outcome: cleanup_calls.append((candidate, outcome)),
+        )
 
         _finalize_cancelled_turn(session, ephemeral=True)
 

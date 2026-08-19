@@ -491,7 +491,7 @@ async function startCompressionRecovery(btn){
     if(!sid) throw new Error('Compression recovery did not return a session.');
     try{_rememberActiveSession(sid);}catch(_){}
     if(typeof loadSession==='function') await loadSession(sid,{preserveActiveInput:false});
-    else if(data.session){S.session=data.session;if(typeof _adoptRegenerationRevision==='function')_adoptRegenerationRevision(data.session);S.messages=data.session.messages||[];syncTopbar();renderMessages();}
+    else if(data.session){S.session=data.session;S.messages=data.session.messages||[];syncTopbar();renderMessages();}
     if(typeof renderSessionList==='function') await renderSessionList();
     if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(sid);
     if(typeof showToast==='function') showToast((data&&data.message)||'Started focused continuation.',3000,'success');
@@ -2659,37 +2659,6 @@ function _applyMediaPlaybackRate(media, rate=_getStoredMediaPlaybackRate()){
   media.playbackRate=rate;
   _syncMediaSpeedButtons(media.closest('.msg-media-editor,.preview-media-wrap'),rate);
 }
-let _mediaVisibilityObserver=null;
-function _promoteVisibleVideoPreload(video){
-  if(!video||!video.matches||!video.matches('.msg-media-video')) return;
-  if(video.isConnected===false) return;
-  if(video.dataset&&video.dataset.visiblePreload==='1') return;
-  if(video.dataset) video.dataset.visiblePreload='1';
-  video.preload='auto';
-  // Off-screen history stays metadata-only. Once a card approaches the
-  // viewport, restart just that resource so Chromium fills a playable buffer.
-  if(video.paused&&video.readyState<4&&typeof video.load==='function') video.load();
-}
-function _observeVideoPreload(video){
-  if(!video||!video.matches||!video.matches('.msg-media-video')) return;
-  if(video.dataset&&video.dataset.visiblePreload==='1') return;
-  if(_mediaVisibilityObserver) _mediaVisibilityObserver.observe(video);
-}
-function _unobserveVideoPreload(video){
-  if(!video||!_mediaVisibilityObserver) return;
-  _mediaVisibilityObserver.unobserve(video);
-}
-function _initMediaVisibilityObserver(){
-  if(_mediaVisibilityObserver||typeof IntersectionObserver==='undefined') return;
-  _mediaVisibilityObserver=new IntersectionObserver(entries=>{
-    for(const entry of entries){
-      if(!entry.isIntersecting) continue;
-      const video=entry.target;
-      _unobserveVideoPreload(video);
-      _promoteVisibleVideoPreload(video);
-    }
-  },{root:null,rootMargin:'300px 0px',threshold:0.01});
-}
 function _mediaKindForName(name=''){
   const clean=String(name||'').split('?')[0].toLowerCase();
   if(_VIDEO_EXTS.test(clean)) return 'video';
@@ -2856,40 +2825,21 @@ document.addEventListener("loadedmetadata", e=>{
     _applyMediaPlaybackRate(e.target);
   }
 },true);
-document.addEventListener('play',e=>{
-  if(e.target&&e.target.matches&&e.target.matches('.msg-media-video')){
-    _promoteVisibleVideoPreload(e.target);
-  }
-},true);
 function _initMediaPlaybackObserver(){
   if(!document.body||window._mediaPlaybackObserver) return;
-  _initMediaVisibilityObserver();
   window._mediaPlaybackObserver=new MutationObserver(records=>{
     for(const rec of records){
-      for(const node of rec.removedNodes||[]){
-        if(!node||node.nodeType!==1) continue;
-        const videos=[];
-        if(node.matches&&node.matches('.msg-media-video')) videos.push(node);
-        if(node.querySelectorAll) videos.push(...node.querySelectorAll('.msg-media-video'));
-        videos.forEach(_unobserveVideoPreload);
-      }
       for(const node of rec.addedNodes||[]){
         if(!node||node.nodeType!==1) continue;
         const media=[];
         if(node.matches&&node.matches('audio,video')) media.push(node);
         if(node.querySelectorAll) media.push(...node.querySelectorAll('audio,video'));
-        media.forEach(m=>{
-          _applyMediaPlaybackRate(m);
-          _observeVideoPreload(m);
-        });
+        media.forEach(m=>_applyMediaPlaybackRate(m));
       }
     }
   });
   window._mediaPlaybackObserver.observe(document.body,{childList:true,subtree:true});
-  document.querySelectorAll('audio,video').forEach(m=>{
-    _applyMediaPlaybackRate(m);
-    _observeVideoPreload(m);
-  });
+  document.querySelectorAll('audio,video').forEach(m=>_applyMediaPlaybackRate(m));
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',_initMediaPlaybackObserver);
 else _initMediaPlaybackObserver();
@@ -10349,7 +10299,6 @@ async function refreshSession() {
   try {
     const data = await api(`/api/session?session_id=${encodeURIComponent(S.session.session_id)}`);
     S.session = data.session;
-    if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
     S.messages = data.session.messages || [];
     _messagesTruncated = !!data.session._messages_truncated;
     _oldestIdx = data.session._messages_offset || 0;
@@ -11193,14 +11142,14 @@ function _activeTurnTokenMatches(msg, session){
  * same text twice in a row (a plain "继续" follow-up) legitimately gets two
  * identical user turns, and matching on text would swallow the new one. The
  * discriminator is therefore exact identity, never proximity: the active turn's
- * public row carries `_active_turn_user`, while private rows carry the server-
- * stamped `_active_turn_token` (stream_id + started_at — unique to this turn),
- * or their timestamp equals `pending_started_at` within a precision-only epsilon
- * that absorbs float/state.db drift but never a full second. A whole-second (or
- * sub-second) mismatch is ambiguous and returns null so the caller materializes
- * the pending turn — the transient duplicate is harmless, hiding a turn + moving
- * its attachments is not. Text equality is still required downstream, so a false
- * match needs identical text AND an exact identity signal.
+ * row either carries the server-stamped `_active_turn_token` (stream_id +
+ * started_at — unique to this turn), or its timestamp equals `pending_started_at`
+ * within a precision-only epsilon that absorbs float/state.db drift but never a
+ * full second. A whole-second (or sub-second) mismatch is ambiguous and returns
+ * null so the caller materializes the pending turn — the transient duplicate is
+ * harmless, hiding a turn + moving its attachments is not. Text equality is
+ * still required downstream, so a false match needs identical text AND an exact
+ * identity signal.
  */
 function _pendingActiveTurnUserMessage(messages, session){
   const startedAt=Number(session?.pending_started_at);
@@ -11210,8 +11159,6 @@ function _pendingActiveTurnUserMessage(messages, session){
     const msg=list[i];
     if(!msg||String(msg.role||'')!=='user') continue;
     if(typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(msg)) continue;
-    // Public projections replace the private token with this authoritative marker.
-    if(msg._active_turn_user===true) return msg;
     // Unambiguous: the row carries the active turn's exact token
     // (stream_id + started_at) stamped by the server's eager-checkpoint path.
     if(typeof _activeTurnTokenMatches==='function'&&_activeTurnTokenMatches(msg,session)) return msg;
@@ -17128,27 +17075,22 @@ function renderMessages(options){
   if(sid&&INFLIGHT[sid]){
     const _lt=document.getElementById('liveAssistantTurn');
     if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
-      // Live-turn preservation requires a PROVABLE live owner — never bare DOM
-      // content. (#6948) The live turn is preserved across the wipe only while
-      // (a) the stream is genuinely active (S.activeStreamId — the #3877
-      // mid-stream flicker case this preserve was written for), or (b) the
-      // current message projection (S.messages) still carries explicit
-      // live-assistant evidence — a client-side _live / _activityBurstId /
-      // _liveSegmentSeq marker merged in from the INFLIGHT tail or a server
-      // journal snapshot (the reconnect / terminal-projection case). A settled
-      // transcript has neither, so a contentful but DEAD live node (stream
-      // ended — S.activeStreamId cleared — while INFLIGHT[sid] was not yet
-      // cleaned) is no longer preserved: re-attaching it over the settled
-      // transcript pinned a second copy of the same assistant message (#6948;
-      // data was always clean — state.db, sidecar, and /api/session each hold
-      // one row; the duplicate existed only in the rendered DOM). The #5390
-      // blank-turn guard (对话消失) is preserved: a dead EMPTY shell has no live
-      // projection either, so it is still dropped with the wipe instead of
-      // pinning an avatar-only blank turn over the settled answer.
-      const _hasLiveAssistantProjection=Array.isArray(S.messages)&&S.messages.some(m=>
-        m&&m.role==='assistant'&&(m._live||m._activityBurstId!==undefined||m._liveSegmentSeq!==undefined)
-      );
-      if(S.activeStreamId || _hasLiveAssistantProjection){
+      // Blank-turn fix (对话消失): only preserve the live turn across the DOM
+      // wipe if it is GENUINELY live — either an active stream is still running
+      // (S.activeStreamId set: the #3877 mid-stream flicker case this preserve
+      // was written for), or the turn already holds real rendered content (a
+      // visible answer body, a tool card, or a reasoning row). A DEAD shell —
+      // an interrupted turn whose stream dropped (S.activeStreamId cleared to
+      // null) but whose INFLIGHT[sid] entry was not cleaned, leaving only an
+      // empty worklog group ("Processed Ns" with no body/tool rows) — must NOT
+      // be preserved: re-attaching it on a session-updated swap re-render pins
+      // an avatar-only empty turn OVER the settled transcript, hiding the real
+      // (already-persisted) answer. That is the reported blank. Reproduced +
+      // fix verified on an isolated debug instance (8710): stale INFLIGHT +
+      // empty live-turn survived the swap → blank; gating on real-content /
+      // active-stream clears it while a genuine live turn still renders.
+      const _hasRealLiveContent=!!_lt.querySelector('.msg-body, .tool-card-row, .wl-reason');
+      if(_hasRealLiveContent || S.activeStreamId){
         _preservedLiveTurn=_lt;
       }
     }
@@ -19882,25 +19824,30 @@ async function submitEdit(msgIdx, newText) {
 
 async function regenerateResponse(btn) {
   if(!S.session || S.busy) return;
-  const row=btn&&btn.closest&&btn.closest('[data-msg-idx]');
-  if(!row)return;
-  const clickedAbsoluteIndex=_oldestIdx+parseInt(row.dataset.msgIdx,10);
+  const row = btn.closest('[data-msg-idx]');
+  if(!row) return;
+  const assistantIdx = parseInt(row.dataset.msgIdx, 10);
+  const absoluteKeepCount = _oldestIdx + assistantIdx;
   const initialSid = S.session.session_id;
+  let lastUserText = '';
+  for(let i = assistantIdx - 1; i >= 0; i--) {
+    const m = S.messages[i];
+    if(m && m.role === 'user') { lastUserText = msgContent(m); break; }
+  }
+  if(!lastUserText) return;
   if(typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
   }
   if(!S.session || S.session.session_id !== initialSid) return;
-  if(!S.session.regeneration_revision){ setStatus(t('regen_failed')); return; }
-  let latestAssistantIndex=-1;
-  for(let i=S.messages.length-1;i>=0;i--){
-    if(S.messages[i]?.role==='assistant'){latestAssistantIndex=i;break;}
-  }
-  if(clickedAbsoluteIndex!==latestAssistantIndex){
-    setStatus(t('regen_failed'));
-    return;
-  }
   try {
-    await startRegeneration(initialSid, S.session.regeneration_revision);
+    await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
+      session_id: initialSid,
+      keep_count: absoluteKeepCount
+    })});
+    S.messages = S.messages.slice(0, absoluteKeepCount);
+    renderMessages();
+    $('msg').value = lastUserText;
+    await send();
   } catch(e) { setStatus(t('regen_failed') + e.message); }
 }
 
@@ -21999,7 +21946,7 @@ async function promptNewFile(targetDir = S.currentDir || '.'){
       // System-minted session (#6022): explicit worktree:false — creating a
       // file from a blank page must not inherit the config worktree default.
       const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws,worktree:false})});
-      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(r.session);S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
     }catch(e){setStatus(t('create_failed')+e.message);return;}
   }
   if(!S.session)return;
@@ -22032,7 +21979,7 @@ async function promptNewFolder(targetDir = S.currentDir || '.'){
       // System-minted session (#6022): explicit worktree:false — creating a
       // folder from a blank page must not inherit the config worktree default.
       const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws,worktree:false})});
-      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(r.session);S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
     }catch(e){setStatus(t('folder_create_failed')+e.message);return;}
   }
   if(!S.session)return;

@@ -333,6 +333,7 @@ owned by one completed agent attempt. A credential retry clears any pair from
 the failed attempt, then accepts either a complete pair from the new result or
 a complete pair from the new agent. Fields from separate attempts or sources
 must never be combined into deletion authority.
+
 #### Session sidecar publication authority
 
 Every compliant writer of `SESSION_DIR/<sid>.json` participates in the same

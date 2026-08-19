@@ -21,8 +21,8 @@ import threading
 import time
 import traceback
 import copy
-import inspect
 import uuid
+import inspect
 from bisect import bisect_left
 from collections import Counter
 from pathlib import Path
@@ -84,10 +84,6 @@ from api.models import (
     _message_has_structured_replay_fields,
     _partial_message_signature as _durable_partial_message_signature,
     _strict_incomplete_message_id_key,
-    _delete_session_sidecar_artifacts_locked,
-    _is_empty_partial_activity_message,
-    _read_sidecar_revision,
-    _session_sidecar_authority,
     _evict_sessions_over_cap,
     clear_process_wakeup_pause,
     get_state_db_session_messages,
@@ -178,29 +174,6 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
     attach_todo_state(raw, messages)
     if tool_calls is not None:
         raw['tool_calls'] = tool_calls
-    try:
-        from api.session_ops import (
-            regeneration_authority,
-            regeneration_state,
-        )
-        canonical_messages, canonical_context = regeneration_state(session)
-        revision = regeneration_authority(
-            session,
-            rows=canonical_messages,
-            context=canonical_context,
-            full_transcript=True,
-            canonical_state=(canonical_messages, canonical_context),
-        )
-        if revision:
-            messages = list(canonical_messages)
-            raw['messages'] = messages
-            raw['message_count'] = len(messages)
-            attach_todo_state(raw, messages)
-            raw['regeneration_revision'] = revision
-        else:
-            raw.pop('regeneration_revision', None)
-    except Exception:
-        raw.pop('regeneration_revision', None)
     return raw
 
 
@@ -1776,29 +1749,12 @@ def _clean_synthetic_control_messages_with_provenance(messages):
 def _active_turn_authority(session, stream_id, msg_text):
     """Capture the stream-owned pending turn before settlement mutates it."""
     pending_text = getattr(session, 'pending_user_message', None)
-    token = build_active_turn_token(stream_id, getattr(session, 'pending_started_at', None))
-    checkpoint = (
-        next(
-            (
-                copy.deepcopy(message)
-                for message in reversed(list(getattr(session, 'messages', None) or []))
-                if isinstance(message, dict)
-                and message.get('role') == 'user'
-                and message.get('_active_turn_token') == token
-            ),
-            None,
-        )
-        if token
-        else None
-    )
     return {
-        'session_id': getattr(session, 'session_id', None),
-        'token': token,
+        'token': build_active_turn_token(stream_id, getattr(session, 'pending_started_at', None)),
         'text': pending_text if pending_text is not None else msg_text,
         'timestamp': getattr(session, 'pending_started_at', None),
         'source': getattr(session, 'pending_user_source', None) or 'webui',
         'attachments': copy.deepcopy(getattr(session, 'pending_attachments', None) or []),
-        'checkpoint': checkpoint,
         'current_turn_user_idx': None,
         'turn_id': '',
     }
@@ -1988,7 +1944,7 @@ def _mark_active_turn_checkpoint_in_history(messages, identity, msg_text, *, all
     if (
         not isinstance(message, dict)
         or message.get('role') != 'user'
-        or _normalize_user_text(_message_text(message.get('content'))) != _normalize_user_text(expected_text)
+        or _normalize_user_text(message.get('content')) != _normalize_user_text(expected_text)
     ):
         return messages, False
     _mark_active_turn_checkpoint(message, identity)
@@ -2065,24 +2021,19 @@ def _find_active_turn_checkpoint_index(
         if (
             isinstance(message, dict)
             and message.get('role') == 'user'
-            and _normalize_user_text(_message_text(message.get('content'))) == _normalize_user_text(expected_text)
+            and _normalize_user_text(message.get('content')) == _normalize_user_text(expected_text)
         ):
             return idx
     return None
 
 
 def _materialize_active_turn_user(identity, msg_text, source):
-    checkpoint = identity.get('checkpoint') if isinstance(identity, dict) else None
-    message = (
-        copy.deepcopy(checkpoint)
-        if isinstance(checkpoint, dict) and checkpoint.get('role') == 'user'
-        else {
-            'role': 'user',
-            'content': identity.get('text') if isinstance(identity, dict) else msg_text,
-        }
-    )
+    message = {
+        'role': 'user',
+        'content': identity.get('text') if isinstance(identity, dict) else msg_text,
+    }
     if isinstance(identity, dict):
-        if identity.get('timestamp') is not None and message.get('timestamp') is None:
+        if identity.get('timestamp') is not None:
             message['timestamp'] = identity['timestamp']
         if identity.get('attachments'):
             message['attachments'] = copy.deepcopy(identity['attachments'])
@@ -2091,15 +2042,8 @@ def _materialize_active_turn_user(identity, msg_text, source):
             identity.get('source') or source or 'webui',
             active_turn_token=identity.get('token'),
         )
-        if str(identity.get('source') or source or '').strip().lower() == 'fork':
-            child_session_id = identity.get('session_id')
-            if child_session_id:
-                message['_fork_child_turn'] = child_session_id
     else:
-        stamp_message_source(
-            message,
-            source,
-        )
+        stamp_message_source(message, source)
     return message
 
 
@@ -2124,18 +2068,7 @@ def _settle_current_turn_boundary(
         allow_exact_prefix=allow_exact_prefix,
     )
     if _checkpoint_idx is not None:
-        existing_checkpoint = result_messages[_checkpoint_idx]
-        if isinstance(identity.get('checkpoint'), dict):
-            retained_checkpoint = _materialize_active_turn_user(identity, msg_text, source)
-            if (
-                retained_checkpoint.get('id') is None
-                and isinstance(existing_checkpoint, dict)
-                and existing_checkpoint.get('id') is not None
-            ):
-                retained_checkpoint['id'] = existing_checkpoint['id']
-            result_messages[_checkpoint_idx] = retained_checkpoint
-        else:
-            _mark_active_turn_checkpoint(existing_checkpoint, identity)
+        _mark_active_turn_checkpoint(result_messages[_checkpoint_idx], identity)
         return result_messages
     previous_context = list(previous_context or [])
     if _messages_have_prefix(
@@ -2858,6 +2791,13 @@ def _persist_cancelled_turn(session, *, message: str = 'Task cancelled.') -> Non
 
 def _clear_ephemeral_turn_state(session) -> None:
     """Clear transient stream fields on an in-memory hidden session."""
+    session.active_stream_id = None
+    session.pending_user_message = None
+    session.pending_attachments = []
+    session.pending_started_at = None
+    session.pending_user_source = None
+
+
 def _cleanup_ephemeral_cancelled_turn(session) -> None:
     """Remove transient /btw session state after a cancel without saving it."""
     _clear_ephemeral_turn_state(session)
@@ -2923,7 +2863,6 @@ def _cleanup_ephemeral_session_sidecar_locked(session, *, outcome: str) -> bool:
             exc_info=True,
         )
         return False
-    _cleanup_ephemeral_session_sidecar_locked(session, outcome='cancelled')
 
 
 def _resolve_current_session_for_write(session):
@@ -9080,7 +9019,7 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
         except (TypeError, ValueError):
             return False
         return (
-            _normalize_user_text(_message_text(existing.get('content'))) == _normalize_user_text(pending_text)
+            _normalize_user_text(existing.get('content')) == _normalize_user_text(pending_text)
             and existing_ts == recovered_ts
             and existing_source == pending_source
             and list(existing.get('attachments') or []) == pending_attachments
@@ -9102,8 +9041,6 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
         'timestamp': recovered_ts,
         '_recovered': True,
     }
-    if str(pending_source or '').strip().lower() == 'fork':
-        recovered['_fork_child_turn'] = session.session_id
     stamp_message_source(recovered, pending_source)
     if pending_attachments:
         recovered['attachments'] = pending_attachments
@@ -10558,27 +10495,22 @@ def _run_agent_streaming(
         try:
             try:
                 from api.route_approvals import (
-                    settle_gateway_pending_local_notification as _settle_pending_for_polling,
+                    submit_gateway_pending_mirror as _submit_pending_for_polling,
                     retire_gateway_pending_mirror as _retire_gateway_pending_mirror,
                 )
                 def _cleanup_gateway_pending_mirror():
                     _retire_gateway_pending_mirror(session_id)
             except ImportError:
-                _settle_pending_for_polling = None
+                _submit_pending_for_polling = None
                 _cleanup_gateway_pending_mirror = None
             from tools.approval import (
                 register_gateway_notify as _reg_notify,
                 unregister_gateway_notify as _unreg_notify,
             )
             def _approval_notify_cb(approval_data):
-                if _settle_pending_for_polling is not None:
+                if _submit_pending_for_polling is not None:
                     try:
-                        auto_resolved, head, total = _settle_pending_for_polling(
-                            session_id,
-                            approval_data,
-                        )
-                        if auto_resolved and head is None:
-                            return
+                        head, total = _submit_pending_for_polling(session_id, approval_data)
                         approval_data = {**(head or approval_data), "pending_count": total}
                     except Exception:
                         logger.warning("Failed to mirror approval into WebUI polling state", exc_info=True)
@@ -11952,7 +11884,6 @@ def _run_agent_streaming(
                     )
                     if _ephemeral_deleted:
                         _clear_ephemeral_turn_state(s)
-                _cleanup_ephemeral_session_sidecar_locked(s, outcome='completed')
                 return  # skip all normal persistence for ephemeral sessions
             if _checkpoint_stop is not None:
                 _checkpoint_stop.set()

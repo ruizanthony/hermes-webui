@@ -61,12 +61,8 @@ class TestBootJsProfileDefaultWorkspace:
         src = read('static/boot.js')
         # Find the settings fetch and the _profileDefaultWorkspace ASSIGNMENT
         # (the if(s.default_workspace) line, not usages elsewhere in the file)
-        settings_match = re.search(
-            r"await api\('/api/settings'(?:,\{[^)]*\})?\)",
-            src,
-        )
-        assert settings_match, "await api('/api/settings', optionalOptions) not found in boot.js"
-        settings_idx = settings_match.start()
+        settings_idx = src.find("await api('/api/settings')")
+        assert settings_idx != -1, "await api('/api/settings') not found in boot.js"
         # Find the assignment specifically — it uses 's.default_workspace'
         ws_assign_idx = src.find('S._profileDefaultWorkspace=s.default_workspace')
         assert ws_assign_idx != -1, "S._profileDefaultWorkspace assignment not found in boot.js"

@@ -108,7 +108,7 @@ def test_share_revoke_makes_link_unavailable():
         created, _ = post("/api/share/create", {"session_id": sid})
         token = created["share"]["token"]
         revoked, status = post("/api/share/revoke", {"session_id": sid})
-        assert status == 200
+        assert status == 200, revoked
         assert revoked["ok"] is True
         missing, status, _ = get(f"/api/share/{token}")
         assert status == 404

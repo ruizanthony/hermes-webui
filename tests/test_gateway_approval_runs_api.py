@@ -1073,19 +1073,10 @@ def test_legacy_gateway_approval_without_run_gets_browser_visible_id():
     try:
         approvals._gateway_queues[sid] = [SimpleNamespace(data={"command": "legacy"})]
         approval = {"command": "legacy"}
-        head, total = approvals.submit_gateway_pending_mirror(sid, approval)
+        approvals.submit_gateway_pending_mirror(sid, approval)
         assert approval.get("approval_id")
         queue = approvals._pending.get(sid) or []
-        # The browser is handed the RETURNED head — both production callers do
-        # `{**(head or approval_data), "pending_count": total}` — so the head's
-        # id is the browser-visible one, and it must be the id actually sitting
-        # in the polling queue or the respond call targets nothing. While a
-        # producer is live that id is the authoritative producer's, not the
-        # submitted copy's: an unmatched copy must not linger and mask it.
-        assert head is not None
-        assert total == 1
-        assert str(head["approval_id"]).strip()
-        assert queue[0]["approval_id"] == head["approval_id"]
+        assert queue[0]["approval_id"] == approval["approval_id"]
     finally:
         approvals._pending.pop(sid, None)
         approvals._gateway_queues.pop(sid, None)
@@ -1111,31 +1102,13 @@ def test_legacy_gateway_approval_without_run_keeps_its_own_id_beside_local_head(
             and not str(entry.get("run_id") or "").strip()
         ]
         assert mirrors
-        # The no-run mirror keeps an id of its own, distinct from the unrelated
-        # local pending entry's. While a producer is live that id comes from the
-        # authoritative producer rather than the submitted copy, so assert the
-        # distinctness this test is about instead of copy-identity.
-        assert str(mirrors[-1]["approval_id"]).strip()
-        assert mirrors[-1]["approval_id"] != "local-id"
+        assert mirrors[-1]["approval_id"] == approval["approval_id"]
     finally:
         approvals._pending.pop(sid, None)
         approvals._gateway_queues.pop(sid, None)
 
 
-def test_legacy_gateway_approval_without_run_yields_to_live_local_gateway_head():
-    """An unmatched no-run mirror must not linger beside a live local producer.
-
-    Previously a submitted copy whose identity matched no live producer
-    ("remote-id" here, against a parked producer carrying "local-id") was kept
-    in `_pending` alongside the producer. That copy is unresolvable — nothing
-    in `_gateway_queues` answers to its id — and while it sat there it
-    suppressed the producer's token, so the real pending approval never
-    surfaced as the head and could not be actioned (responding to the copy
-    returned 409 in gateway mode and `ok:true` resolving nothing in local
-    mode). Only the authoritative producer's mirror may survive while a
-    producer is live; tokenless-orphan retention is reserved for the genuine
-    no-producer case (#7093).
-    """
+def test_legacy_gateway_approval_without_run_keeps_its_own_id_beside_local_gateway_head():
     import api.route_approvals as approvals
     ta = pytest.importorskip(
         "tools.approval",
@@ -1146,26 +1119,21 @@ def test_legacy_gateway_approval_without_run_yields_to_live_local_gateway_head()
     approvals._pending.pop(sid, None)
     approvals._gateway_queues.pop(sid, None)
     try:
-        entry = ta._ApprovalEntry({
+        approvals._gateway_queues[sid] = [ta._ApprovalEntry({
             "approval_id": "local-id",
             "command": "local-head",
-        })
-        approvals._gateway_queues[sid] = [entry]
+        })]
         approval = {"approval_id": "remote-id", "command": "legacy"}
-        head, total = approvals.submit_gateway_pending_mirror(sid, approval)
+        approvals.submit_gateway_pending_mirror(sid, approval)
         assert approval["approval_id"] == "remote-id"
         queue = approvals._pending.get(sid) or []
-        # The unmatched copy must be gone, not parked next to the producer.
-        assert not [
-            item for item in queue
-            if item.get("approval_id") == "remote-id"
-        ], "an unmatched no-run mirror must not mask the live local producer"
-        # The authoritative producer is what the user sees and can action.
-        assert head is not None
-        assert total == 1
-        assert head["approval_id"] == "local-id"
-        assert head["command"] == "local-head"
-        assert queue[0]["approval_id"] == "local-id"
+        mirrors = [
+            entry for entry in queue
+            if entry.get(approvals._GATEWAY_MIRROR_FLAG)
+            and not str(entry.get("run_id") or "").strip()
+            and entry.get("approval_id") == "remote-id"
+        ]
+        assert mirrors
     finally:
         approvals._pending.pop(sid, None)
         approvals._gateway_queues.pop(sid, None)

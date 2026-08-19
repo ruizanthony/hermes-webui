@@ -594,6 +594,9 @@ def test_offline_compactor_serializes_runtime_writer_through_publish(
     session_dir.mkdir()
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    # Preserve the duplicate for the offline writer: this test exercises lock
+    # serialization rather than the small-sidecar inline repair path.
+    monkeypatch.setattr(models, "_INLINE_REPLAY_REPAIR_MAX_BYTES", 1)
     sidecar = session_dir / "race.json"
     sidecar.write_text(
         json.dumps(
@@ -646,7 +649,7 @@ def test_offline_compactor_serializes_runtime_writer_through_publish(
     assert writer_finished_before_publish == [False]
     assert writer_done.is_set()
     assert writer_errors == [
-        "stale sidecar revision for session 'race'; reload before saving"
+        "Stale session generation for 'race'; reload before saving"
     ]
     persisted = json.loads(sidecar.read_text(encoding="utf-8"))
     assert persisted["title"] == "before"
@@ -779,7 +782,7 @@ def test_runtime_save_rejects_owner_loaded_before_offline_compaction(
     fresh_owner.save(skip_index=True)
 
     stale_owner.title = "must not overwrite"
-    with pytest.raises(RuntimeError, match="stale sidecar revision"):
+    with pytest.raises(RuntimeError, match="Stale session generation"):
         stale_owner.save(skip_index=True)
 
     persisted = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -809,7 +812,7 @@ def test_runtime_save_rejects_delete_recreate_epoch_aba(tmp_path, monkeypatch):
     assert recreated_payload["_sidecar_epoch_v1"] != original_epoch
 
     stale_owner.title = "must not cross epoch"
-    with pytest.raises(RuntimeError, match="stale sidecar revision"):
+    with pytest.raises(RuntimeError, match="Stale session generation"):
         stale_owner.save(skip_index=True)
 
     assert json.loads(recreated.path.read_text(encoding="utf-8")) == recreated_payload

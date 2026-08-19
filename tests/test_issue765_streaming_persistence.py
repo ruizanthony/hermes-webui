@@ -300,13 +300,7 @@ class TestIssue765FollowupHardening:
         authority_calls = 0
         replace_lock = threading.Lock()
         replace_sources = []
-        replace_active = 0
-        max_replace_active = 0
-        replace_state_lock = threading.Lock()
         errors = []
-        publication_lock = threading.Lock()
-        active_publications = 0
-        max_active_publications = 0
 
         @contextmanager
         def _tracked_authority(session_id):
@@ -364,7 +358,6 @@ class TestIssue765FollowupHardening:
             "Concurrent same-session saves must use distinct temp files; "
             f"got {replace_sources}"
         )
-        assert max_active_publications == 1
         data = json.loads(s.path.read_text(encoding="utf-8"))
         assert data["session_id"] == "same_sid"
 
