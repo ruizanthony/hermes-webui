@@ -2858,39 +2858,6 @@ def _persist_cancelled_turn(session, *, message: str = 'Task cancelled.') -> Non
 
 def _clear_ephemeral_turn_state(session) -> None:
     """Clear transient stream fields on an in-memory hidden session."""
-def _cleanup_ephemeral_session_sidecar_locked(session, *, outcome: str) -> bool:
-    """Durably remove one hidden /btw sidecar without deleting a reincarnation."""
-    sid = str(getattr(session, 'session_id', '') or '').strip()
-    expected_path = SESSION_DIR / f'{sid}.json'
-    if Path(session.path).resolve() != expected_path.resolve():
-        raise ValueError(f"Ephemeral session path does not match SID {sid!r}")
-    expected_revision = None
-    if getattr(session, '_sidecar_revision_session_id_v1', None) == sid:
-        expected_revision = getattr(session, '_sidecar_revision_v1', None)
-    with _get_session_agent_lock(sid):
-        with _session_sidecar_authority(sid):
-            if expected_revision is None:
-                expected_revision = _read_sidecar_revision(expected_path)
-            deleted = _delete_session_sidecar_artifacts_locked(
-                sid,
-                expected_revision=expected_revision,
-            )
-    if not deleted:
-        raise RuntimeError(
-            f'Ephemeral session {sid!r} changed before {outcome} cleanup'
-        )
-    return True
-
-
-def _cleanup_ephemeral_cancelled_turn(session) -> None:
-    """Remove transient /btw session state after a cancel without saving it."""
-    session.active_stream_id = None
-    session.pending_user_message = None
-    session.pending_attachments = []
-    session.pending_started_at = None
-    session.pending_user_source = None
-
-
 def _cleanup_ephemeral_cancelled_turn(session) -> None:
     """Remove transient /btw session state after a cancel without saving it."""
     _clear_ephemeral_turn_state(session)

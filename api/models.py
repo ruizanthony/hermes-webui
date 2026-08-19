@@ -216,8 +216,6 @@ _INDEX_WRITE_LOCK = threading.RLock()
 _SESSION_SAVE_AUTHORITIES_LOCK = threading.Lock()
 _SESSION_SAVE_AUTHORITIES: "weakref.WeakValueDictionary[str, threading.RLock]" = weakref.WeakValueDictionary()
 _INLINE_REPLAY_REPAIR_MAX_BYTES = 128 * 1024 * 1024
-_SESSION_SAVE_AUTHORITIES_LOCK = threading.Lock()
-_SESSION_SAVE_AUTHORITIES: "weakref.WeakValueDictionary[str, threading.RLock]" = weakref.WeakValueDictionary()
 _WORKSPACE_BINDING_REVISION_RECEIPTS_LOCK = threading.Lock()
 _WORKSPACE_BINDING_REVISION_RECEIPTS: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
 _WORKSPACE_BINDING_REVISION_RECEIPTS_MAX = 2000
@@ -234,6 +232,54 @@ def _session_save_authority(authority_id: str) -> threading.RLock:
             authority = threading.RLock()
             _SESSION_SAVE_AUTHORITIES[authority_id] = authority
         return authority
+
+
+class StaleSessionGenerationError(RuntimeError):
+    """A sidecar changed after this Session observed its generation."""
+
+
+@dataclass(frozen=True)
+class SidecarRevision:
+    sid: str
+    state: str
+    generation: int
+    digest_sha256: str | None
+
+    @classmethod
+    def absent(cls, sid: str) -> "SidecarRevision":
+        return cls(sid=sid, state="ABSENT", generation=0, digest_sha256=None)
+
+
+def _sidecar_revision_record(revision: SidecarRevision) -> dict:
+    """Return a JSON-compatible token for storage on Session.__dict__."""
+    return {
+        "sid": revision.sid,
+        "state": revision.state,
+        "generation": revision.generation,
+        "digest_sha256": revision.digest_sha256,
+    }
+
+
+def _coerce_sidecar_revision(value, sid: str) -> SidecarRevision | None:
+    if isinstance(value, SidecarRevision):
+        return value if value.sid == sid else None
+    if not isinstance(value, dict) or value.get("sid") != sid:
+        return None
+    state = value.get("state")
+    generation = value.get("generation")
+    digest = value.get("digest_sha256")
+    if (
+        not isinstance(state, str)
+        or type(generation) is not int
+        or (digest is not None and not isinstance(digest, str))
+    ):
+        return None
+    return SidecarRevision(
+        sid=sid,
+        state=state,
+        generation=generation,
+        digest_sha256=digest,
+    )
 
 
 def _record_workspace_binding_revision_receipt(
@@ -398,29 +444,6 @@ def is_safe_session_id(sid) -> bool:
     return all(c in _SAFE_SID_CHARS for c in sid)
 
 
-def _offline_replay_artifact_paths(sidecar: Path):
-    """Yield replay-v10 artifacts owned by one safe session sidecar."""
-    sidecar = Path(sidecar)
-    if sidecar.suffix != '.json' or not is_safe_session_id(sidecar.stem):
-        raise ValueError(f'Unsafe session sidecar path: {sidecar}')
-    name = sidecar.name
-    patterns = (
-        f'{name}.replay-v10.*.bak',
-        f'_replay-v10.{name}.*.manifest.json',
-        f'.{name}.replay-v10.tmp.*',
-        f'.{name}.replay-v10.restore.*',
-        f'._replay-v10.{name}.*.manifest.json.tmp.*',
-    )
-    seen = set()
-    for pattern in patterns:
-        for candidate in sidecar.parent.glob(pattern):
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            if candidate.is_file() or candidate.is_symlink():
-                yield candidate
-
-
 def _delete_offline_replay_artifacts(sidecar: Path) -> int:
     """Remove all plaintext replay artifacts owned by one sidecar."""
     removed = 0
@@ -483,59 +506,6 @@ def _delete_session_recovery_artifacts_locked(
         cause = failures[0] if failures else None
         raise RuntimeError(
             f"Failed to delete required recovery artifacts for {sid!r}"
-        ) from cause
-    return True
-
-
-class SessionDeleteTombstoneError(RuntimeError):
-    """A sidecar delete could not durably fence stale writers."""
-
-
-def _delete_session_sidecar_artifacts_locked(
-    sid: str,
-    *,
-    session_dir: Path | None = None,
-    expected_revision=None,
-    record_tombstone: bool = True,
-) -> bool:
-    """Delete one SID's complete sidecar family while its authority is held."""
-    if not is_safe_session_id(sid):
-        raise ValueError(f"Unsafe session_id {sid!r}")
-    directory = Path(session_dir or SESSION_DIR)
-    sidecar = directory / f'{sid}.json'
-    if expected_revision is not None:
-        if _read_sidecar_revision(sidecar) != expected_revision:
-            return False
-    if record_tombstone:
-        try:
-            _record_webui_deleted_session_tombstone(sid)
-        except Exception as exc:
-            raise SessionDeleteTombstoneError(
-                f"Failed to durably tombstone deleted WebUI session {sid!r}"
-            ) from exc
-
-    _invalidate_cached_session_generation(sid)
-    failures = []
-    required = [sidecar, sidecar.with_suffix('.json.bak')]
-    required.extend(directory.glob(f'{sidecar.name}.bak.archive-*'))
-    for artifact in required:
-        try:
-            artifact.unlink(missing_ok=True)
-        except Exception as exc:
-            failures.append(exc)
-    try:
-        _delete_offline_replay_artifacts(sidecar)
-    except Exception as exc:
-        failures.append(exc)
-
-    remaining = any(path.exists() for path in required)
-    remaining = remaining or any(_offline_replay_artifact_paths(sidecar))
-    remaining = remaining or any(directory.glob(f'{sidecar.name}.bak.archive-*'))
-    _fsync_sidecar_directory(directory)
-    if failures or remaining:
-        cause = failures[0] if failures else None
-        raise RuntimeError(
-            f"Failed to delete required sidecar artifacts for {sid!r}"
         ) from cause
     return True
 
