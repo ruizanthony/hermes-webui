@@ -110,6 +110,29 @@ def covering_refs(commit: str, refs: list[str]) -> list[str]:
     return covering
 
 
+def is_merge(commit: str) -> bool:
+    """True when `commit` has more than one parent."""
+    parents = git("rev-list", "--parents", "-1", commit).split()[1:]
+    return len(parents) > 1
+
+
+def merge_has_unique_resolution(commit: str) -> bool:
+    """True when the merge's combined diff is non-empty.
+
+    `git diff-tree --cc` shows only hunks that differ from BOTH parents, i.e.
+    content hand-written in the resolution. An empty combined diff means the
+    merge is a pure integration of its parents: every line already exists on
+    one side (local keep refs or upstream), so there is nothing a replay
+    could individually restore.
+
+    NB: `--quiet` is NOT usable here — it suppresses output but exits 0 even
+    when the combined diff is non-empty, so it does not discriminate. Use the
+    raw `--no-commit-id` output length instead.
+    """
+    out = git("diff-tree", "--cc", "--no-commit-id", commit)
+    return bool(out.strip())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rev", help="audit this single revision instead of the local stack")
@@ -148,6 +171,12 @@ def main() -> int:
                 print(f"             via {', '.join(declared_cover)}")
         elif covering:
             unprotected.append((commit, subject, f"ref exists but NOT declared in updater: {', '.join(covering)}"))
+        elif is_merge(commit):
+            if merge_has_unique_resolution(commit):
+                unprotected.append((commit, subject, "merge with unique manual resolution (differs from both parents); resolve toward upstream or extract the hunk into its own protected commit"))
+            elif not args.quiet:
+                print(f"  OK-MERGE   {commit[:9]}  {subject}")
+                print("             pure integration merge: combined diff empty, content already covered by a parent")
         else:
             unprotected.append((commit, subject, "no local/keep-* ref covers this commit"))
 
