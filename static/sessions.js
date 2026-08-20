@@ -3156,6 +3156,12 @@ function _captureSameSessionForceReloadHint(sid){
     loaded_renderable_count:loadedRenderableCount,
     loaded_message_count:loadedMessageCount,
     message_count:knownMessageCount,
+    // Retained as captured state (and asserted by the frontend contract test),
+    // but no longer a decision switch: _messageReloadLimitForSession() used to
+    // short-circuit to a full-transcript reload when this was false, which made
+    // every fully-loaded conversation refetch its whole transcript on a
+    // return-from-background refresh. Width is now derived from the loaded
+    // counts alone.
     truncated:!!_messagesTruncated,
   };
 }
@@ -3171,11 +3177,36 @@ function _messageReloadLimitForSession(sid){
     const loadedRenderableCount=Math.max(0,Number(hint.loaded_renderable_count)||0);
     const loadedMessageCount=Math.max(0,Number(hint.loaded_message_count)||0);
     if(loadedRenderableCount>0 || loadedMessageCount>0){
-      if(!hint.truncated) return null;
       const previousMessageCount=Math.max(0,Number(hint.message_count)||0);
       const currentMessageCount=Math.max(0,Number(S.session&&S.session.session_id===sid&&S.session.message_count)||0);
       const appendedMessageCount=Math.max(0,currentMessageCount-previousMessageCount);
-      return Math.max(_INITIAL_MSG_LIMIT,loadedRenderableCount,loadedMessageCount+appendedMessageCount);
+      // Width that preserves everything currently on screen plus whatever was
+      // appended while we were away. `loadedMessageCount+appendedMessageCount`
+      // covers the untruncated case too: the whole conversation is loaded, so
+      // the tail window simply widens by the new rows.
+      const desired=Math.max(_INITIAL_MSG_LIMIT,loadedRenderableCount,loadedMessageCount+appendedMessageCount);
+      // Anti-shrink invariant (#6154): the caller drops the msg_limit param
+      // whenever the requested width exceeds the server ceiling, because the
+      // backend would clamp it and silently replace already-loaded older rows.
+      // But dropping the param means refetching the ENTIRE transcript — 11 MB /
+      // 2.2 s on a 9.5k-message session — just to surface the one or two
+      // messages that arrived while the tab was hidden, which is the ordinary
+      // return-from-background path (visibilitychange/focus -> loadSession
+      // {force:true}).
+      //
+      // Clamp to the ceiling instead, and only give up the window when even the
+      // ceiling would drop rows that are currently rendered. `minSafeWidth` is
+      // what must survive; when the ceiling can hold it, a clamped window is
+      // both correct and bounded. Fail closed toward correctness: if the view
+      // is genuinely wider than any single server window, keep the old
+      // full-transcript path.
+      const ceiling=Math.max(0,Number(_msgLimitMax)||0);
+      if(ceiling>0 && desired>ceiling){
+        const minSafeWidth=Math.max(loadedRenderableCount,loadedMessageCount);
+        if(minSafeWidth>ceiling) return null;
+        return ceiling;
+      }
+      return desired;
     }
   }
   // Small first-paint tail (latest conclusion + latest user message); older
@@ -3463,15 +3494,13 @@ async function _ensureMessagesLoaded(sid, opts) {
     return;
   }
   // Fetch session messages with a tail window for fast initial load.
+  // _messageReloadLimitForSession() owns the ceiling decision (clamp when the
+  // visible transcript still fits in one server window, null only when it does
+  // not) — see the anti-shrink note there. A second ceiling test here would
+  // re-introduce the full-transcript fallback it deliberately avoids, so this
+  // only rejects a nonsensical width.
   const reloadLimit = _messageReloadLimitForSession(sid); // defaults to _INITIAL_MSG_LIMIT
-  // A reload window above the server's msg_limit ceiling would be clamped by
-  // the backend (returning only the last _MSG_LIMIT_MAX rows), which can
-  // silently SHRINK an already-loaded transcript that had more than the ceiling
-  // of rows visible (rows 400–999 replaced by 500–999). When the requested
-  // window exceeds the ceiling, fall back to the bare full-transcript request
-  // (no msg_limit / no expand_renderable) so a same-session refresh never drops
-  // already-loaded older rows (Codex gate #6154, silent row-loss).
-  const boundedReloadLimit = (reloadLimit && reloadLimit <= _msgLimitMax) ? reloadLimit : null;
+  const boundedReloadLimit = (reloadLimit && reloadLimit > 0) ? reloadLimit : null;
   const reloadLimitParam = boundedReloadLimit ? `&msg_limit=${boundedReloadLimit}` : '';
   // Older frontends used expand_renderable=1 to request visible-row expansion.
   // The server now counts msg_limit by visible transcript rows by default; keep
