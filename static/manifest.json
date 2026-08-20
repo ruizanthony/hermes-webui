@@ -6,7 +6,7 @@
   "start_url": "./?source=pwa",
   "scope": "./",
   "display": "standalone",
-  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "display_override": ["tabbed", "window-controls-overlay", "standalone", "minimal-ui"],
   "background_color": "#0D0D1A",
   "theme_color": "#0D0D1A",
   "orientation": "portrait-primary",
