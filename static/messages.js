@@ -1613,6 +1613,11 @@ async function send(){
 
   const activeSid=S.session.session_id;
   _sendInProgressSid=activeSid;
+  // Sending mutates this conversation server-side. Invalidate before the turn
+  // starts, not only when it ends: an aborted or failed send still appended
+  // the user message, and a cached payload captured before it would paint a
+  // transcript with the user's own message missing.
+  if(typeof invalidateSessionNavCache==='function') invalidateSessionNavCache(activeSid);
 
   // Salvage of #4750 (@harryazj): capture the composer text and clear the
   // textarea NOW — immediately after capture and BEFORE the uploadPendingFiles()
@@ -2015,6 +2020,10 @@ function closeLiveStream(sessionId, streamId, source){
   // thinking/tool content (only the elapsed clock survives). Capturing here
   // guarantees switch-back restores the exact state shown at switch-away. (#3668)
   if(typeof snapshotLiveTurnHtmlForSession==='function') snapshotLiveTurnHtmlForSession(sessionId);
+  // The server keeps generating after we detach. Whatever nav payload we hold
+  // for this conversation is therefore about to be outdated by a turn we are
+  // no longer watching; drop it so the next switch re-reads real state.
+  if(typeof invalidateSessionNavCache==='function') invalidateSessionNavCache(sessionId);
   // Stop the live footer timer/status for the pane that is being detached; the
   // reattach path will rebuild it from INFLIGHT/server state if the user returns.
   if(typeof _clearLiveRunStatusTimer==='function') _clearLiveRunStatusTimer(sessionId);
@@ -2469,6 +2478,10 @@ function attachLiveStream(attachSid, streamId, uploaded=[], options={}){
     if(_isActiveSession() && S.activeStreamId!==streamId) return;
     delete INFLIGHT[activeSid];
     clearInflightState(activeSid);
+    // The turn just changed this conversation's transcript on the server. Any
+    // cached nav payload for it now predates the new turn, so serving it on a
+    // later switch would paint a conversation missing its newest reply.
+    if(typeof invalidateSessionNavCache==='function') invalidateSessionNavCache(activeSid);
     _clearActivePaneInflightIfOwner();
     _resumeSessionStreamAfterLiveChat(activeSid);
   }
@@ -6030,12 +6043,20 @@ function attachLiveStream(attachSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('tool',e=>{
       if(_terminalStateReached||_streamFinalized) return;
-      if(!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
+      if(!_ownsActiveStreamOrBackground()) return;
       const d=JSON.parse(e.data);
       if(d.name==='clarify') return;
       _completeAutomaticCompressionOnLiveProgress(activeSid);
+      // Record into INFLIGHT BEFORE the "is this pane visible" test. Bailing
+      // out first — as this handler used to — silently dropped every tool card
+      // of a conversation the user had switched away from, so returning to it
+      // showed prose with holes where the tool work happened and forced a full
+      // journal replay to reconstruct it. The prose handlers already accumulate
+      // unconditionally; tools must behave the same way for a backgrounded
+      // conversation to stay complete in memory. (#fastnav-bg-tools)
       const tc=upsertLiveToolCall(d,'start');
       if(!tc) return;
+      if(!S.session||S.session.session_id!==activeSid) return;   // recorded; nothing to paint
       const pendingDisplayTextBeforeTool=segmentStart===0
         ? (_parseStreamState().displayText||'')
         : _stripXmlToolCalls(assistantText.slice(segmentStart));
@@ -6066,19 +6087,24 @@ function attachLiveStream(attachSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('tool_complete',e=>{
       if(_terminalStateReached||_streamFinalized) return;
-      if(!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
+      if(!_ownsActiveStreamOrBackground()) return;
       const d=JSON.parse(e.data);
       if(d.name==='clarify') return;
       _completeAutomaticCompressionOnLiveProgress(activeSid);
+      // Same ordering rule as the 'tool' handler: record the completion into
+      // INFLIGHT before testing visibility. Dropping it for a backgrounded
+      // conversation left its recorded tool card pinned in the "running" state
+      // forever, which is worse than not recording it at all. (#fastnav-bg-tools)
       const tc=upsertLiveToolCall(d,'complete');
       if(!tc) return;
       tc.is_error=!!d.is_error;
+      if(typeof noteWorkspaceMutationsFromToolCall==='function') noteWorkspaceMutationsFromToolCall(tc);
+      if(!S.session||S.session.session_id!==activeSid) return;   // recorded; nothing to paint
       const pendingDisplayTextBeforeComplete=segmentStart===0
         ? (_parseStreamState().displayText||'')
         : _stripXmlToolCalls(assistantText.slice(segmentStart));
       if(String(pendingDisplayTextBeforeComplete||'').trim()) _upsertAnchorProcessProse(pendingDisplayTextBeforeComplete,{sealed:true});
       _applyToAnchor('tool_complete',{...d,...tc,is_error:!!d.is_error},e);
-      if(typeof noteWorkspaceMutationsFromToolCall==='function') noteWorkspaceMutationsFromToolCall(tc);
       if(S.session&&S.session.session_id===activeSid&&typeof scheduleRenderSessionArtifacts==='function') scheduleRenderSessionArtifacts();
       if(!S.session||S.session.session_id!==activeSid) return;
       _maybeNotifyPersistentStateSaved(tc);

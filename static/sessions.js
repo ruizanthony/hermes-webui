@@ -3236,9 +3236,45 @@ function _syncToolCallsForLoadedMessages(messages, sessionToolCalls){
 //     (e.g. the same-session force-reload hint) misses the cache and fetches
 //     normally, exactly as before.
 // ============================================================================
+// Cache sizing — deliberately coupled to the live-stream pool, not a separate
+// magic number. The pool is what decides how many conversations the operator
+// is actually piloting at once (see _liveStreamPoolMax in messages.js); a nav
+// cache smaller than that budget guarantees the least-recently-used of those
+// conversations pays a full round-trip on switch-back, which is exactly the
+// "switching is slow" symptom the pool was raised to remove. Falling back to
+// the previous literal keeps this file standalone if messages.js is absent
+// (test harnesses load these modules independently).
+const _SESSION_NAV_CACHE_FALLBACK_MAX = 6;
+function _sessionNavCacheMax(){
+  try{
+    if(typeof _liveStreamPoolMax==='function'){
+      const n=Number(_liveStreamPoolMax());
+      if(Number.isFinite(n)&&n>0) return n;
+    }
+  }catch(_){}
+  return _SESSION_NAV_CACHE_FALLBACK_MAX;
+}
+
+// Freshness policy. Two different questions, deliberately two different TTLs:
+//
+//   * _SESSION_NAV_CACHE_TTL_MS — how long a payload may be served WITHOUT
+//     revalidation. Short, because a conversation that changed server-side
+//     must not be shown as authoritative from cache.
+//   * _SESSION_NAV_CACHE_MAX_AGE_MS — how long an entry may be served AT ALL,
+//     as an instant first paint that is simultaneously revalidated against the
+//     server (stale-while-revalidate). This is what makes switching back to a
+//     conversation feel instant instead of costing a round-trip.
+//
+// A stale entry is never treated as truth: _apiSessionNav re-issues the
+// request and the caller swaps in the authoritative transcript when it lands.
 const _SESSION_NAV_CACHE_TTL_MS = 20000;
-const _SESSION_NAV_CACHE_MAX = 6;
-const _sessionNavCache = new Map(); // sid -> {at:number, urls:Map<string,Promise>}
+const _SESSION_NAV_CACHE_MAX_AGE_MS = 15 * 60 * 1000;
+// sid -> {at:number, urls:Map<string,Promise>, results:Map<string,any>}
+// `urls` holds in-flight promises (single-use, consumed by the click that
+// races the prefetch). `results` holds settled payloads and is NOT consumed on
+// read: returning to a conversation repeatedly must stay instant, which the
+// original single-use-only design could not do.
+const _sessionNavCache = new Map();
 
 function _sessionNavRowIsStreaming(sid){
   try{
@@ -3251,7 +3287,8 @@ function _sessionNavRowIsStreaming(sid){
 function _sessionNavCacheTouch(sid, entry){
   _sessionNavCache.delete(sid);
   _sessionNavCache.set(sid, entry);
-  while(_sessionNavCache.size > _SESSION_NAV_CACHE_MAX){
+  const max=_sessionNavCacheMax();
+  while(_sessionNavCache.size > max){
     const oldest=_sessionNavCache.keys().next().value;
     _sessionNavCache.delete(oldest);
   }
@@ -3268,29 +3305,129 @@ function _prefetchSessionForNav(sid){
   // Mirror the exact URLs loadSession()/_ensureMessagesLoaded() request so a
   // later click awaits the same promise instead of re-fetching.
   const urls=new Map();
-  urls.set(`${base}&messages=0&resolve_model=0`,
-    api(`${base}&messages=0&resolve_model=0`));
-  urls.set(`${base}&messages=1&resolve_model=0&msg_limit=${_INITIAL_TAIL_MSG_LIMIT}&expand_renderable=1`,
-    api(`${base}&messages=1&resolve_model=0&msg_limit=${_INITIAL_TAIL_MSG_LIMIT}&expand_renderable=1`, {timeoutMs:120000}));
+  const results=new Map();
+  const metaUrl=`${base}&messages=0&resolve_model=0`;
+  const tailUrl=`${base}&messages=1&resolve_model=0&msg_limit=${_INITIAL_TAIL_MSG_LIMIT}&expand_renderable=1`;
+  urls.set(metaUrl, api(metaUrl));
+  urls.set(tailUrl, api(tailUrl, {timeoutMs:120000}));
+  // Retain each settled payload so a LATER return to this conversation can
+  // paint instantly instead of re-fetching. Without this the cache only ever
+  // helped the single click that raced the prefetch.
+  for(const [u,p] of urls){
+    p.then((data)=>{ if(data!==undefined) results.set(u,data); }).catch(()=>{});
+  }
   // A rejected prefetch must not surface as an unhandled rejection: the real
   // load path re-fetches on cache miss and reports its own errors.
   for(const p of urls.values()){ p.catch(()=>{ _sessionNavCache.delete(sid); }); }
-  _sessionNavCacheTouch(sid, {at:now, urls});
+  _sessionNavCacheTouch(sid, {at:now, urls, results});
 }
 
+// Record an authoritative payload the normal (non-prefetch) load path fetched,
+// so the NEXT visit to this conversation can paint from cache. Without this,
+// only hover/keyboard-prefetched conversations were ever cached, and the very
+// conversations the operator switches between most — the ones opened by a
+// direct click — kept paying a full round-trip every time.
+function _sessionNavCacheStore(sid, url, data){
+  if(!sid||!url||data===undefined||data===null) return;
+  if(_sessionNavRowIsStreaming(sid)) return;   // live turn: SSE owns freshness
+  const now=Date.now();
+  const existing=_sessionNavCache.get(sid);
+  const entry=existing||{at:now, urls:new Map(), results:new Map()};
+  if(!(entry.results instanceof Map)) entry.results=new Map();
+  entry.results.set(url, data);
+  entry.at=now;
+  _sessionNavCacheTouch(sid, entry);
+}
+
+// ---------------------------------------------------------------------------
+// Nav-cache invalidation.
+//
+// The cache may only ever be a latency optimization, never a source of truth.
+// Any event that mutates a conversation server-side must drop its entry, or a
+// later switch would paint a transcript missing the newest turn. The mutation
+// points are: sending a message, a live turn finishing, and a stream being
+// detached (the turn keeps running on the server after we stop listening).
+//
+// Cross-tab: with several Chrome tabs open on the same WebUI, a mutation in
+// tab B must invalidate tab A's cache too — otherwise A keeps painting a
+// transcript that B has already moved past. Nothing in this app synchronized
+// session state across tabs before, so the channel is created here. It is
+// strictly an invalidation signal: no payload is ever shared between tabs.
+// ---------------------------------------------------------------------------
+const _SESSION_NAV_SYNC_CHANNEL = 'hermes-webui-session-nav';
+let _sessionNavSyncChan = null;
+try{
+  if(typeof BroadcastChannel!=='undefined'){
+    _sessionNavSyncChan = new BroadcastChannel(_SESSION_NAV_SYNC_CHANNEL);
+    _sessionNavSyncChan.onmessage = (ev)=>{
+      const sid = ev && ev.data && ev.data.sid;
+      if(sid) _sessionNavCache.delete(String(sid));
+      else if(ev && ev.data && ev.data.all) _sessionNavCache.clear();
+    };
+  }
+}catch(_){ _sessionNavSyncChan = null; }
+
+function invalidateSessionNavCache(sid){
+  // Local first: correctness in THIS tab must not depend on the channel
+  // existing (Safari private mode, older engines, or a failed construction
+  // all leave _sessionNavSyncChan null).
+  if(sid) _sessionNavCache.delete(String(sid));
+  else _sessionNavCache.clear();
+  try{
+    if(_sessionNavSyncChan){
+      _sessionNavSyncChan.postMessage(sid?{sid:String(sid)}:{all:true});
+    }
+  }catch(_){}
+}
+if(typeof window!=='undefined') window.invalidateSessionNavCache=invalidateSessionNavCache;
+
 function _apiSessionNav(sid, url, apiOpts){
-  // Consume a fresh prefetched promise for this exact URL when available;
-  // otherwise fall through to a normal api() call (identical behavior to the
-  // pre-#fastnav code path).
+  // Resolution order, from strongest freshness guarantee to weakest:
+  //
+  //   1. a live turn on this row  -> never serve cache; SSE owns freshness.
+  //   2. an in-flight prefetch    -> await it (single-use; it IS a fresh fetch).
+  //   3. a settled payload within the revalidation TTL -> return as-is.
+  //   4. a settled payload older than the TTL but under MAX_AGE -> return it
+  //      for an instant paint AND re-fetch in the background so the cache is
+  //      authoritative for the next visit (stale-while-revalidate).
+  //   5. anything else            -> normal api() call, exactly as before.
+  //
+  // Case 4 is the one that makes switching back feel instant. It is safe only
+  // because the entry is dropped the moment the row is streaming (case 1) and
+  // because the background refresh keeps the stored payload converging on the
+  // server's state rather than pinning a snapshot.
+  if(_sessionNavRowIsStreaming(sid)){
+    _sessionNavCache.delete(sid);
+    return api(url, apiOpts);
+  }
   const entry=_sessionNavCache.get(sid);
-  if(entry && (Date.now()-entry.at)<_SESSION_NAV_CACHE_TTL_MS && !_sessionNavRowIsStreaming(sid)){
-    const p=entry.urls.get(url);
-    if(p){
-      entry.urls.delete(url); // single-use: later reloads must re-read fresh state
+  if(entry){
+    const age=Date.now()-entry.at;
+    const p=entry.urls && entry.urls.get(url);
+    if(p && age<_SESSION_NAV_CACHE_TTL_MS){
+      entry.urls.delete(url); // single-use: a promise can only be awaited as "fresh" once
       return p;
     }
+    const cached=entry.results && entry.results.get(url);
+    if(cached!==undefined){
+      if(age<_SESSION_NAV_CACHE_TTL_MS) return Promise.resolve(cached);
+      if(age<_SESSION_NAV_CACHE_MAX_AGE_MS){
+        // Serve now, revalidate behind. Failure of the background refresh must
+        // not reject into the caller: it already has a usable payload, and the
+        // next miss re-fetches normally.
+        api(url, apiOpts).then((fresh)=>{
+          if(fresh!==undefined) _sessionNavCacheStore(sid, url, fresh);
+        }).catch(()=>{ _sessionNavCache.delete(sid); });
+        return Promise.resolve(cached);
+      }
+      _sessionNavCache.delete(sid); // beyond max age: too stale to paint at all
+    }
   }
-  return api(url, apiOpts);
+  // Cache miss: fetch normally and remember the result so the NEXT visit to
+  // this conversation is instant.
+  const req=api(url, apiOpts);
+  req.then((data)=>{ if(data!==undefined) _sessionNavCacheStore(sid, url, data); }).catch(()=>{});
+  return req;
 }
 
 async function _ensureMessagesLoaded(sid, opts) {
@@ -9236,6 +9373,18 @@ function renderSessionListFromCache(){
       if(e.pointerType==='touch') return;
       if(typeof _prefetchSessionForNav==='function') _prefetchSessionForNav(s.session_id);
     };
+    // Touch has no hover, so the pointerenter warm-up above never fires in the
+    // PWA — the exact environment where switching felt slowest. pointerdown is
+    // the touch equivalent: it lands on finger contact, tens to hundreds of
+    // milliseconds before the tap is released and the click is dispatched, and
+    // that gap is enough to overlap both round-trips with the user's own
+    // gesture. Warming on a press that turns out to be a swipe (archive/delete)
+    // or a long-press only costs a cached GET that is discarded on the next
+    // mutation; it never commits navigation on its own.
+    el.addEventListener('pointerdown',(e)=>{
+      if(e.pointerType!=='touch') return;   // mouse/pen already warmed on enter
+      if(typeof _prefetchSessionForNav==='function') _prefetchSessionForNav(s.session_id);
+    },{passive:true});
     el.onpointercancel=(e)=>{
       if(e.pointerType==='touch') return;
       _clearPointerDragState();

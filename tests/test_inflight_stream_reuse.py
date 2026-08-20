@@ -228,13 +228,26 @@ def test_load_session_preserves_existing_worklog_content_without_destructive_fal
 
 
 def test_tool_events_are_guarded_against_stale_session_and_stream():
-    """Delayed tool events from an old EventSource must not mutate the current session DOM."""
+    """Delayed tool events from an old EventSource must not mutate the current session DOM.
+
+    The stale-stream guard is now expressed through the shared
+    `_ownsActiveStreamOrBackground()` helper rather than an inline
+    `S.activeStreamId!==streamId` comparison. The guarantee is unchanged for a
+    VISIBLE pane — that helper still requires `S.activeStreamId===streamId`
+    when the session is active — but a BACKGROUNDED conversation is now allowed
+    to keep recording its tool calls into INFLIGHT instead of dropping them
+    (#fastnav-bg-tools). Painting remains gated on the pane being visible.
+    """
     tool_handler = MESSAGES_JS.split("source.addEventListener('tool',e=>{", 1)[1].split("source.addEventListener('tool_complete'", 1)[0]
     complete_handler = MESSAGES_JS.split("source.addEventListener('tool_complete',e=>{", 1)[1].split("source.addEventListener('approval'", 1)[0]
+    guard = _function_body(MESSAGES_JS, "_ownsActiveStreamOrBackground")
+    assert "S.activeStreamId===streamId" in re.sub(r"\s+", "", guard), (
+        "the shared guard must still pin the active pane to its own stream"
+    )
     for handler in (tool_handler, complete_handler):
         assert "_terminalStateReached||_streamFinalized" in handler
         assert "S.session.session_id!==activeSid" in handler
-        assert "S.activeStreamId!==streamId" in handler
+        assert "_ownsActiveStreamOrBackground()" in handler
         assert "appendLiveToolCard(tc,{sessionId:activeSid,streamId})" in handler
 
 
