@@ -1,5 +1,8 @@
 # Focused static coverage for the workspace-panel Context tab and the
 # "Goal finish" button (feature: context brief in the workspace panel).
+import json
+import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,12 +55,31 @@ def test_context_tab_hides_file_chrome_via_css():
 def test_goal_finish_button_and_handler():
     assert PANELS.count("context_goal_finish") >= 2  # both llm variants
     assert "async function _contextBriefGoalFinish(btn)" in PANELS
-    assert "'/api/goal'" in PANELS
+    assert "async function _hydrateContextBriefGoalFinish(sid, goalText)" in PANELS
+    assert "await cmdGoal(goalText)" in PANELS
     assert "it.status === 'pending' || it.status === 'in_progress'" in PANELS
     # non-blocking app dialog, never the browser-native confirm
     assert "showConfirmDialog({" in PANELS
     assert "window.confirm" not in PANELS
     assert "context_goal_finish_none" in PANELS
+
+
+def _goal_finish_handler_body() -> str:
+    return PANELS.split("async function _contextBriefGoalFinish", 1)[1].split(
+        "\nasync function _pollContextBriefJob", 1
+    )[0]
+
+
+def test_goal_finish_hydrates_via_cmd_goal_not_raw_post():
+    # Raw POST /api/goal starts the server turn but leaves the open tab idle
+    # until reload. Goal finish must reuse composer cmdGoal so SSE attaches.
+    body = _goal_finish_handler_body()
+    assert "await _hydrateContextBriefGoalFinish(sid, goalText)" in body
+    assert "await cmdGoal(goalText)" in body
+    assert "api('/api/goal'" not in body
+    assert "role:'user'" in body
+    assert "content:goalText" in body
+    assert "renderMessages()" in body
 
 
 def test_goal_finish_guards_stale_session():
@@ -98,3 +120,69 @@ def test_stale_badge_has_inline_refresh_button():
     assert "llm.stale ? `<button" in PANELS
     assert "${staleBadge}${staleRefresh}" in PANELS
     assert ".ctx-brief-btn-inline" in STYLE
+
+
+def _extract_hydrate_fn() -> str:
+    start = PANELS.index("async function _hydrateContextBriefGoalFinish")
+    end = PANELS.index("\nasync function _pollContextBriefJob")
+    return PANELS[start:end]
+
+
+def test_hydrate_context_brief_goal_finish_echoes_prompt_and_calls_cmd_goal():
+    fn_src = _extract_hydrate_fn()
+    script = f"""
+const vm = require('vm');
+const fnSrc = {json.dumps(fn_src)};
+const calls = [];
+const S = {{ session: {{ session_id: 'sid-1' }}, messages: [] }};
+const ctx = {{
+  S,
+  Date,
+  cmdGoal: async (args) => {{ calls.push({{cmd: 'cmdGoal', args}}); }},
+  renderMessages: () => {{ calls.push({{cmd: 'renderMessages'}}); }},
+  showToast: (msg) => {{ calls.push({{cmd: 'toast', msg}}); }},
+  t: (key) => key,
+}};
+vm.createContext(ctx);
+vm.runInContext(fnSrc, ctx);
+(async () => {{
+  const ok = await vm.runInContext(
+    `_hydrateContextBriefGoalFinish('sid-1', 'Finish remaining work')`,
+    ctx
+  );
+  const skipped = await vm.runInContext(
+    `_hydrateContextBriefGoalFinish('other-sid', 'should not echo')`,
+    ctx
+  );
+  process.stdout.write(JSON.stringify({{
+    ok, skipped,
+    messages: S.messages,
+    calls,
+  }}));
+}})().catch((err) => {{
+  console.error(err && err.stack || err);
+  process.exit(1);
+}});
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as handle:
+        handle.write(script)
+        script_path = Path(handle.name)
+    try:
+        proc = subprocess.run(
+            ["node", str(script_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+    finally:
+        script_path.unlink(missing_ok=True)
+    result = json.loads(proc.stdout)
+    assert result["ok"] is True
+    assert result["skipped"] is True
+    assert result["messages"][0]["role"] == "user"
+    assert result["messages"][0]["content"] == "Finish remaining work"
+    assert result["calls"][0]["cmd"] == "renderMessages"
+    assert result["calls"][1] == {"cmd": "cmdGoal", "args": "Finish remaining work"}
+    assert result["calls"][2] == {"cmd": "cmdGoal", "args": "should not echo"}
+    assert len(result["messages"]) == 1

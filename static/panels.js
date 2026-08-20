@@ -4147,15 +4147,28 @@ async function _contextBriefGoalFinish(btn){
     focusCancel: true,
   });
   if (!ok) return;
+  // A raw POST /api/goal starts the kickoff on the server but leaves this tab
+  // idle: no user bubble, no busy state, no SSE. Reload then hydrates via
+  // loadSession. Reuse cmdGoal (composer /goal) so the prompt and first
+  // tokens appear live without a refresh.
+  await _hydrateContextBriefGoalFinish(sid, goalText);
+}
+
+async function _hydrateContextBriefGoalFinish(sid, goalText){
+  if (typeof cmdGoal !== 'function') {
+    if (typeof showToast === 'function') showToast(t('context_brief_error'));
+    return false;
+  }
+  if (typeof S !== 'undefined' && S.session && S.session.session_id === sid && Array.isArray(S.messages)) {
+    S.messages.push({role:'user', content:goalText, _ts:Date.now()/1000});
+    if (typeof renderMessages === 'function') renderMessages();
+  }
   try {
-    const r = await api('/api/goal', {method:'POST', body: JSON.stringify({session_id: sid, args: goalText})});
-    if (r && r.ok){
-      if (typeof showToast === 'function') showToast(t('context_goal_finish_started'));
-    } else if (typeof showToast === 'function'){
-      showToast((r && r.error) || t('context_brief_error'));
-    }
-  } catch(e){
+    await cmdGoal(goalText);
+    return true;
+  } catch (e) {
     if (typeof showToast === 'function') showToast((e && e.message) || t('context_brief_error'));
+    return false;
   }
 }
 
