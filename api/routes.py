@@ -42,6 +42,7 @@ from api.agent_runtime import (
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     _looks_like_default_cli_title,
+    compression_lineage_member_ids,
     is_cli_session_row,
     is_cli_session_row_visible,
     open_state_db_readonly,
@@ -303,6 +304,86 @@ def _normalize_cron_job_ids(job_ids) -> list[str]:
         seen.add(jid)
         normalized.append(jid)
     return normalized
+
+
+def _apply_archive_to_compression_lineage(session_id: str, archived: bool) -> int:
+    """Mirror an archive/restore flag onto every segment of one lineage.
+
+    The sidebar collapses a chain of compression continuation segments into a
+    single representative row. Archiving only the clicked segment let the next
+    segment take its place on the following render, which the user experiences
+    as "the archive button does nothing".
+
+    Returns the number of sibling segments updated (excluding ``session_id``,
+    which the caller already persisted). Never raises: the clicked session is
+    archived by the caller first, so a lineage-resolution failure degrades to
+    the previous single-session behaviour instead of failing the request.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return 0
+    try:
+        from api.models import _active_state_db_path
+
+        db_path = _active_state_db_path()
+        if not db_path or not Path(db_path).exists():
+            return 0
+        rows_by_id: dict[str, dict] = {}
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            cols = {row[1] for row in cur.fetchall()}
+            if "id" not in cols or "parent_session_id" not in cols:
+                return 0
+            wanted = [
+                c
+                for c in (
+                    "id",
+                    "parent_session_id",
+                    "source",
+                    "end_reason",
+                    "ended_at",
+                    "started_at",
+                    "session_source",
+                )
+                if c in cols
+            ]
+            cur.execute(f"SELECT {', '.join(wanted)} FROM sessions")
+            for row in cur.fetchall():
+                record = {key: row[key] for key in wanted}
+                rid = str(record.get("id") or "")
+                if rid:
+                    rows_by_id[rid] = record
+        if sid not in rows_by_id:
+            return 0
+        members = compression_lineage_member_ids(rows_by_id, sid)
+    except Exception:
+        logger.debug("archive lineage resolution failed for %s", sid, exc_info=True)
+        return 0
+
+    updated = 0
+    for member_id in sorted(members):
+        if member_id == sid:
+            continue
+        try:
+            member = _get_or_materialize_session(member_id)
+        except (KeyError, PermissionError):
+            continue
+        except Exception:
+            logger.debug("archive lineage load failed for %s", member_id, exc_info=True)
+            continue
+        try:
+            if bool(getattr(member, "archived", False)) == archived:
+                continue
+            with _get_session_agent_lock(member_id):
+                member.archived = archived
+                member.save(touch_updated_at=False)
+            updated += 1
+        except Exception:
+            logger.debug("archive lineage save failed for %s", member_id, exc_info=True)
+            continue
+    return updated
 
 
 def _latest_cron_session_info_for_jobs(
@@ -16890,6 +16971,17 @@ def handle_post(handler, parsed) -> bool:
         with _get_session_agent_lock(sid):
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)
+        # #5305 follow-up: the sidebar collapses a compression lineage into ONE
+        # representative row, but archiving only ever flipped the clicked
+        # segment. The next segment was then promoted as the new representative
+        # and the row reappeared — the user-visible "archive does nothing" bug.
+        # The code that DECIDES what to show and the code that ACTS must use the
+        # same resolved unit, so fan the flag out across the whole lineage.
+        # Fail closed: any resolution error still leaves the clicked session
+        # archived above; it must never turn into a silent no-op.
+        _apply_archive_to_compression_lineage(
+            sid, bool(body.get("archived", True))
+        )
         publish_session_list_changed(
             "session_archive",
             profile=getattr(s, "profile", None),

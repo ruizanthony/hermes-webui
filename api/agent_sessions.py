@@ -381,6 +381,62 @@ def _is_continuation_session(parent: dict | None, child: dict | None) -> bool:
     return False
 
 
+def compression_lineage_member_ids(
+    rows_by_id: dict[str, dict],
+    session_id: str | None,
+) -> set[str]:
+    """Return every session id belonging to ``session_id``'s collapsed lineage.
+
+    The sidebar collapses a chain of compression continuation segments into one
+    representative row (see ``_collapseSessionLineageForSidebar``). Any action
+    that operates on that visible row — archiving in particular — must apply to
+    the whole lineage, otherwise the next segment is promoted as the new
+    representative and the row reappears as if nothing happened.
+
+    Traversal walks both directions (ancestors and descendants) and only crosses
+    edges accepted by :func:`_is_continuation_session`, so delegated subagent
+    children and forks are never swept into the set. The walk is cycle-safe and
+    always returns at least the requested id, so callers can never silently
+    degrade to a no-op.
+    """
+    sid = str(session_id or '').strip()
+    if not sid:
+        return set()
+    members = {sid}
+    if not isinstance(rows_by_id, dict) or not rows_by_id:
+        return members
+
+    children_by_parent: dict[str, list[dict]] = {}
+    for row in rows_by_id.values():
+        if not isinstance(row, dict):
+            continue
+        parent_id = str(row.get('parent_session_id') or '').strip()
+        if parent_id:
+            children_by_parent.setdefault(parent_id, []).append(row)
+
+    pending = [sid]
+    while pending:
+        current_id = pending.pop()
+        current = rows_by_id.get(current_id)
+        if not isinstance(current, dict):
+            continue
+        parent_id = str(current.get('parent_session_id') or '').strip()
+        if parent_id and parent_id not in members:
+            parent = rows_by_id.get(parent_id)
+            if _is_continuation_session(parent, current):
+                members.add(parent_id)
+                pending.append(parent_id)
+        for child in children_by_parent.get(current_id, []):
+            child_id = str(child.get('id') or '').strip()
+            if not child_id or child_id in members:
+                continue
+            if not _is_continuation_session(current, child):
+                continue
+            members.add(child_id)
+            pending.append(child_id)
+    return members
+
+
 def _continuation_root_id(rows_by_id: dict[str, dict], session_id: str | None) -> str | None:
     """Return the visible lineage root for ``session_id`` by walking continuations."""
     if not session_id:
