@@ -26,6 +26,7 @@ The function under test is the real region extracted from static/messages.js and
 executed under node, matching tests/test_5306_subagent_sidebar_flicker.py.
 """
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -42,6 +43,22 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node not on PATH")
 @pytest.fixture(scope="session", autouse=True)
 def test_server():
     """This module only reads static source; it does not need the HTTP fixture."""
+
+
+def _source_const(name: str) -> int:
+    """Read an integer constant's value straight from static/messages.js.
+
+    Tests assert the pool's INVARIANTS (a multiplexed transport gets a wider
+    budget; the cap is enforced; unknown fails closed). Pinning the literal
+    numbers here would turn a deliberate capacity change into a test failure
+    that says nothing about correctness, so the numbers are sourced from the
+    implementation and only their relationships are asserted.
+    """
+    src = MESSAGES_JS_PATH.read_text(encoding="utf-8")
+    match = re.search(r"^const\s+" + re.escape(name) + r"\s*=\s*(\d+)\s*;", src, re.M)
+    if not match:
+        raise AssertionError(f"{name} not found in static/messages.js")
+    return int(match.group(1))
 
 
 def _run_node(source: str) -> str:
@@ -210,9 +227,23 @@ console.log(JSON.stringify({
 def test_multiplexed_transport_raises_the_cap():
     """On HTTP/2 the per-origin connection limit does not apply, so more
     conversations may stream at once. The browser reports the protocol it
-    negotiated with the first hop; the pool must honour it."""
+    negotiated with the first hop; the pool must honour it.
+
+    The expected cap is read from the source constant rather than hardcoded:
+    the invariant under test is "a multiplexed transport uses the wider
+    budget, and the pool never exceeds it", not one particular number.
+    """
+    multiplexed_cap = _source_const("LIVE_STREAM_POOL_MAX_MULTIPLEXED")
+    http1_cap = _source_const("LIVE_STREAM_POOL_MAX_HTTP1")
+    assert multiplexed_cap > http1_cap, (
+        "a multiplexed transport must allow strictly more concurrent streams "
+        "than the HTTP/1.1 connection budget"
+    )
+    # Offer more background streams than the cap so the assertion below proves
+    # the cap is enforced, not merely that every stream survived.
+    background = [f"b{i}" for i in range(multiplexed_cap + 3)]
     out = json.loads(_run_node(_pool_source("""
-for (const sid of ['b','c','d','e','f','g','h']) {
+for (const sid of %s) {
   LIVE_STREAMS[sid] = { streamId:'s'+sid };
   _touchLiveStreamUse(sid);
 }
@@ -221,10 +252,10 @@ closeOtherLiveStreams('a');
 console.log(JSON.stringify({
   open:Object.keys(LIVE_STREAMS).sort(), cap:_liveStreamPoolMax(),
 }));
-""", next_hop_protocol="h2")))
-    assert out["cap"] == 6
-    assert len(out["open"]) == 6
-    assert "a" in out["open"]
+""" % json.dumps(background), next_hop_protocol="h2")))
+    assert out["cap"] == multiplexed_cap
+    assert len(out["open"]) == multiplexed_cap
+    assert "a" in out["open"], "the viewed conversation must never be evicted"
 
 
 def test_http3_is_treated_as_multiplexed():
@@ -232,7 +263,7 @@ def test_http3_is_treated_as_multiplexed():
         "console.log(JSON.stringify({ cap:_liveStreamPoolMax() }));",
         next_hop_protocol="h3-29",
     )))
-    assert out["cap"] == 6
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_MULTIPLEXED")
 
 
 def test_unknown_transport_fails_closed_to_the_http1_budget():
@@ -245,8 +276,10 @@ def test_unknown_transport_fails_closed_to_the_http1_budget():
         "console.log(JSON.stringify({ first, second:_liveStreamPoolMax() }));",
         next_hop_protocol=None,
     )))
-    assert out["first"] == 3, "unknown transport must fail closed to HTTP/1.1"
-    assert out["second"] == 6, (
+    assert out["first"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1"), (
+        "unknown transport must fail closed to the HTTP/1.1 budget"
+    )
+    assert out["second"] == _source_const("LIVE_STREAM_POOL_MAX_MULTIPLEXED"), (
         "an unknown transport must not be cached: once navigation timing "
         "reports h2 the pool must widen"
     )

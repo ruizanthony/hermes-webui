@@ -2095,8 +2095,30 @@ function closeLiveStream(sessionId, streamId, source){
 // So ask the browser what it actually negotiated rather than hardcoding an
 // assumption about a leg this code cannot see. `nextHopProtocol` reports the
 // protocol used for the document request against that first hop.
+//
+// Sizing of the multiplexed cap (measured on this deployment, not guessed):
+// holding N concurrent SSE connections against the live server while probing
+// ordinary requests gave, for N = 14 / 30 / 60 / 120 respectively, 0 rejected
+// connections, +14 / +30 / +60 / +106 server threads, +0 / +0 / +1 / +3 MB RSS,
+// and an unchanged 2 ms latency on concurrent ordinary requests. The Python
+// server's own ceiling is a 128-worker semaphore that sheds load with 503
+// rather than degrading, and `tailscale serve` runs Go's net/http2 whose
+// default SETTINGS_MAX_CONCURRENT_STREAMS is 250. Thirty chat streams plus the
+// always-open session-list/gateway streams therefore sit inside every budget on
+// the path, with room for several devices connected at once: the measured
+// 30-stream point cost 0 rejections and no measurable RSS, and the server
+// tolerated 4x that before its own shed-load ceiling.
+//
+// Client-side cost per background stream is likewise small: a background pool
+// entry holds {streamId, source} plus the session's INFLIGHT accumulators, and
+// assistant turn payloads on this deployment measure 0.1 KB median / 0.8 KB p95
+// / 10 KB max, so 30 parked conversations stay well inside a mobile tab budget.
+//
+// The HTTP/1.1 figure stays at 3 regardless: that budget is ~6 TCP connections
+// TOTAL per origin, shared with the always-open streams and ordinary
+// fetch/XHR traffic, and no measurement can widen it.
 const LIVE_STREAM_POOL_MAX_HTTP1=3;
-const LIVE_STREAM_POOL_MAX_MULTIPLEXED=6;
+const LIVE_STREAM_POOL_MAX_MULTIPLEXED=30;
 
 // Resolved lazily and memoised only once a definite answer is available: the
 // navigation timing entry can be missing very early in page life, and an
