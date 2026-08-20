@@ -284,3 +284,77 @@ console.log(JSON.stringify(rows.map(r=>({sid:r.session_id, orphan:!!r._orphan_ch
         {"sid": "telegram_parent", "orphan": False},
         {"sid": "webui_tip", "orphan": True},
     ]
+
+
+def test_nested_delegated_subagent_child_is_suppressed_not_orphaned():
+    """#5305, nested-delegation dimension: a subagent that itself delegated.
+
+    ``_cross_surface_child_session`` is only stamped by the server when the
+    child's source DIFFERS from its parent's (api/agent_sessions.py). When a
+    delegate child's parent is ITSELF a subagent (nested delegation), both rows
+    are ``source='subagent'``, so the marker is never set and the #5305
+    suppression branch — which is gated on that marker — does not fire. The row
+    was promoted to a contextless top-level "Subagent Session" orphan: exactly
+    the state #5244/#5305 set out to remove, and view-only, so the user cannot
+    archive or dismiss it.
+
+    A delegated subagent child with no visible parent must be suppressed
+    regardless of whether its parent shares its source.
+    """
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + """
+global._showArchived = false;
+const collapsed = [];  // the subagent parent is not a visible sidebar row
+const raw = [
+  { session_id:'nested_subagent_child', title:'Subagent Session', parent_session_id:'subagent_parent', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', source_label:'Subagent', parent_source:'subagent', message_count:46 },
+];
+const rows = _attachChildSessionsToSidebarRows(collapsed, raw);
+console.log(JSON.stringify(rows.map(r=>({sid:r.session_id, orphan:!!r._orphan_child_session}))));
+"""
+    out = json.loads(_run_node(source))
+    assert out == []
+
+
+def test_non_subagent_child_of_absent_parent_still_orphans():
+    """Scope guard for the nested-delegation fix: suppression is keyed on the
+    delegated-subagent source, NOT on 'child_session with an absent parent'.
+
+    A same-source WebUI child row whose parent is missing from the render must
+    keep its existing top-level behaviour, otherwise the fix would silently
+    hide ordinary conversations.
+    """
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + """
+global._showArchived = false;
+const collapsed = [];
+const raw = [
+  { session_id:'webui_child', title:'Ordinary WebUI child', parent_session_id:'absent_parent', relationship_type:'child_session', raw_source:'webui', source_tag:'webui', session_source:'webui', message_count:5 },
+];
+const rows = _attachChildSessionsToSidebarRows(collapsed, raw);
+console.log(JSON.stringify(rows.map(r=>({sid:r.session_id, orphan:!!r._orphan_child_session}))));
+"""
+    out = json.loads(_run_node(source))
+    assert out == [{"sid": "webui_child", "orphan": True}]
+
+
+def test_nested_delegated_subagent_child_still_stacks_under_visible_parent():
+    """The nested-delegation suppression must not break attachment: when the
+    subagent parent IS a visible row, the nested child stacks under it."""
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + """
+global._showArchived = false;
+const collapsed = [{ session_id:'subagent_parent', title:'Subagent Session', raw_source:'subagent', source_tag:'subagent', session_source:'other', message_count:12 }];
+const raw = [
+  collapsed[0],
+  { session_id:'nested_subagent_child', title:'Subagent Session', parent_session_id:'subagent_parent', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', source_label:'Subagent', parent_source:'subagent', message_count:46 },
+];
+const rows = _attachChildSessionsToSidebarRows(collapsed, raw);
+const parent = rows.find(r=>r.session_id==='subagent_parent') || {};
+console.log(JSON.stringify({
+  topLevel: rows.map(r=>r.session_id),
+  childSids: (parent._child_sessions||[]).map(c=>c.session_id),
+}));
+"""
+    out = json.loads(_run_node(source))
+    assert out["topLevel"] == ["subagent_parent"]
+    assert out["childSids"] == ["nested_subagent_child"]

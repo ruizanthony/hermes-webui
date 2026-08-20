@@ -7447,7 +7447,22 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // trigger from archived to filtered-out. A cross-surface WebUI child of a
       // genuinely external (messaging/CLI) parent is handled by the parentIsExternal
       // branch above and still orphans as before.
-      if(child&&child._cross_surface_child_session&&_isChildSession(child)) continue;
+      //
+      // The `_cross_surface_child_session` marker alone under-covers this: the
+      // server only stamps it when the child's source DIFFERS from its parent's
+      // (api/agent_sessions.py). Under NESTED delegation — a subagent that
+      // itself delegated — parent and child are both `source='subagent'`, the
+      // marker is never set, and the row escaped to top level. Such a row is
+      // view-only (every mutation route refuses it), so the user cannot archive
+      // or dismiss it: it is stuck in the sidebar forever. Key the suppression
+      // on the delegated-subagent source too, so both the cross-surface and the
+      // same-source nested cases are covered, while ordinary same-source WebUI
+      // children with an absent parent keep their top-level behaviour.
+      // The source tag is the authoritative signal the server stamps from
+      // state.db `sessions.source`; the "Subagent Session" title is only a
+      // display fallback and must not be used to infer this.
+      const _childDelegatedSource=String((child&&(child.source_tag||child.raw_source))||'').trim().toLowerCase();
+      if(child&&_isChildSession(child)&&(child._cross_surface_child_session||_childDelegatedSource==='subagent')) continue;
       orphans.push({...child,_orphan_child_session:true});
     }
   }
