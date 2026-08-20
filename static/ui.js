@@ -661,9 +661,14 @@ function _computeSilentTurnHiddenIdxs(messages){
   for(let i=0;i<msgs.length;i++){
     const m=msgs[i];
     if(!m||typeof m!=='object') continue;
+    if(m._source==='process_wakeup'){
+      closeTurn();
+      turnStart=i;
+      turnAssistantIdxs=[];
+      continue;
+    }
     if(m.role==='user'){
       closeTurn();
-      if(m._source==='process_wakeup'){ turnStart=i; turnAssistantIdxs=[]; }
       continue;
     }
     if(m.role==='assistant'){
@@ -19832,6 +19837,7 @@ async function regenerateResponse(btn) {
   let lastUserText = '';
   for(let i = assistantIdx - 1; i >= 0; i--) {
     const m = S.messages[i];
+    if(m && m._source === 'process_wakeup') return;
     if(m && m.role === 'user') { lastUserText = msgContent(m); break; }
   }
   if(!lastUserText) return;

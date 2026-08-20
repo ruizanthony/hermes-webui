@@ -1114,16 +1114,38 @@ def scrub_internal_replay_fields(
     return result
 
 
+_STATE_DB_CONTENT_JSON_PREFIX = "\x00json:"
+
+
+def _decode_public_message_content(value):
+    """Decode Hermes structured content at the response boundary only."""
+    if not isinstance(value, str) or not value.startswith(_STATE_DB_CONTENT_JSON_PREFIX):
+        return value
+    try:
+        decoded = _json.loads(value[len(_STATE_DB_CONTENT_JSON_PREFIX):])
+        if isinstance(decoded, list):
+            return [_scrub_content_part(part) for part in decoded]
+        if isinstance(decoded, dict):
+            return _scrub_content_part(decoded)
+        return decoded
+    except (_json.JSONDecodeError, TypeError, RecursionError):
+        return value
+
+
 def _public_message_projection(message, *, _enabled: bool):
     """Return one public transcript message without internal replay fields."""
     message = scrub_internal_replay_fields([message], message_records=True)[0]
     if not isinstance(message, dict):
         return _redact_value(message, _enabled=_enabled)
+    decoded_content = _decode_public_message_content(message.get("content"))
+    is_process_wakeup = message.get("_source") == "process_wakeup"
     item = {}
-    allow_native_image = message.get("role") == "user"
+    allow_native_image = message.get("role") == "user" and not is_process_wakeup
     for key, value in message.items():
         if key in _PUBLIC_MESSAGE_INTERNAL_FIELDS:
             continue
+        if key == "content":
+            value = decoded_content
         if allow_native_image and key == "content" and isinstance(value, list):
             item[key] = [
                 _redact_message_content_part(part, _enabled=_enabled)
@@ -1131,6 +1153,8 @@ def _public_message_projection(message, *, _enabled: bool):
             ]
         else:
             item[key] = _redact_value(value, _enabled=_enabled)
+    if is_process_wakeup:
+        item["role"] = "event"
     return item
 
 
