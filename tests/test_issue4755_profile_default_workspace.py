@@ -130,7 +130,33 @@ def _new_session_driver(session_workspace: str, default_workspace: str, switch_w
 
 
 @node_test
-def test_new_session_prefers_profile_default_over_current_session_workspace():
+def test_new_session_prefers_current_session_workspace_over_profile_default():
+    """DIVERGENCE LOCALE ASSUMÉE vis-à-vis d'upstream #4755.
+
+    Upstream #4755 a fait gagner le "défaut de profil" sur le workspace de la conversation
+    courante. Sur cette installation, cette précédence produit l'effet inverse de son
+    intention, pour une raison structurelle :
+
+    ``api/workspace.py::get_profile_default_workspace()`` lit ``last_workspace.txt`` AVANT
+    la valeur configurée (lignes ~419-427), et pour le profil ``default`` ce fichier est le
+    fichier GLOBAL. Or ``set_last_workspace()`` le réécrit à chaque ``/api/chat/start`` et
+    ``/api/session/update`` de N'IMPORTE QUELLE conversation.
+
+    Donc ``S._profileDefaultWorkspace`` — hydraté depuis ``/api/profile/active`` — n'est pas
+    un défaut stable configuré : c'est un pointeur volatil partagé. « défaut de profil gagne
+    sur la conversation courante » devient en pratique « le dernier workspace utilisé par une
+    AUTRE conversation gagne sur la conversation où je suis ». Avec plusieurs conversations en
+    parallèle sur des workspaces différents (MES, Hermes WebUI, LABOPICHOT...), ouvrir une
+    nouvelle conversation depuis MES la créait sur le workspace d'une conversation tierce.
+
+    Décision locale (Anthony, 2026-08-20) : le workspace doit suivre la conversation.
+    Précédence retenue : bascule de profil one-shot → conversation courante → défaut de profil.
+    Le défaut de profil reste le repli de page blanche (#804/#5169) et n'est jamais consommé (#823).
+
+    ATTENTION mainteneur : ce test diverge volontairement d'upstream et entrera en conflit lors
+    d'une reprise de #4755. Ne pas le "réparer" en rétablissant l'ordre upstream sans traiter
+    d'abord la volatilité de ``get_profile_default_workspace()``.
+    """
     payload = _run_node(_new_session_driver(
         session_workspace="/current-workspace",
         default_workspace="/profile-default",
@@ -138,8 +164,25 @@ def test_new_session_prefers_profile_default_over_current_session_workspace():
     ))
 
     assert payload["captured"]["path"] == "/api/session/new"
-    assert payload["captured"]["body"]["workspace"] == "/profile-default"
+    assert payload["captured"]["body"]["workspace"] == "/current-workspace"
     assert payload["captured"]["body"]["prev_session_id"] == "previous-session"
+
+
+@node_test
+def test_new_session_blank_page_falls_back_to_profile_default():
+    """Sans conversation chargée, le défaut de profil reste le repli (#804/#5169)."""
+    driver = _new_session_driver(
+        session_workspace="/current-workspace",
+        default_workspace="/profile-default",
+        switch_workspace=None,
+    ).replace(
+        "session:{session_id:'previous-session',workspace:\"/current-workspace\"},",
+        "session:null,",
+    )
+    payload = _run_node(driver)
+
+    assert payload["captured"]["body"]["workspace"] == "/profile-default"
+
 
 
 @node_test
