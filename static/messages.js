@@ -2128,19 +2128,61 @@ function closeLiveStream(sessionId, streamId, source){
 // fetch/XHR traffic, and no measurement can widen it.
 const LIVE_STREAM_POOL_MAX_HTTP1=3;
 const LIVE_STREAM_POOL_MAX_MULTIPLEXED=30;
+let _liveStreamTransportUncertain=false;
 
-// Resolved lazily and memoised only once a definite answer is available: the
-// navigation timing entry can be missing very early in page life, and an
-// unknown transport must not be cached as if it were HTTP/1.1 forever.
-let _liveStreamPoolMaxCache=0;
+function _markLiveStreamTransportUncertain(){
+  if(_liveStreamTransportUncertain) return;
+  _liveStreamTransportUncertain=true;
+  // The replacement EventSource's transport is unknowable before it opens.
+  // Prune immediately and keep the HTTP/1.1-safe budget until the next reload.
+  const keepSid=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
+  closeOtherLiveStreams(keepSid);
+}
+
+if(typeof window!=='undefined'&&typeof window.addEventListener==='function'){
+  window.addEventListener('online', _markLiveStreamTransportUncertain);
+  window.addEventListener('pageshow', event=>{
+    if(event&&event.persisted) _markLiveStreamTransportUncertain();
+  });
+}
 
 function _liveStreamPoolMax(){
-  if(_liveStreamPoolMaxCache) return _liveStreamPoolMaxCache;
+  if(_liveStreamTransportUncertain) return LIVE_STREAM_POOL_MAX_HTTP1;
+  // Re-evaluate whenever the pool is arbitrated. A service-worker-controlled
+  // page can reconnect over a different transport without reloading, so a
+  // page-lifetime h2 verdict could later exhaust an HTTP/1.1 connection budget.
   let proto='';
   try{
     if(typeof performance!=='undefined'&&performance.getEntriesByType){
       const nav=performance.getEntriesByType('navigation');
       if(nav&&nav.length) proto=String(nav[0].nextHopProtocol||'');
+      // Navigation timing describes the page's initial transport. EventSources
+      // can reconnect later without a reload, while same-origin resource timing
+      // reflects a newer connection. Prefer that newest observation whenever it
+      // exists; it also covers service-worker navigations whose protocol is blank.
+      const here=(typeof location!=='undefined'&&location.origin)?location.origin:'';
+      if(here){
+        const res=performance.getEntriesByType('resource')||[];
+        for(let i=res.length-1;i>=0;i--){
+          const entry=res[i];
+          if(!entry||!entry.name) continue;
+          // Same-origin only: a third-party CDN negotiating h2 says nothing
+          // about the connection this app's streams actually use, and
+          // trusting it would OVER-size the pool. Compare parsed origins --
+          // a prefix test would accept "https://host.evil.com" for the
+          // origin "https://host".
+          let sameOrigin=false;
+          try{ sameOrigin=(new URL(entry.name,here)).origin===here; }
+          catch(_){ sameOrigin=false; }
+          if(!sameOrigin) continue;
+          // Entries are chronological and we scan newest-first. The newest
+          // same-origin observation is decisive even when its protocol is
+          // blank; in that case the caller fails closed instead of trusting an
+          // older h2 or h3 observation.
+          proto=String(entry.nextHopProtocol||'');
+          break;
+        }
+      }
     }
   }catch(_){ proto=''; }
   // Unknown transport: fail closed on the HTTP/1.1 budget and retry later
@@ -2149,10 +2191,9 @@ function _liveStreamPoolMax(){
   // h2 / h2c / h3 / h3-29… multiplex over one connection; everything else
   // (http/1.1, http/1.0, http/0.9) spends one connection per stream.
   const multiplexed=(proto==='h2'||proto==='h2c'||proto.slice(0,2)==='h3');
-  _liveStreamPoolMaxCache=multiplexed
+  return multiplexed
     ? LIVE_STREAM_POOL_MAX_MULTIPLEXED
     : LIVE_STREAM_POOL_MAX_HTTP1;
-  return _liveStreamPoolMaxCache;
 }
 // sid -> monotonically increasing use counter. Recency, not open order, decides
 // eviction: a conversation the user keeps visiting must outlive one they opened
@@ -2246,6 +2287,7 @@ function attachLiveStream(attachSid, streamId, uploaded=[], options={}){
   };
 
   const reconnecting=!!options.reconnecting;
+  if(reconnecting) _markLiveStreamTransportUncertain();
   const _extensionTurnStartedAt=(S.session&&S.session.session_id===activeSid&&Number.isFinite(S.session.pending_started_at))
     ?S.session.pending_started_at
     :Date.now()/1000;
@@ -5887,15 +5929,23 @@ function attachLiveStream(attachSid, streamId, uploaded=[], options={}){
     return true;
   }
 
-  function _wireSSE(source){
+  function _registerLiveStream(activeSid,streamId,source){
     const existingLive=LIVE_STREAMS[activeSid];
     if(existingLive&&existingLive.source&&existingLive.source!==source){
       try{if(existingLive.source.readyState!==2)existingLive.source.close();}catch(_){ }
     }
     LIVE_STREAMS[activeSid]={streamId,source};
-    // Register this stream's recency so the background pool evicts genuinely
-    // stale conversations rather than whichever key happens to sort first.
     if(typeof _touchLiveStreamUse==='function') _touchLiveStreamUse(activeSid);
+    // Registration follows asynchronous status/replay probes. Re-arbitrate
+    // AFTER publishing so concurrent late completions cannot exceed the budget.
+    const foregroundSid=(S&&S.session&&S.session.session_id)
+      ?String(S.session.session_id)
+      :activeSid;
+    closeOtherLiveStreams(foregroundSid);
+  }
+
+  function _wireSSE(source){
+    _registerLiveStream(activeSid,streamId,source);
     // Note on #631 Bug B: the original PR description stated the server
     // "replays buffered token events" on reconnect, and proposed resetting
     // the accumulators here so the re-sent tokens wouldn't double the prefix.
@@ -7182,6 +7232,7 @@ function attachLiveStream(attachSid, streamId, uploaded=[], options={}){
         _closeSource(source);
         return;
       }
+      _markLiveStreamTransportUncertain();
       if(typeof recordClientSSEError==='function') recordClientSSEError('chat-response',{ready_state:source?source.readyState:null,session_id:activeSid,stream_id:streamId,reason:'chat EventSource.onerror'});
       try{if(source&&source.readyState!==2)source.close();}catch(_){ }
       if(_deferStreamErrorIfOffline()) return;

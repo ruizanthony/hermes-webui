@@ -145,10 +145,12 @@ def _pool_source(scenario: str, next_hop_protocol: str | None = "http/1.1") -> s
           "extractConstValue('LIVE_STREAM_POOL_MAX_HTTP1');\n"
         + "globalThis.LIVE_STREAM_POOL_MAX_MULTIPLEXED = "
           "extractConstValue('LIVE_STREAM_POOL_MAX_MULTIPLEXED');\n"
-        + "globalThis._liveStreamPoolMaxCache = 0;\n"
+        + "globalThis._liveStreamTransportUncertain = false;\n"
         + "eval(extractFunc('_liveStreamPoolMax'));\n"
+        + "eval(extractFunc('_markLiveStreamTransportUncertain'));\n"
         + "eval(extractFunc('_touchLiveStreamUse'));\n"
         + "eval(extractFunc('closeOtherLiveStreams'));\n"
+        + "eval(extractFunc('_registerLiveStream'));\n"
         + scenario
     )
 
@@ -297,3 +299,223 @@ def test_eviction_uses_close_live_stream_for_snapshot_and_reattach():
     body = src[start:src.index("\n}", start)]
     assert "closeLiveStream(" in body
     assert ".close()" not in body, "must delegate teardown, not close the transport directly"
+
+
+# ---------------------------------------------------------------------------
+# Service-worker navigation entries report an EMPTY nextHopProtocol, which used
+# to pin an h2 origin to the HTTP/1.1 budget on every visit after the first.
+# ---------------------------------------------------------------------------
+
+def _sw_pool_source(
+    scenario: str,
+    resources,
+    origin: str = "https://webui.example.net",
+    nav_protocol: str = "",
+) -> str:
+    """Pool harness where navigation timing is service-worker blanked.
+
+    ``resources`` is a list of ``(url, nextHopProtocol)`` pairs, mirroring what
+    Resource Timing exposes for subresources the worker did not intercept.
+    """
+    entries = json.dumps([{"name": u, "nextHopProtocol": p} for u, p in resources])
+    perf = (
+        "globalThis.location = { origin: %s };\n"
+        "globalThis.performance = { getEntriesByType: (t) => "
+        "t === 'navigation' ? [{ nextHopProtocol: %s }] : "
+        "(t === 'resource' ? %s : []) };\n"
+    ) % (json.dumps(origin), json.dumps(nav_protocol), entries)
+    return (
+        _preamble()
+        + perf
+        + "globalThis.LIVE_STREAM_POOL_MAX_HTTP1 = "
+          "extractConstValue('LIVE_STREAM_POOL_MAX_HTTP1');\n"
+        + "globalThis.LIVE_STREAM_POOL_MAX_MULTIPLEXED = "
+          "extractConstValue('LIVE_STREAM_POOL_MAX_MULTIPLEXED');\n"
+        + "globalThis._liveStreamTransportUncertain = false;\n"
+        + "eval(extractFunc('_liveStreamPoolMax'));\n"
+        + scenario
+    )
+
+
+def test_service_worker_blanked_navigation_falls_back_to_resource_timing():
+    """The regression this fixes: an h2 origin behind a service worker.
+
+    The navigation entry reports '', so the pool used to fail closed to the
+    HTTP/1.1 budget forever -- which also shrank the nav cache sized off it.
+    """
+    out = json.loads(_run_node(_sw_pool_source(
+        "console.log(JSON.stringify({ cap:_liveStreamPoolMax() }));",
+        resources=[("https://webui.example.net/static/messages.js", "h2")],
+    )))
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_MULTIPLEXED")
+
+
+def test_resource_timing_fallback_respects_http1():
+    """The fallback must report what was negotiated, not assume multiplexing."""
+    out = json.loads(_run_node(_sw_pool_source(
+        "console.log(JSON.stringify({ cap:_liveStreamPoolMax() }));",
+        resources=[("https://webui.example.net/static/app.css", "http/1.1")],
+    )))
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1")
+
+
+def test_multiplexed_decision_is_revalidated_after_transport_change():
+    """A page-lifetime h2 verdict must not outlive a later HTTP/1.1 transport."""
+    out = json.loads(_run_node(_sw_pool_source(
+        "const first=_liveStreamPoolMax();\n"
+        "globalThis.performance = { getEntriesByType: (t) => "
+        "t === 'navigation' ? [{ nextHopProtocol: '' }] : "
+        "(t === 'resource' ? [{ name: 'https://webui.example.net/new.js', "
+        "nextHopProtocol: 'http/1.1' }] : []) };\n"
+        "console.log(JSON.stringify({ first, second:_liveStreamPoolMax() }));",
+        resources=[("https://webui.example.net/old.js", "h2")],
+    )))
+    assert out["first"] == _source_const("LIVE_STREAM_POOL_MAX_MULTIPLEXED")
+    assert out["second"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1")
+
+
+def test_transport_uncertainty_guard_is_fail_closed():
+    source = MESSAGES_JS_PATH.read_text(encoding="utf-8")
+    compact = re.sub(r"\s+", "", source)
+    assert "let_liveStreamTransportUncertain=false" in compact
+    assert "function_markLiveStreamTransportUncertain()" in compact
+    assert "if(_liveStreamTransportUncertain)returnLIVE_STREAM_POOL_MAX_HTTP1" in compact
+    assert "closeOtherLiveStreams(keepSid)" in compact
+    assert "addEventListener('online',_markLiveStreamTransportUncertain)" in compact
+    assert "event.persisted" in source
+
+
+def test_marking_transport_uncertain_prunes_immediately_and_locks_budget():
+    out = json.loads(_run_node(_pool_source("""
+globalThis.S={session:{session_id:'a'}};
+for (const sid of ['a','b','c','d']) {
+  LIVE_STREAMS[sid]={streamId:'s'+sid};
+  _touchLiveStreamUse(sid);
+}
+_markLiveStreamTransportUncertain();
+console.log(JSON.stringify({
+  cap:_liveStreamPoolMax(), open:Object.keys(LIVE_STREAMS).sort(),
+  closed:closed.slice().sort(), uncertain:_liveStreamTransportUncertain,
+}));
+""")))
+    assert out["uncertain"] is True
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1")
+    assert "a" in out["open"]
+    assert len(out["open"]) == out["cap"]
+    assert len(out["closed"]) == 1
+
+
+def test_late_stream_registrations_rearbitrate_and_keep_foreground():
+    out = json.loads(_run_node(_pool_source("""
+globalThis.S={session:{session_id:'front'}};
+LIVE_STREAMS.front={streamId:'s-front',source:{readyState:1,close(){}}};
+LIVE_STREAMS.b={streamId:'s-b',source:{readyState:1,close(){}}};
+LIVE_STREAMS.c={streamId:'s-c',source:{readyState:1,close(){}}};
+_touchLiveStreamUse('front'); _touchLiveStreamUse('b'); _touchLiveStreamUse('c');
+_registerLiveStream('late-1','s-late-1',{readyState:1,close(){}});
+_registerLiveStream('late-2','s-late-2',{readyState:1,close(){}});
+console.log(JSON.stringify({
+  cap:_liveStreamPoolMax(), open:Object.keys(LIVE_STREAMS).sort(),
+  closed:closed.slice().sort(),
+}));
+""")))
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1")
+    assert "front" in out["open"]
+    assert len(out["open"]) <= out["cap"]
+    assert len(out["closed"]) >= 2
+
+
+def test_newest_resource_overrides_stale_navigation_transport():
+    """Fresh same-origin timing must override an old nonblank navigation h2."""
+    out = json.loads(_run_node(_sw_pool_source(
+        "console.log(JSON.stringify({ cap:_liveStreamPoolMax() }));",
+        resources=[("https://webui.example.net/new.js", "http/1.1")],
+        nav_protocol="h2",
+    )))
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1")
+
+
+def test_cross_origin_resources_must_not_widen_the_pool():
+    """A third-party CDN on h2 says nothing about this origin's connection.
+
+    Trusting it would OVER-size the pool against an HTTP/1.1 origin, which is
+    the failure mode the same-origin filter exists to prevent.
+    """
+    out = json.loads(_run_node(_sw_pool_source(
+        "console.log(JSON.stringify({ cap:_liveStreamPoolMax() }));",
+        resources=[
+            ("https://cdn.example.com/lib.js", "h2"),
+            ("https://fonts.example.org/f.woff2", "h3"),
+        ],
+    )))
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1"), (
+        "cross-origin nextHopProtocol must never size this origin's pool"
+    )
+
+
+def test_origin_prefix_match_is_not_fooled_by_lookalike_host():
+    """'https://webui.example.net.evil.com/...' must not count as same-origin."""
+    out = json.loads(_run_node(_sw_pool_source(
+        "console.log(JSON.stringify({ cap:_liveStreamPoolMax() }));",
+        resources=[("https://webui.example.net.evil.com/x.js", "h2")],
+    )))
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1")
+
+
+def test_blank_resource_protocols_still_fail_closed():
+    """Cached/blocked resources report ''. No signal must stay fail-closed."""
+    out = json.loads(_run_node(_sw_pool_source(
+        "const first=_liveStreamPoolMax();\n"
+        "console.log(JSON.stringify({ first }));",
+        resources=[
+            ("https://webui.example.net/a.js", ""),
+            ("https://webui.example.net/b.js", ""),
+        ],
+    )))
+    assert out["first"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1")
+
+
+def test_newest_blank_same_origin_resource_does_not_reuse_stale_h2():
+    """A stale h2 entry must not widen the pool after the transport becomes unknown.
+
+    Resource Timing entries are chronological. If the newest same-origin entry
+    has no protocol, walking farther back to an old h2 observation would turn an
+    uncertain current transport into a permanently cached multiplexed verdict.
+    """
+    out = json.loads(_run_node(_sw_pool_source(
+        "console.log(JSON.stringify({ cap:_liveStreamPoolMax() }));",
+        resources=[
+            ("https://webui.example.net/old.js", "h2"),
+            ("https://webui.example.net/new.js", ""),
+        ],
+    )))
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1")
+
+
+def test_navigation_protocol_is_fallback_without_same_origin_resource():
+    """Navigation timing remains authoritative when no relevant resource exists."""
+    out = json.loads(_run_node(_sw_pool_source(
+        "console.log(JSON.stringify({ cap:_liveStreamPoolMax() }));",
+        resources=[("https://cdn.example.com/x.js", "http/1.1")],
+        nav_protocol="h2",
+    )))
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_MULTIPLEXED")
+
+
+def test_missing_location_object_fails_closed():
+    """Without an origin there is no safe same-origin test: stay conservative."""
+    src = (
+        _preamble()
+        + "globalThis.performance = { getEntriesByType: (t) => "
+          "t === 'navigation' ? [{ nextHopProtocol: '' }] : "
+          "[{ name:'https://x/y.js', nextHopProtocol:'h2' }] };\n"
+        + "globalThis.LIVE_STREAM_POOL_MAX_HTTP1 = "
+          "extractConstValue('LIVE_STREAM_POOL_MAX_HTTP1');\n"
+        + "globalThis.LIVE_STREAM_POOL_MAX_MULTIPLEXED = "
+          "extractConstValue('LIVE_STREAM_POOL_MAX_MULTIPLEXED');\n"
+        + "globalThis._liveStreamTransportUncertain = false;\n"
+        + "eval(extractFunc('_liveStreamPoolMax'));\n"
+        + "console.log(JSON.stringify({ cap:_liveStreamPoolMax() }));"
+    )
+    out = json.loads(_run_node(src))
+    assert out["cap"] == _source_const("LIVE_STREAM_POOL_MAX_HTTP1")
