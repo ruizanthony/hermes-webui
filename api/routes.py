@@ -9162,6 +9162,7 @@ def _limited_webui_messages_for_display_with_sidecar(
     state_db_messages,
     *,
     state_db_signature=_DISPLAY_STATE_SIGNATURE_UNSET,
+    msg_before=None,
 ) -> list:
     if sidecar_messages is None:
         sidecar_messages = _webui_sidecar_lineage_messages_for_display(session)
@@ -9193,7 +9194,11 @@ def _limited_webui_messages_for_display_with_sidecar(
     #   - a content fingerprint of the (bounded) state.db rows.
     # Any uncertainty (missing signature, fingerprint failure) skips caching.
     cache_key = None
-    if not _display_merge_session_is_active(session):
+    # A msg_before request deliberately reads a different (uncapped) state.db
+    # scope than the initial tail request.  It must bypass both cache layers:
+    # skipping only the pre-load probe still let this inner lookup reuse the
+    # initial 50k-row backstop merge and made the oldest row unreachable.
+    if msg_before is None and not _display_merge_session_is_active(session):
         if state_db_signature is _DISPLAY_STATE_SIGNATURE_UNSET:
             # Direct/internal callers that already own the rows key them on the
             # exact content snapshot. The HTTP handler passes an explicit DB
@@ -9689,12 +9694,17 @@ def _webui_sidecar_lineage_messages_for_display(session, *, max_hops: int = 20) 
         parent_id = str(getattr(current, "parent_session_id", "") or "").strip()
         if not parent_id or parent_id in seen or not is_safe_session_id(parent_id):
             break
+        parent_path = SESSION_DIR / f"{parent_id}.json"
+        parent_sig_before = _sidecar_stat_signature(parent_path)
         parent = Session.load(parent_id)
         if not parent or not getattr(parent, "pre_compression_snapshot", False):
             break
-        parent_path = SESSION_DIR / f"{parent_id}.json"
         parent_sig = _sidecar_stat_signature(parent_path)
-        if parent_sig is None:
+        if (
+            parent_sig_before is None
+            or parent_sig is None
+            or parent_sig_before != parent_sig
+        ):
             parent_signatures_complete = False
         else:
             parent_sigs.append((str(parent_path), parent_sig))
@@ -13669,6 +13679,7 @@ def handle_get(handler, parsed) -> bool:
                             limited_sidecar_messages,
                             state_db_messages,
                             state_db_signature=_display_state_db_signature,
+                            msg_before=msg_before,
                         )
                 else:
                     _all_msgs = merge_session_messages_append_only(
