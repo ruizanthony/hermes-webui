@@ -1042,6 +1042,17 @@ MIME_MAP = {
     ".bmp": "image/bmp",
     ".pdf": "application/pdf",
     ".json": "application/json",
+    # Plain-text payloads need an explicit text type. Left as
+    # application/octet-stream, Chrome ignores the Content-Disposition
+    # filename and saves the download as "media.bin" instead of the real
+    # name. Only non-executable text types are listed here: XML/XHTML are
+    # deliberately excluded because _handle_file_raw serves unknown types
+    # inline and same-origin, where an XSLT stylesheet could run script.
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".txt": "text/plain",
+    ".log": "text/plain",
+    ".md": "text/markdown",
     ".html": "text/html",
     ".htm": "text/html",
     ".xls": "application/vnd.ms-excel",
