@@ -8329,7 +8329,13 @@ def _is_claimable_cli_source(cli_meta: dict, state_db_source: str = "") -> tuple
     return True, ""
 
 
-def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
+def _claim_or_synthesize_cli_session(
+    sid: str,
+    cli_meta: dict = None,
+    *,
+    message_limit=None,
+    message_before=None,
+):
     """Resolve a session_id that has no WebUI sidecar.
 
     Returns ``(session_or_None, reason)``. Reasons:
@@ -8374,7 +8380,10 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
     computed ``_lookup_cli_session_metadata(sid)`` (e.g. the GET path
     building a sidebar dict) can pass it in to avoid the redundant
     lookup; callers without it (POST path, tests) pass nothing and the
-    helper does the lookup itself.
+    helper does the lookup itself. ``message_limit`` is a GET-only projection
+    control: ``None`` preserves the complete writable materialization required by
+    POST, ``0`` loads metadata without transcript content, and a positive value
+    returns a bounded visible window ending at ``message_before`` (or the tail).
 
     Closing the GET-vs-POST asymmetry for foreign-origin sessions: GET
     ``/api/session`` and POST ``/api/chat/start`` both call this helper
@@ -8460,32 +8469,125 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
         return None, "was_webui"
     if cli_meta is None:
         cli_meta = _lookup_cli_session_metadata(sid) or {}
-    msgs = get_cli_session_messages(sid)
-    if not msgs:
+
+    projection_summary = None
+    projection_offset = 0
+    projection_profile = (cli_meta or {}).get("profile") or None
+    if str(projection_profile or "").strip().lower() == "default":
+        projection_profile = None
+
+    def read_cli_messages(*, limit=None, before=None):
+        kwargs = {}
+        if projection_profile:
+            kwargs["profile"] = projection_profile
+        if limit is not None:
+            kwargs["limit"] = limit
+        if before is not None:
+            kwargs["before"] = before
+        return get_cli_session_messages(sid, **kwargs)
+
+    if message_limit is None:
+        msgs = read_cli_messages()
+    elif str(sid or '').startswith(f'{CLAUDE_CODE_SOURCE}_'):
+        # Claude Code transcripts live outside state.db and do not support SQL
+        # cursors. Preserve their historical reader, then window in memory.
+        all_msgs = read_cli_messages()
+        projection_summary = _message_summary(all_msgs)
+        window_before = (
+            min(len(all_msgs), max(0, int(message_before)))
+            if message_before is not None
+            else len(all_msgs)
+        )
+        if int(message_limit or 0) <= 0:
+            msgs = []
+        else:
+            msgs, projection_offset = _message_window_for_display(
+                all_msgs,
+                msg_limit=int(message_limit),
+                msg_before=window_before,
+            )
+            msgs = _messages_for_limited_payload(msgs)
+    else:
+        projection_summary = get_state_db_session_summary(
+            sid,
+            profile=projection_profile,
+            stitch_continuations=True,
+        )
+        total_rows = _numeric_count(projection_summary.get("message_count"))
+        requested_limit = max(0, int(message_limit or 0))
+        if total_rows <= 0:
+            # Non-state.db foreign readers (and focused test doubles) have no SQL
+            # summary. Fall back to their historical complete reader, then bound
+            # only the public GET projection in memory.
+            all_msgs = read_cli_messages()
+            projection_summary = _message_summary(all_msgs)
+            window_before = (
+                min(len(all_msgs), max(0, int(message_before)))
+                if message_before is not None
+                else len(all_msgs)
+            )
+            if requested_limit <= 0:
+                msgs = []
+            else:
+                msgs, projection_offset = _message_window_for_display(
+                    all_msgs,
+                    msg_limit=requested_limit,
+                    msg_before=window_before,
+                )
+                msgs = _messages_for_limited_payload(msgs)
+        elif requested_limit <= 0:
+            msgs = []
+        else:
+            boundary = total_rows
+            if message_before is not None:
+                try:
+                    boundary = min(total_rows, max(0, int(message_before)))
+                except (TypeError, ValueError):
+                    boundary = total_rows
+            # SQL rows and visible rows are different coordinate spaces because
+            # tool-result rows do not consume msg_limit. Grow a bounded raw slice
+            # until it contains the requested visible budget or reaches the
+            # cursor's beginning. This never materializes unrelated newer rows.
+            raw_limit = min(boundary, max(64, requested_limit * 4))
+            raw_page = []
+            local_offset = 0
+            # boundary == 0 means the cursor sits at the very beginning of the
+            # transcript: there is nothing older to project, so the window stays
+            # empty instead of leaving the loop variables unbound.
+            msgs = []
+            while boundary > 0:
+                raw_page = read_cli_messages(
+                    limit=max(1, raw_limit),
+                    before=boundary,
+                )
+                msgs, local_offset = _message_window_for_display(
+                    raw_page,
+                    msg_limit=requested_limit,
+                )
+                visible_count = sum(
+                    1 for message in msgs
+                    if _message_counts_as_renderable_for_window(message)
+                )
+                if visible_count >= requested_limit or raw_limit >= boundary:
+                    break
+                raw_limit = min(boundary, max(raw_limit + 1, raw_limit * 2))
+            projection_offset = max(0, boundary - len(raw_page) + local_offset)
+            msgs = _messages_for_limited_payload(msgs)
+    if not msgs and not (
+        projection_summary
+        and _numeric_count(projection_summary.get("message_count")) > 0
+    ):
         return None, "no_foreign_state"
     # TUI/Desktop sessions often have empty cli_meta (they don't appear in
     # get_cli_sessions() because of the cap).  Fall back to the state.db
     # ``source`` column to make the claim-eligibility check robust and to
     # populate the Session's source-tag metadata so the sidebar still
     # renders the correct badge for these sessions.
-    state_db_source = ""
-    state_db_row = None
-    try:
-        from api.models import _active_state_db_path
-        db_path = _active_state_db_path()
-        if db_path and Path(db_path).exists():
-            import sqlite3 as _sqlite
-            with closing(_sqlite.connect(str(db_path))) as _conn:
-                _conn.row_factory = _sqlite.Row
-                _row = _conn.execute(
-                    "SELECT source, title, model, cwd, started_at, ended_at "
-                    "FROM sessions WHERE id = ?", (sid,)
-                ).fetchone()
-                if _row is not None:
-                    state_db_row = dict(_row)
-                    state_db_source = str(_row["source"] or "").strip().lower()
-    except Exception:
-        state_db_source = ""
+    state_db_row = get_state_db_session_metadata(
+        sid,
+        profile=projection_profile,
+    )
+    state_db_source = str((state_db_row or {}).get("source") or "").strip().lower()
     # Populate source metadata from state.db when cli_meta is empty so the
     # synthesized Session carries the right source_tag/source_label.  Only
     # fill fields that are actually missing from cli_meta; the foreign store
@@ -8506,8 +8608,8 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             cli_meta["title"] = state_db_row["title"]
         if not cli_meta.get("model") and state_db_row.get("model"):
             cli_meta["model"] = state_db_row["model"]
-        if not cli_meta.get("workspace") and state_db_row.get("cwd"):
-            cli_meta["workspace"] = state_db_row["cwd"]
+        if not cli_meta.get("workspace") and state_db_row.get("workspace"):
+            cli_meta["workspace"] = state_db_row["workspace"]
         # Map state.db timestamps to created_at/updated_at on the
         # synthesized Session.  Without this, the first POST writes
         # epoch (0) timestamps into the permanent sidecar and the
@@ -8522,13 +8624,28 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
         # updated_at to wall-clock now, so this value is only the
         # GET-stub display value; the claimed sidecar's updated_at
         # reflects the moment of claim (the desired "just now" UX).
-        if not cli_meta.get("created_at") and state_db_row.get("started_at"):
-            cli_meta["created_at"] = state_db_row["started_at"]
+        if not cli_meta.get("created_at") and state_db_row.get("created_at"):
+            cli_meta["created_at"] = state_db_row["created_at"]
         if not cli_meta.get("updated_at"):
-            _ended = state_db_row.get("ended_at")
-            _started = state_db_row.get("started_at")
-            if _ended or _started:
-                cli_meta["updated_at"] = _ended or _started
+            _updated = state_db_row.get("updated_at")
+            _created = state_db_row.get("created_at")
+            if _updated or _created:
+                cli_meta["updated_at"] = _updated or _created
+
+    def attach_projection(session):
+        if projection_summary is None:
+            return session
+        session._projection_message_count = _numeric_count(
+            projection_summary.get("message_count")
+        )
+        try:
+            session._projection_last_message_at = float(
+                projection_summary.get("last_message_at") or 0
+            )
+        except (TypeError, ValueError):
+            session._projection_last_message_at = 0.0
+        session._projection_messages_offset = projection_offset
+        return session
     claimable, _reason = _is_claimable_cli_source(cli_meta, state_db_source)
     if not claimable:
         # The session is real and viewable, but the foreign source forbids
@@ -8545,11 +8662,18 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
         # CLI classification so its source badge renders.
         _sa_child = _is_subagent_child_session_id(sid)
         return (
-            build_session(sid, cli_meta, msgs, read_only_flag=True,
-                          is_cli_flag=not _sa_child),
+            attach_projection(build_session(
+                sid,
+                cli_meta,
+                msgs,
+                read_only_flag=True,
+                is_cli_flag=not _sa_child,
+            )),
             "not_claimable",
         )
-    return build_session(sid, cli_meta, msgs, read_only_flag=False), "materialized"
+    return attach_projection(
+        build_session(sid, cli_meta, msgs, read_only_flag=False)
+    ), "materialized"
 
 
 def _request_wants_all_profiles_import(body) -> bool:
@@ -10455,6 +10579,7 @@ from api.models import (
     get_latest_state_db_compaction_summary,
     get_state_db_session_message_prefix_summary,
     get_state_db_session_message_keys_before_timestamp,
+    get_state_db_session_metadata,
     get_state_db_session_summary,
     merge_session_messages_append_only,
     _reconcile_api_content_sidecars,
@@ -14033,7 +14158,7 @@ def handle_get(handler, parsed) -> bool:
                         journal,
                         active=journal_active,
                     )
-                    if journal_active and (not load_messages or msg_limit is None):
+                    if journal_active and load_messages and msg_limit is None:
                         try:
                             snapshot = _run_journal_live_snapshot(original_stream_id, handler=handler)
                         except Exception:
@@ -14146,7 +14271,12 @@ def handle_get(handler, parsed) -> bool:
             # _session_index_marks_was_webui) and the #4911 source ownership
             # gate (via _is_claimable_cli_source) so the two endpoints can't
             # drift on foreign-session semantics.
-            cli_meta = _lookup_cli_session_metadata(sid)
+            # The id is already known, so prefer one targeted state.db row over
+            # get_cli_sessions(), which enumerates every foreign transcript and
+            # was the dominant cold-load cost for sidecar-less detail requests.
+            cli_meta = get_state_db_session_metadata(sid)
+            if not cli_meta:
+                cli_meta = _lookup_cli_session_metadata(sid)
             _session_profile = (cli_meta or {}).get("profile") or None
             # Claude Code rows are profile-less by construction (they come from
             # ~/.claude/projects, not from any profile's state.db), so the gate
@@ -14169,7 +14299,16 @@ def handle_get(handler, parsed) -> bool:
                 # otherwise emit a useless 409 with profile=null and skip the
                 # frontend self-heal + spin the SSE reconnect against a dead sid.
                 return bad(handler, "Session not found", 404)
-            synth, reason = _claim_or_synthesize_cli_session(sid, cli_meta=cli_meta or {})
+            synth, reason = _claim_or_synthesize_cli_session(
+                sid,
+                cli_meta=cli_meta or {},
+                message_limit=(msg_limit if load_messages else 0),
+                message_before=(
+                    msg_before
+                    if load_messages and msg_limit is not None
+                    else None
+                ),
+            )
             if reason == "was_webui":
                 # Deleted WebUI session: 404 so the client self-heals
                 # (clears stale /session/<id> URL and localStorage, #2782).
@@ -14180,17 +14319,30 @@ def handle_get(handler, parsed) -> bool:
             # Build the legacy dict response from the synthesized Session so
             # the wire shape stays byte-equivalent to the previous inline
             # synthesis (the frontend has been reading these exact keys).
-            msgs = list(synth.messages or [])
+            synth_message_count = len(synth.messages or [])
+            msgs = list(synth.messages or []) if load_messages else []
+            projection_count = _numeric_count(
+                getattr(synth, "_projection_message_count", synth_message_count)
+            )
+            projection_last_message_at = getattr(
+                synth,
+                "_projection_last_message_at",
+                None,
+            )
+            projection_offset = _numeric_count(
+                getattr(synth, "_projection_messages_offset", 0)
+            )
             sess = {
                 "session_id": synth.session_id,
                 "title": synth.title,
                 "workspace": synth.workspace,
                 "model": synth.model,
-                "message_count": len(msgs),
+                "message_count": projection_count,
                 "created_at": synth.created_at,
                 "updated_at": synth.updated_at,
                 "last_message_at": (
-                    (cli_meta or {}).get("last_message_at")
+                    projection_last_message_at
+                    or (cli_meta or {}).get("last_message_at")
                     or (cli_meta or {}).get("updated_at", 0)
                     or ((msgs or [{}])[-1].get("timestamp", 0))
                 ),
@@ -14222,12 +14374,28 @@ def handle_get(handler, parsed) -> bool:
                 "read_only": bool(getattr(synth, "read_only", False)),
                 "messages": msgs,
                 "tool_calls": [],
+                "_messages_truncated": bool(
+                    load_messages and msg_limit is not None and projection_offset > 0
+                ),
+                "_messages_offset": projection_offset,
+                "_msg_limit_max": _MAX_MSG_LIMIT,
             }
-            attach_todo_state(sess, msgs)
+            if load_messages:
+                attach_todo_state(sess, msgs)
             sess = _merge_cli_sidebar_metadata(sess, cli_meta)
+            # Sidebar metadata may carry a raw per-segment count. The detail
+            # endpoint paginates in the stitched transcript coordinate space.
+            sess["message_count"] = projection_count
+            sess["messages"] = msgs
+            sess["_messages_truncated"] = bool(
+                load_messages and msg_limit is not None and projection_offset > 0
+            )
+            sess["_messages_offset"] = projection_offset
+            sess["_msg_limit_max"] = _MAX_MSG_LIMIT
             # Mid-turn compression hops have no sidecar yet. Project the
             # origin run so a PWA reload of the hop URL rejoins the live SSE
-            # instead of painting a finished stitch.
+            # instead of painting a finished stitch. Bounded/metadata reads keep
+            # the stream id and status but deliberately omit runtime_journal_snapshot.
             from api.session_live_stream import apply_live_stream_lineage_projection
 
             apply_live_stream_lineage_projection(sess)
@@ -14242,17 +14410,18 @@ def handle_get(handler, parsed) -> bool:
                         journal,
                         active=True,
                     )
-                    try:
-                        snapshot = _run_journal_live_snapshot(
-                            _projected_stream_id,
-                            handler=handler,
-                        )
-                    except Exception:
-                        snapshot = None
-                    if snapshot:
-                        sess["runtime_journal_snapshot"] = (
-                            _runtime_journal_snapshot_for_session_payload(snapshot)
-                        )
+                    if load_messages and msg_limit is None:
+                        try:
+                            snapshot = _run_journal_live_snapshot(
+                                _projected_stream_id,
+                                handler=handler,
+                            )
+                        except Exception:
+                            snapshot = None
+                        if snapshot:
+                            sess["runtime_journal_snapshot"] = (
+                                _runtime_journal_snapshot_for_session_payload(snapshot)
+                            )
             return j(handler, {"session": public_session_projection(sess)})
 
     if parsed.path == "/api/session/lineage/report":

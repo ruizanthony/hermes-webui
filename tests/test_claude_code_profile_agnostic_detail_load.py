@@ -117,7 +117,11 @@ def test_claude_code_detail_load_survives_named_active_profile(monkeypatch):
     assert sess["read_only"] is True
     assert sess["is_cli_session"] is True
     assert sess["source_tag"] == "claude_code"
-    assert len(sess["messages"]) == 2
+    # messages=0 is a strict metadata projection for every source, including
+    # profile-less Claude Code rows. The profile-gate contract remains covered by
+    # the 200/status/source assertions above; transcript count stays available.
+    assert sess["messages"] == []
+    assert sess["message_count"] == 2
 
 
 def test_profile_tagged_foreign_session_still_scoped(monkeypatch):
