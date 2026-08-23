@@ -10415,6 +10415,61 @@ def get_latest_state_db_compaction_summary(sid, *, profile=None) -> dict | None:
         return None
 
 
+def _state_db_continuation_chain(cur, sid, *, stitch_continuations: bool) -> list[str]:
+    """Return the compatible parent chain ending at ``sid``.
+
+    Message windows and cheap summaries must use the exact same continuation
+    predicate as the full CLI transcript reader.  Keeping the walk in one helper
+    prevents pagination counts and payload rows from drifting apart.
+    """
+    session_chain = [str(sid)]
+    if not stitch_continuations:
+        return session_chain
+    cur.execute("PRAGMA table_info(sessions)")
+    session_cols = {str(row['name']) for row in cur.fetchall()}
+    required = {'id', 'parent_session_id', 'end_reason', 'started_at', 'source'}
+    if not required.issubset(session_cols):
+        return session_chain
+    cur.execute(
+        """
+        SELECT id, source, started_at, parent_session_id, ended_at, end_reason
+        FROM sessions
+        WHERE id = ?
+        """,
+        (sid,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return session_chain
+    rows_by_id = {str(row['id']): dict(row)}
+    current_id = str(row['id'])
+    seen = {current_id}
+    for _ in range(20):
+        current = rows_by_id.get(current_id)
+        parent_id = current.get('parent_session_id') if current else None
+        if not parent_id or parent_id in seen:
+            break
+        cur.execute(
+            """
+            SELECT id, source, started_at, parent_session_id, ended_at, end_reason
+            FROM sessions
+            WHERE id = ?
+            """,
+            (parent_id,),
+        )
+        parent_row = cur.fetchone()
+        if not parent_row:
+            break
+        parent_dict = dict(parent_row)
+        rows_by_id[str(parent_row['id'])] = parent_dict
+        if not _is_continuation_session(parent_dict, current):
+            break
+        session_chain.insert(0, str(parent_row['id']))
+        current_id = str(parent_row['id'])
+        seen.add(current_id)
+    return session_chain
+
+
 def get_state_db_session_messages(
     sid,
     *,
@@ -10424,6 +10479,7 @@ def get_state_db_session_messages(
     include_null_timestamps: bool = True,
     include_inactive: bool = False,
     limit=None,
+    before=None,
 ) -> list:
     """Read messages for a Hermes session from state.db.
 
@@ -10451,6 +10507,11 @@ def get_state_db_session_messages(
     corrupt the sidecar/state.db merge (see _state_db_since_timestamp_for_limited_display,
     which deliberately does NOT SQL-LIMIT raw rows for that reason). Callers that
     need the full history for model-context reconstruction leave this unset.
+
+    ``before`` is an optional absolute row cursor in the filtered, stitched
+    transcript.  Together with ``limit`` it returns the bounded page immediately
+    preceding that cursor.  It is reserved for display projections; model-context
+    callers leave both values unset and retain the historical full-read behavior.
 
     When the messages table exposes an ``active`` column, inactive rows are
     compacted/archived history and are intentionally excluded by default. WebUI
@@ -10500,48 +10561,11 @@ def get_state_db_session_messages(
             id_col = ['id'] if 'id' in available else []
             selected = id_col + ['role', 'content', 'timestamp'] + [c for c in optional if c in available]
 
-            session_chain = [str(sid)]
-            if stitch_continuations:
-                cur.execute("PRAGMA table_info(sessions)")
-                session_cols = {str(row['name']) for row in cur.fetchall()}
-                if {'parent_session_id', 'end_reason', 'started_at', 'source'}.issubset(session_cols):
-                    cur.execute(
-                        """
-                        SELECT id, source, started_at, parent_session_id, ended_at, end_reason
-                        FROM sessions
-                        WHERE id = ?
-                        """,
-                        (sid,),
-                    )
-                    rows_by_id = {}
-                    row = cur.fetchone()
-                    if row:
-                        rows_by_id[str(row['id'])] = dict(row)
-                        current_id = str(row['id'])
-                        seen = {current_id}
-                        for _ in range(20):
-                            current = rows_by_id.get(current_id)
-                            parent_id = current.get('parent_session_id') if current else None
-                            if not parent_id or parent_id in seen:
-                                break
-                            cur.execute(
-                                """
-                                SELECT id, source, started_at, parent_session_id, ended_at, end_reason
-                                FROM sessions
-                                WHERE id = ?
-                                """,
-                                (parent_id,),
-                            )
-                            parent_row = cur.fetchone()
-                            if not parent_row:
-                                break
-                            parent_dict = dict(parent_row)
-                            rows_by_id[str(parent_row['id'])] = parent_dict
-                            if not _is_continuation_session(parent_dict, current):
-                                break
-                            session_chain.insert(0, str(parent_row['id']))
-                            current_id = str(parent_row['id'])
-                            seen.add(current_id)
+            session_chain = _state_db_continuation_chain(
+                cur,
+                sid,
+                stitch_continuations=stitch_continuations,
+            )
 
             placeholders = ', '.join('?' for _ in session_chain)
             params = list(session_chain)
@@ -10566,6 +10590,7 @@ def get_state_db_session_messages(
             # retained and a pathological state.db can't materialize unbounded
             # rows. None = unchanged full-history read for model-context callers.
             limit_clause = ""
+            limit_int = None
             if limit is not None:
                 try:
                     limit_int = max(1, int(limit))
@@ -10576,8 +10601,29 @@ def get_state_db_session_messages(
                     # rows under the cap, take a descending-ordered subquery and
                     # re-sort ascending — a plain LIMIT would keep the oldest.
                     limit_clause = " ORDER BY timestamp DESC, id DESC LIMIT ?"
-                    params.append(limit_int)
-            if limit_clause:
+            before_int = None
+            if before is not None:
+                try:
+                    before_int = max(0, int(before))
+                except (TypeError, ValueError):
+                    before_int = None
+            if before_int is not None:
+                if before_int <= 0:
+                    return []
+                page_size = min(before_int, limit_int or before_int)
+                page_offset = max(0, before_int - page_size)
+                params.extend((page_size, page_offset))
+                cur.execute(f"""
+                    SELECT {', '.join(selected)}, session_id
+                    FROM messages
+                    WHERE session_id IN ({placeholders})
+                    {since_clause}
+                    {active_clause}
+                    ORDER BY timestamp ASC, id ASC
+                    LIMIT ? OFFSET ?
+                """, params)
+            elif limit_clause:
+                params.append(limit_int)
                 cur.execute(f"""
                     SELECT * FROM (
                         SELECT {', '.join(selected)}, session_id
@@ -10778,8 +10824,82 @@ def get_state_db_session_message_keys_before_timestamp(
         return None
 
 
-def get_state_db_session_summary(sid, *, profile=None) -> dict:
-    """Return a cheap message count/timestamp summary for one state.db session."""
+def get_state_db_session_metadata(sid, *, profile=None) -> dict:
+    """Return one targeted state.db session row in WebUI metadata shape.
+
+    Unlike ``get_cli_sessions()``, this projection never enumerates unrelated
+    sessions or materializes message content.  It is used by the detail endpoint
+    after a missing-sidecar lookup, where the requested id is already known.
+    """
+    try:
+        import sqlite3
+    except ImportError:
+        return {}
+
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / 'state.db'
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not sid or not db_path.exists():
+        return {}
+
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            available = {str(row['name']) for row in cur.fetchall()}
+            if 'id' not in available:
+                return {}
+            wanted = (
+                'source', 'title', 'model', 'cwd', 'started_at', 'ended_at',
+                'last_activity_at', 'profile_name', 'archived', 'pinned',
+            )
+            selected = ['id'] + [column for column in wanted if column in available]
+            row = cur.execute(
+                f"SELECT {', '.join(selected)} FROM sessions WHERE id = ? LIMIT 1",
+                (str(sid),),
+            ).fetchone()
+            if row is None:
+                return {}
+            record = dict(row)
+    except Exception:
+        return {}
+
+    source = str(record.get('source') or '').strip().lower()
+    started_at = record.get('started_at') or 0
+    updated_at = (
+        record.get('last_activity_at')
+        or record.get('ended_at')
+        or started_at
+    )
+    return {
+        'session_id': str(record.get('id') or sid),
+        'title': record.get('title'),
+        'model': record.get('model'),
+        'workspace': record.get('cwd'),
+        'cwd': record.get('cwd'),
+        'created_at': started_at,
+        'updated_at': updated_at,
+        'last_message_at': updated_at,
+        'profile': record.get('profile_name') or profile,
+        'source_tag': source or None,
+        'raw_source': source or None,
+        'source': source or None,
+        'archived': bool(record.get('archived', False)),
+        'pinned': bool(record.get('pinned', False)),
+    }
+
+
+def get_state_db_session_summary(
+    sid,
+    *,
+    profile=None,
+    stitch_continuations: bool = False,
+) -> dict:
+    """Return a cheap message count/timestamp summary for one transcript."""
     try:
         import sqlite3
     except ImportError:
@@ -10802,11 +10922,22 @@ def get_state_db_session_summary(sid, *, profile=None) -> dict:
             available = {str(row['name']) for row in cur.fetchall()}
             if 'session_id' not in available:
                 return {"message_count": 0, "last_message_at": 0.0}
+            session_chain = _state_db_continuation_chain(
+                cur,
+                sid,
+                stitch_continuations=stitch_continuations,
+            )
+            placeholders = ', '.join('?' for _ in session_chain)
+            active_clause = (
+                " AND (active IS NULL OR active != 0)"
+                if stitch_continuations and 'active' in available
+                else ""
+            )
             if 'timestamp' in available:
                 cur.execute(
                     "SELECT COUNT(*) AS message_count, MAX(timestamp) AS last_message_at "
-                    "FROM messages WHERE session_id = ?",
-                    (str(sid),),
+                    f"FROM messages WHERE session_id IN ({placeholders}){active_clause}",
+                    list(session_chain),
                 )
                 row = cur.fetchone()
                 if not row:
@@ -10815,7 +10946,11 @@ def get_state_db_session_summary(sid, *, profile=None) -> dict:
                     "message_count": max(0, int(row["message_count"] or 0)),
                     "last_message_at": float(row["last_message_at"] or 0) if row["last_message_at"] is not None else 0.0,
                 }
-            cur.execute("SELECT COUNT(*) AS message_count FROM messages WHERE session_id = ?", (str(sid),))
+            cur.execute(
+                f"SELECT COUNT(*) AS message_count FROM messages "
+                f"WHERE session_id IN ({placeholders}){active_clause}",
+                list(session_chain),
+            )
             row = cur.fetchone()
             return {
                 "message_count": max(0, int(row["message_count"] or 0)) if row else 0,
@@ -12665,7 +12800,7 @@ def reconciled_state_db_messages_for_session(
     )
 
 
-def get_cli_session_messages(sid, *, profile=None) -> list:
+def get_cli_session_messages(sid, *, profile=None, limit=None, before=None) -> list:
     """Read messages for a single CLI/external-agent session.
 
     Preserve tool-call/result and reasoning metadata from the agent state.db so
@@ -12676,7 +12811,13 @@ def get_cli_session_messages(sid, *, profile=None) -> list:
     """
     if str(sid or '').startswith(f'{CLAUDE_CODE_SOURCE}_'):
         return get_claude_code_session_messages(sid)
-    return get_state_db_session_messages(sid, stitch_continuations=True, profile=profile)
+    return get_state_db_session_messages(
+        sid,
+        stitch_continuations=True,
+        profile=profile,
+        limit=limit,
+        before=before,
+    )
 
 
 def count_conversation_rounds(sid: str, since: float | None = None) -> int:
