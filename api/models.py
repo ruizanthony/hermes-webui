@@ -10667,7 +10667,26 @@ def merge_session_messages_append_only(
         seen_dedup_keys.add(dedup_key)
         seen_content_keys.add(content_key)
         seen_visible_keys.add(visible_key)
-        merged_messages.append(msg)
+        # Append-only must not mean append-at-the-end. A state.db-only row can
+        # legitimately reach this point while carrying a timestamp that predates
+        # the sidecar tail — most often when its typed row id is unique to
+        # state.db (row_id_preserves_source_multiplicity), which bypasses the
+        # sidecar-timestamp-range block above and its chronological insert.
+        # Blindly appending such a row renders it after turns that already
+        # answered it: the reported shape is a user prompt displayed below its
+        # own assistant reply on the paginated (msg_limit) load, which unlike
+        # the full display path does not re-sort by timestamp afterwards.
+        # Place the row in its chronological slot instead; rows that are
+        # genuinely newest still land at the tail, so no row is ever dropped.
+        if (
+            max_sidecar_timestamp is not None
+            and timestamp is not None
+            and timestamp < max_sidecar_timestamp
+        ):
+            if not _insert_state_message_chronologically(merged_messages, msg):
+                merged_messages.append(msg)
+        else:
+            merged_messages.append(msg)
         _remember_merged_message(msg, source="state")
     return merged_messages
 
