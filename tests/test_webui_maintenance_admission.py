@@ -191,4 +191,3 @@ def test_worker_thread_constructor_failure_does_not_transfer_handoff(monkeypatch
 
     assert handoff.transferred is False
     assert handoff.released is False
-
