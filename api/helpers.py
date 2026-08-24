@@ -472,10 +472,31 @@ _redact_fn_lru = functools.lru_cache(maxsize=4096)(_redact_fn_uncached)
 # thousands of small recurring strings that actually benefit, or balloon RSS.
 _REDACT_CACHE_MAX_TEXT_LEN = 16384
 
+# Strings above that threshold used to bypass memoization entirely and re-run
+# the full ~15-pass redactor on every request. On a real 22MB session that was
+# 59 large strings (29 unique, 0.76MB) costing 1.68s per request — 99.9% of the
+# recurring redaction cost once the small-string cache is warm, paid again by
+# every tab and every poll for a byte-identical result.
+#
+# They get their own small cache instead of sharing the 4096-entry one, so a
+# large blob can never evict the thousands of small recurring strings. Both the
+# entry count and the per-entry size are capped, which bounds retained bytes to
+# roughly _REDACT_LARGE_CACHE_SIZE * _REDACT_LARGE_CACHE_MAX_TEXT_LEN (key plus
+# value). Anything larger stays uncached: unbounded growth is the failure mode
+# this threshold exists to prevent.
+_REDACT_LARGE_CACHE_MAX_TEXT_LEN = 131072
+_REDACT_LARGE_CACHE_SIZE = 64
+
+_redact_fn_large_lru = functools.lru_cache(maxsize=_REDACT_LARGE_CACHE_SIZE)(
+    _redact_fn_uncached
+)
+
 
 def _redact_fn_cached(text):
     if len(text) > _REDACT_CACHE_MAX_TEXT_LEN:
-        return _redact_fn_uncached(text)
+        if len(text) > _REDACT_LARGE_CACHE_MAX_TEXT_LEN:
+            return _redact_fn_uncached(text)
+        return _redact_fn_large_lru(text)
     return _redact_fn_lru(text)
 
 
@@ -956,13 +977,43 @@ def _redact_value(v, *, _enabled: bool | None = None):
 
     ``_enabled`` is threaded through so a single response-level redact pass
     only reads settings.json once. (Opus pre-release perf fix.)
+
+    Containers are rebuilt only when a descendant actually changed. The
+    overwhelming majority of a transcript carries no credential marker, so the
+    previous unconditional dict/list comprehension deep-copied the entire
+    payload — tens of MB per response — to reproduce an identical structure.
+    That copy is pure CPU under the GIL (allocation and refcounting never
+    release it), which serialized concurrent tab loads on a threaded server.
+
+    Returning the original object when nothing changed is safe because callers
+    treat redacted output as read-only: ``_public_message_projection`` builds a
+    fresh ``item`` dict per message, and ``redact_session_data`` builds a fresh
+    ``result``. Nothing mutates a value returned from here in place, so sharing
+    an unmodified subtree cannot leak a later mutation back into session state.
+    The redacting path is unchanged: as soon as one string is masked, every
+    container on the path to it is rebuilt and the caller's original is left
+    untouched.
     """
     if isinstance(v, str):
         return _redact_text(v, _enabled=_enabled)
     if isinstance(v, dict):
-        return {key: _redact_value(value, _enabled=_enabled) for key, value in v.items()}
+        changed = False
+        out = {}
+        for key, value in v.items():
+            redacted = _redact_value(value, _enabled=_enabled)
+            out[key] = redacted
+            if redacted is not value:
+                changed = True
+        return out if changed else v
     if isinstance(v, list):
-        return [_redact_value(item, _enabled=_enabled) for item in v]
+        changed = False
+        out = []
+        for item in v:
+            redacted = _redact_value(item, _enabled=_enabled)
+            out.append(redacted)
+            if redacted is not item:
+                changed = True
+        return out if changed else v
     return v
 
 
