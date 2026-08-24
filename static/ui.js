@@ -6458,7 +6458,7 @@ if(typeof window!=='undefined'){
       // a tiny upward nudge while the reader is still AT the bottom, with no real
       // input intent, is a layout artifact — not a decision to leave the tail.
       // Any wheel/touch/key/scrollbar intent bypasses this and unpins normally.
-      const _tailJitter=_isMessageTailJitter(top,bottomDistance);
+      const _tailJitter=typeof _isMessageTailJitter==='function'&&_isMessageTailJitter(top,bottomDistance);
       const movedUp=!grew&&!_tailJitter&&_lastScrollTop!==null&&top<_lastScrollTop-2;
       const movedDown=_lastScrollTop!==null&&top>_lastScrollTop+2;
       // Suppress the post-render scroll artifact: right after renderMessages()
