@@ -953,9 +953,13 @@ def test_load_session_rearms_stream_on_every_early_return():
 
     # Isolate the loadSession body. Widened window: the #4946 visit-ack helpers
     # added inside loadSession pushed the fetch-error catch's stream restart past
-    # the old 14000-char cutoff.
+    # the old 14000-char cutoff. 2026-08-24: upstream growth inside loadSession
+    # pushed `startSessionStream(currentSid)` to offset ~16185, i.e. 185 chars
+    # past the previous 16000 cutoff — the assertions below silently read a
+    # truncated body and failed on correct code. Keep headroom above the real
+    # offset; re-widen (do NOT weaken the assertions) if it drifts again.
     fn_ix = js.index("async function loadSession(")
-    body = js[fn_ix:fn_ix + 16000]
+    body = js[fn_ix:fn_ix + 18000]
 
     # The unconditional teardown must still be there (this is what creates the
     # dead-stream window the re-arm closes).

@@ -1101,6 +1101,15 @@ def test_standby_worker_retries_leadership(continuation_store, monkeypatch):
 def test_profile_goal_manager_accepts_current_five_field_judge_result(monkeypatch):
     import api.goals as goals
 
+    # 2026-08-24: upstream #6899 split this class in two. `_ProfileGoalManager`
+    # became a thin profile-scoped proxy that forwards everything to the native
+    # hermes_cli GoalManager via `__getattr__`; the local five-field judge-result
+    # implementation this test guards now lives in `_LegacyProfileGoalManager`
+    # (still used as the fallback path at api/goals.py:593 when the native
+    # manager is unavailable). Building the proxy with `object.__new__` leaves
+    # `_manager` unset, so `__getattr__` recurses on itself until RecursionError
+    # — the failure was the test targeting the wrong class, not a code defect.
+    # Target the legacy class explicitly: it is the one that owns this logic.
     state = SimpleNamespace(
         goal="finish the durable workflow",
         status="active",
@@ -1118,13 +1127,13 @@ def test_profile_goal_manager_accepts_current_five_field_judge_result(monkeypatc
         consecutive_parse_failures=0,
         consecutive_transport_failures=0,
     )
-    manager = object.__new__(goals._ProfileGoalManager)
+    manager = object.__new__(goals._LegacyProfileGoalManager)
     manager.session_id = "session-a"
     manager.profile_home = Path("/profiles/default")
     manager.default_max_turns = 4
     manager.strict_load = False
     manager._state = state
-    manager._save = lambda _state: None
+    manager._save = lambda state: None
 
     monkeypatch.setattr(
         goals,
