@@ -28,6 +28,21 @@ ROOT = Path(__file__).resolve().parents[1]
 UI_JS = (ROOT / "static" / "ui.js").read_text(encoding="utf-8")
 
 
+def _function_body(src: str, signature: str) -> str:
+    """Return a whole function body, brace-balanced from its signature."""
+    start = src.index(signature)
+    brace = src.index("{", start)
+    depth = 0
+    for i in range(brace, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start : i + 1]
+    raise AssertionError(f"function body not found: {signature}")
+
+
 def _scroll_listener_block() -> str:
     """Return the rAF callback inside the messages scroll listener."""
     anchor = "el.addEventListener('scroll'"
@@ -84,17 +99,14 @@ def test_moved_up_ignores_tail_jitter():
 
 def test_tail_jitter_requires_reader_at_bottom():
     """Far from the tail, an upward scroll must always unpin."""
-    block = _scroll_listener_block()
-    assert "bottomDistance>MESSAGE_TAIL_JITTER_MAX_BOTTOM_PX" in block
-    assert "delta>0&&delta<=MESSAGE_TAIL_JITTER_MAX_DELTA_PX" in block
+    guard = _function_body(UI_JS, "function _isMessageTailJitter")
+    assert "bottomDistance>MESSAGE_TAIL_JITTER_MAX_BOTTOM_PX" in guard
+    assert "delta>0&&delta<=MESSAGE_TAIL_JITTER_MAX_DELTA_PX" in guard
 
 
 def test_tail_jitter_yields_to_every_real_input_intent():
     """Any genuine reader input must bypass the guard and unpin normally."""
-    block = _scroll_listener_block()
-    start = block.index("_tailJitter")
-    end = block.index("const movedUp=", start)
-    guard = block[start:end]
+    guard = _function_body(UI_JS, "function _isMessageTailJitter")
     for intent in (
         "_scrollbarDragActive",
         "_recentMessageWheelIntent",
@@ -106,3 +118,23 @@ def test_tail_jitter_yields_to_every_real_input_intent():
             f"The tail-jitter guard must yield to {intent}: a real scroll-up "
             "must keep unpinning the reader."
         )
+
+
+def test_tail_jitter_helper_is_defined_outside_the_scroll_listener():
+    """Keep the helper at module scope.
+
+    Several existing harnesses slice the scroll listener by searching for the
+    first `})();` after its start. An inlined IIFE inside the listener
+    introduces an earlier `})();` and silently truncates that slice, breaking
+    unrelated assertions. Defining the helper at module scope keeps the
+    listener body extractable.
+    """
+    block = _scroll_listener_block()
+    assert "function _isMessageTailJitter" not in block, (
+        "_isMessageTailJitter must live at module scope, not inside the scroll "
+        "listener, so `})();`-based test harnesses keep slicing the full block."
+    )
+    assert "_cancelBottomSettle();" in block, (
+        "Sanity check: the extracted listener block must still reach its tail; "
+        "if this fails the block was truncated by an early `})();`."
+    )

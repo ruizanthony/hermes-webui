@@ -6026,6 +6026,23 @@ let _lastMessageClientHeight=null;   // #4702: track scroller height to ignore i
 // keeps unpinning through the branch below.
 const MESSAGE_TAIL_JITTER_MAX_BOTTOM_PX=16;
 const MESSAGE_TAIL_JITTER_MAX_DELTA_PX=16;
+// Returns true when this scroll event is browser tail drift rather than a
+// reader decision. Defined at module scope (NOT inlined in the scroll listener)
+// so brace/`})();`-based test harnesses that slice the listener body keep
+// extracting the whole block. The typeof guards keep it inert in harnesses that
+// inject the listener without these helpers.
+function _isMessageTailJitter(top,bottomDistance){
+  if(_lastScrollTop===null) return false;
+  const delta=_lastScrollTop-top;
+  if(!(delta>0&&delta<=MESSAGE_TAIL_JITTER_MAX_DELTA_PX)) return false;
+  if(bottomDistance>MESSAGE_TAIL_JITTER_MAX_BOTTOM_PX) return false;
+  if(typeof _scrollbarDragActive!=='undefined'&&_scrollbarDragActive) return false;
+  if(typeof _recentMessageWheelIntent==='function'&&_recentMessageWheelIntent()) return false;
+  if(typeof _recentMessageTouchScrollIntent==='function'&&_recentMessageTouchScrollIntent()) return false;
+  if(typeof _recentMessageKeyScrollIntent==='function'&&_recentMessageKeyScrollIntent()) return false;
+  if(typeof _recentNonMessageScrollIntent==='function'&&_recentNonMessageScrollIntent()) return false;
+  return true;
+}
 // Sticky-unpin model (#3343 supersedes #3330's proximity re-pin): once the user
 // scrolls up, streaming stops auto-following until they return to the bottom or
 // click ↓. The upward-intent TIMEOUT mechanism (_lastMessageUpwardIntentMs /
@@ -6441,18 +6458,7 @@ if(typeof window!=='undefined'){
       // a tiny upward nudge while the reader is still AT the bottom, with no real
       // input intent, is a layout artifact — not a decision to leave the tail.
       // Any wheel/touch/key/scrollbar intent bypasses this and unpins normally.
-      const _tailJitter=(()=>{
-        if(_lastScrollTop===null) return false;
-        const delta=_lastScrollTop-top;
-        if(!(delta>0&&delta<=MESSAGE_TAIL_JITTER_MAX_DELTA_PX)) return false;
-        if(bottomDistance>MESSAGE_TAIL_JITTER_MAX_BOTTOM_PX) return false;
-        if(typeof _scrollbarDragActive!=='undefined'&&_scrollbarDragActive) return false;
-        if(typeof _recentMessageWheelIntent==='function'&&_recentMessageWheelIntent()) return false;
-        if(typeof _recentMessageTouchScrollIntent==='function'&&_recentMessageTouchScrollIntent()) return false;
-        if(typeof _recentMessageKeyScrollIntent==='function'&&_recentMessageKeyScrollIntent()) return false;
-        if(typeof _recentNonMessageScrollIntent==='function'&&_recentNonMessageScrollIntent()) return false;
-        return true;
-      })();
+      const _tailJitter=_isMessageTailJitter(top,bottomDistance);
       const movedUp=!grew&&!_tailJitter&&_lastScrollTop!==null&&top<_lastScrollTop-2;
       const movedDown=_lastScrollTop!==null&&top>_lastScrollTop+2;
       // Suppress the post-render scroll artifact: right after renderMessages()
