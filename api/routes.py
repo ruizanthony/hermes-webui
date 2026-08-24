@@ -2658,9 +2658,8 @@ def _build_session_list_cache_payload(
     diag_stage("visible_lineage_metadata")
     _enrich_sidebar_lineage_metadata(scoped)
     # Delegated subagent children (#5307) are view-only, owned by the delegate
-    # runner. Coerce their sidebar rows to read_only=True + is_cli_session=False
-    # so the UI never offers delete / edit / truncate / pin affordances on them
-    # (defense-in-depth is also enforced server-side on the mutation routes).
+    # runner. The model-layer batch overlay above has already applied the
+    # authoritative source and view-only flags before this route runs.
     def _coerce_subagent_rows(_rows):
         for _r in _rows:
             if not isinstance(_r, dict):
@@ -2669,16 +2668,7 @@ def _build_session_list_cache_payload(
                 str(_r.get("source_tag") or _r.get("raw_source")
                     or _r.get("session_source") or _r.get("source") or "").strip().lower()
             )
-            _is_sa = _src == "subagent"
-            # A stale index row can say webui/fork while state.db records the
-            # row as source='subagent' (the child shares the parent's lineage).
-            # For rows not already read-only, confirm via the state.db source so
-            # a delegated child can't surface as a writable/CLI sidebar row.
-            if not _is_sa and not _r.get("read_only"):
-                _sid = str(_r.get("session_id") or "").strip()
-                if _sid and _is_subagent_child_session_id(_sid):
-                    _is_sa = True
-            if _is_sa:
+            if _src == "subagent":
                 _r["read_only"] = True
                 _r["is_cli_session"] = False
     _coerce_subagent_rows(scoped)
@@ -15294,6 +15284,29 @@ def _validate_session_toolsets_shape(toolsets):
         raise ValueError("each toolset must be a non-empty string")
     return toolsets
 
+
+def _resolve_new_session_workspace(body, visible_prev_session_id):
+    """Resolve a new-session workspace, recovering only verified inheritance."""
+    candidate = body.get("workspace")
+    if not candidate:
+        return None
+    if (
+        body.get("workspace_inherited_from_prev_session") is not True
+        or not visible_prev_session_id
+    ):
+        return str(resolve_trusted_workspace(candidate))
+    try:
+        previous_session = get_session(visible_prev_session_id, metadata_only=True)
+    except KeyError:
+        return str(resolve_trusted_workspace(candidate))
+    if str(getattr(previous_session, "workspace", None) or "") != str(candidate):
+        return str(resolve_trusted_workspace(candidate))
+    workspace, _recovered = resolve_implicit_workspace_with_recovery(
+        candidate,
+        get_last_workspace,
+    )
+    return str(workspace)
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
@@ -15636,8 +15649,13 @@ def handle_post(handler, parsed) -> bool:
         )
 
     if parsed.path == "/api/session/new":
+        workspace_prev_session_id = body.get("prev_session_id")
+        if workspace_prev_session_id and not _session_id_visible_to_request_profile(
+            handler, workspace_prev_session_id, emit_error=False
+        ):
+            workspace_prev_session_id = None
         try:
-            workspace = str(resolve_trusted_workspace(body.get("workspace"))) if body.get("workspace") else None
+            workspace = _resolve_new_session_workspace(body, workspace_prev_session_id)
         except (TypeError, ValueError) as e:
             return bad(handler, str(e))
         worktree_info = None
@@ -27732,14 +27750,28 @@ def _handle_handoff_summary(handler, body):
         resolved_model = None
         resolved_provider = None
         resolved_base_url = None
+        session_model_provider = None
         try:
             from api.models import get_session
             s_obj = get_session(sid)
             resolved_model = getattr(s_obj, "model", None)
+            # Carry the session's OWN selected provider into resolution. Without
+            # it, a bare resolve_model_provider(model) routes the summary through
+            # whatever main provider is active — so a session pinned to custom:A
+            # gets its handoff summary rerouted to the active custom:B when both
+            # providers list the same model id (overlapping-id misroute, sibling
+            # of the resolve_model_provider fix). model_with_provider_context
+            # encodes it as @custom:A:model so the resolver honors the session's
+            # endpoint; base_url is backfilled from that provider's own custom
+            # entry by the resolve_custom_provider_connection block below.
+            session_model_provider = getattr(s_obj, "model_provider", None)
         except Exception:
             pass
 
-        resolved_model, resolved_provider, resolved_base_url = _cfg.resolve_model_provider(resolved_model)
+        model_for_resolution = _cfg.model_with_provider_context(
+            resolved_model, session_model_provider
+        )
+        resolved_model, resolved_provider, resolved_base_url = _cfg.resolve_model_provider(model_for_resolution)
 
         resolved_api_key = None
         try:
@@ -27868,6 +27900,16 @@ def _handle_handoff_summary(handler, body):
             "type": "agent_runtime_stale",
             "retryable": True,
         }, status=409)
+    except api_config.AmbiguousCustomProviderError as e:
+        # A custom-provider slug collision is a user-fixable misconfiguration,
+        # not a transient summary failure. Return 400 with the actionable rename
+        # message so the UI shows it, instead of degrading to a 200 local
+        # fallback that the client treats as success and that hides the fix.
+        logger.warning("Handoff summary blocked by ambiguous custom provider: %s", e.message)
+        return j(handler, {
+            "error": e.message,
+            "type": "custom_provider_ambiguous",
+        }, status=400)
     except Exception as e:
         logger.warning("Handoff summary generation failed: %s", e)
         summary_text = _fallback_handoff_summary(msgs)

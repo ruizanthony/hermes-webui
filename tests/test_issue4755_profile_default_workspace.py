@@ -120,7 +120,11 @@ def _new_session_driver(session_workspace: str, default_workspace: str, switch_w
         function loadDir(){{return Promise.resolve();}}
         {new_session}
         newSession().then(()=>{{
-          process.stdout.write(JSON.stringify({{captured,switchWorkspace:S._profileSwitchWorkspace}}));
+          process.stdout.write(JSON.stringify({{
+            captured,
+            switchWorkspace:S._profileSwitchWorkspace,
+            profileDefaultWorkspace:S._profileDefaultWorkspace,
+          }}));
         }}).catch(err=>{{
           console.error(err && err.stack || err);
           process.exit(1);
@@ -131,31 +135,31 @@ def _new_session_driver(session_workspace: str, default_workspace: str, switch_w
 
 @node_test
 def test_new_session_prefers_current_session_workspace_over_profile_default():
-    """DIVERGENCE LOCALE ASSUMÉE vis-à-vis d'upstream #4755.
+    """Deliberate divergence from the precedence introduced in #4755.
 
-    Upstream #4755 a fait gagner le "défaut de profil" sur le workspace de la conversation
-    courante. Sur cette installation, cette précédence produit l'effet inverse de son
-    intention, pour une raison structurelle :
+    #4755 made the "profile default" win over the current conversation's workspace.
+    That precedence assumes the profile default is a stable, configured value. It is
+    not, for a structural reason:
 
-    ``api/workspace.py::get_profile_default_workspace()`` lit ``last_workspace.txt`` AVANT
-    la valeur configurée (lignes ~419-427), et pour le profil ``default`` ce fichier est le
-    fichier GLOBAL. Or ``set_last_workspace()`` le réécrit à chaque ``/api/chat/start`` et
-    ``/api/session/update`` de N'IMPORTE QUELLE conversation.
+    ``api/workspace.py::get_profile_default_workspace()`` reads ``last_workspace.txt``
+    BEFORE the configured value, and for the ``default`` profile that file is the
+    GLOBAL one. ``set_last_workspace()`` rewrites it on every ``/api/chat/start`` and
+    ``/api/session/update`` from ANY conversation.
 
-    Donc ``S._profileDefaultWorkspace`` — hydraté depuis ``/api/profile/active`` — n'est pas
-    un défaut stable configuré : c'est un pointeur volatil partagé. « défaut de profil gagne
-    sur la conversation courante » devient en pratique « le dernier workspace utilisé par une
-    AUTRE conversation gagne sur la conversation où je suis ». Avec plusieurs conversations en
-    parallèle sur des workspaces différents (MES, Hermes WebUI, LABOPICHOT...), ouvrir une
-    nouvelle conversation depuis MES la créait sur le workspace d'une conversation tierce.
+    So ``S._profileDefaultWorkspace`` — hydrated from ``/api/profile/active`` — is not a
+    configured default: it is a volatile shared pointer. "profile default wins over the
+    current conversation" therefore degrades into "the workspace last used by ANOTHER
+    conversation wins over the conversation I am actually in". With several
+    conversations open on different workspaces, opening a new chat from conversation A
+    created it on conversation B's workspace.
 
-    Décision locale (Anthony, 2026-08-20) : le workspace doit suivre la conversation.
-    Précédence retenue : bascule de profil one-shot → conversation courante → défaut de profil.
-    Le défaut de profil reste le repli de page blanche (#804/#5169) et n'est jamais consommé (#823).
+    Precedence used here: one-shot profile switch -> current conversation -> profile
+    default. The profile default remains the blank-page fallback (#804/#5169) and is
+    never consumed (#823).
 
-    ATTENTION mainteneur : ce test diverge volontairement d'upstream et entrera en conflit lors
-    d'une reprise de #4755. Ne pas le "réparer" en rétablissant l'ordre upstream sans traiter
-    d'abord la volatilité de ``get_profile_default_workspace()``.
+    MAINTAINER NOTE: this intentionally diverges from #4755 and will conflict if that
+    precedence is restored. Please do not "fix" it by reinstating the previous order
+    without first addressing the volatility of ``get_profile_default_workspace()``.
     """
     payload = _run_node(_new_session_driver(
         session_workspace="/current-workspace",
@@ -166,6 +170,8 @@ def test_new_session_prefers_current_session_workspace_over_profile_default():
     assert payload["captured"]["path"] == "/api/session/new"
     assert payload["captured"]["body"]["workspace"] == "/current-workspace"
     assert payload["captured"]["body"]["prev_session_id"] == "previous-session"
+    assert payload["captured"]["body"]["workspace_inherited_from_prev_session"] is True
+    assert payload["profileDefaultWorkspace"] == "/profile-default"
 
 
 @node_test
@@ -182,7 +188,8 @@ def test_new_session_blank_page_falls_back_to_profile_default():
     payload = _run_node(driver)
 
     assert payload["captured"]["body"]["workspace"] == "/profile-default"
-
+    assert "workspace_inherited_from_prev_session" not in payload["captured"]["body"]
+    assert payload["profileDefaultWorkspace"] == "/profile-default"
 
 
 @node_test
@@ -194,7 +201,28 @@ def test_new_session_one_shot_switch_workspace_still_wins_and_clears():
     ))
 
     assert payload["captured"]["body"]["workspace"] == "/explicit-switch"
+    assert "workspace_inherited_from_prev_session" not in payload["captured"]["body"]
     assert payload["switchWorkspace"] is None
+    assert payload["profileDefaultWorkspace"] == "/profile-default"
+
+
+@node_test
+def test_parallel_conversations_each_inherit_their_own_workspace():
+    first = _run_node(_new_session_driver(
+        session_workspace="/workspace-a",
+        default_workspace="/shared-profile-pointer",
+        switch_workspace=None,
+    ))
+    second = _run_node(_new_session_driver(
+        session_workspace="/workspace-b",
+        default_workspace="/shared-profile-pointer",
+        switch_workspace=None,
+    ))
+
+    assert first["captured"]["body"]["workspace"] == "/workspace-a"
+    assert second["captured"]["body"]["workspace"] == "/workspace-b"
+    assert first["captured"]["body"]["workspace_inherited_from_prev_session"] is True
+    assert second["captured"]["body"]["workspace_inherited_from_prev_session"] is True
 
 
 @node_test
