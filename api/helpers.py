@@ -577,7 +577,27 @@ _SENSITIVE_DISCORD_MARKER_RE = _re.compile(r"<@!?\d{17,20}>")
 _SENSITIVE_PHONE_MARKER_RE = _re.compile(r"(?<![A-Za-z0-9])\+[1-9]\d{6,14}(?![A-Za-z0-9])")
 
 
-def _might_contain_sensitive_text(text: str) -> bool:
+# The prefilter runs on every string of every API response — ~74k strings /
+# ~19MB on a real large session — and cProfile showed it costing 2.98s of the
+# 3.7s redaction pass once the redactor's own caches are warm. The work is
+# pure and deterministic (fixed marker tuples, fixed patterns), so identical
+# text always yields the same verdict and is safe to memoize without
+# invalidation, exactly like `_redact_fn_cached` above.
+#
+# Note on what was NOT done: replacing the 71 `in` scans with one compiled
+# alternation looks like the obvious fix, but measured 38% SLOWER on the real
+# payload (2.60s vs 1.88s). CPython's substring search is already a tuned
+# C-level algorithm, and a large regex alternation has to try each branch at
+# each position. Memoizing the verdict avoids the scan entirely instead.
+#
+# Bounds mirror the redaction caches: capping entry count and per-entry size
+# keeps retained bytes to roughly size * max_len, so a burst of giant unique
+# blobs cannot balloon RSS. Oversized strings simply run the scan uncached.
+_SENSITIVE_PREFILTER_CACHE_SIZE = 8192
+_SENSITIVE_PREFILTER_MAX_TEXT_LEN = 16384
+
+
+def _might_contain_sensitive_text_uncached(text: str) -> bool:
     """Cheap prefilter before the full agent+fallback redaction pass."""
     if not isinstance(text, str) or not text:
         return False
@@ -593,6 +613,24 @@ def _might_contain_sensitive_text(text: str) -> bool:
     if "+" in text and _SENSITIVE_PHONE_MARKER_RE.search(text):
         return True
     return False
+
+
+_might_contain_sensitive_text_lru = functools.lru_cache(
+    maxsize=_SENSITIVE_PREFILTER_CACHE_SIZE
+)(_might_contain_sensitive_text_uncached)
+
+
+def _might_contain_sensitive_text(text: str) -> bool:
+    """Memoized wrapper around the prefilter.
+
+    Falls back to the uncached scan for non-strings and oversized text so the
+    cache can never be poisoned by an unhashable value or grow unbounded.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    if len(text) > _SENSITIVE_PREFILTER_MAX_TEXT_LEN:
+        return _might_contain_sensitive_text_uncached(text)
+    return _might_contain_sensitive_text_lru(text)
 
 
 def _redact_text(text: str, *, _enabled: bool | None = None) -> str:
