@@ -525,8 +525,9 @@ class TestGenerations:
         # The retired slow owner must finish WITHOUT flipping the outcome.
         time.sleep(0.5)
         assert r2.status == "completed", "retired generation must not publish"
-        # The registry still holds exactly ONE current owner for the profile.
-        assert streaming._MCP_READINESS["profile-r"].thread is r2.thread
+        # The registry still holds exactly ONE current owner for the profile
+        # (looked up under the CANONICAL key — round 15 #3).
+        assert streaming._MCP_READINESS[streaming._canonical_readiness_key("profile-r")].thread is r2.thread
 
 
 class TestStreamBoundarySurfacing:
@@ -557,3 +558,166 @@ class TestStreamBoundarySurfacing:
         assert not any(
             "MCP discovery failed" in rec.getMessage() for rec in caplog.records
         )
+
+
+class TestRefreshableRecovery:
+    """Maintainer round 15 #2 — incomplete/failed runs must RECOVER."""
+
+    def test_incomplete_outcome_is_failed_and_refreshable(self):
+        """A closure returning _MCP_INCOMPLETE -> failed + cooldown refresh_at.
+
+        Regression (maintainer round 15 #2): per-server connection
+        failures used to be recorded 'completed' forever.  The runner
+        must treat the INCOMPLETE sentinel as failed-and-refreshable, NOT
+        completed.
+        """
+        readiness = streaming._McpReadiness()
+        streaming._discovery_runner(
+            lambda: streaming._MCP_INCOMPLETE,
+            readiness,
+            readiness.event,
+            readiness.gen,
+            readiness.cancel,
+        )
+        assert readiness.status == "failed"
+        assert readiness.refresh_at is not None, (
+            "an incomplete run must be refreshable after the cooldown"
+        )
+        assert readiness.event.is_set()
+
+    def test_failed_run_recovers_after_cooldown_retry(self):
+        """A failed run schedules a retry after the cooldown which completes.
+
+        The user-visible contract: a transient outage must NOT permanently
+        strip a profile's MCP tools.  `_maybe_schedule_mcp_retry` spawns
+        ONE background retry owner once the cooldown elapses, and the
+        retry re-registers the recovered servers.
+        """
+        _old_cool = streaming._MCP_DISCOVERY_RETRY_COOLDOWN_S
+        streaming._MCP_DISCOVERY_RETRY_COOLDOWN_S = 0.0
+        try:
+            runs = []
+
+            def _ok():
+                runs.append(1)
+                return True
+
+            _profile = "refreshable-profile"
+            readiness = streaming._McpReadiness()
+            readiness.status = "failed"
+            readiness.refresh_at = 0.0  # cooldown elapsed
+            streaming._MCP_READINESS[streaming._canonical_readiness_key(_profile)] = readiness
+            streaming._maybe_schedule_mcp_retry(readiness, _profile, _ok)
+            deadline = time.monotonic() + 3.0
+            while readiness.status != "completed" and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert readiness.status == "completed", (
+                "a failed profile must recover via the cooldown retry"
+            )
+            assert runs, "the retry discovery never ran"
+        finally:
+            streaming._MCP_DISCOVERY_RETRY_COOLDOWN_S = _old_cool
+
+    def test_stale_completed_with_connect_errors_heals(self, monkeypatch):
+        """A 'completed' readiness whose servers now fail must heal.
+
+        Stale states recorded BEFORE this fix (the `se`-profile symptom)
+        are detected via `_mcp_profile_has_connect_errors` and scheduled
+        for a cooldown retry instead of staying silently tool-less.
+        """
+        monkeypatch.setattr(
+            streaming, "_mcp_profile_has_connect_errors", lambda *a: True
+        )
+        _old_cool = streaming._MCP_DISCOVERY_RETRY_COOLDOWN_S
+        streaming._MCP_DISCOVERY_RETRY_COOLDOWN_S = 0.0
+        try:
+            runs = []
+
+            def _ok():
+                runs.append(1)
+                return True
+
+            _profile = "stale-completed"
+            readiness = streaming._McpReadiness()
+            readiness.status = "completed"  # stale pre-fix state
+            readiness.refresh_at = None
+            streaming._MCP_READINESS[streaming._canonical_readiness_key(_profile)] = readiness
+            streaming._maybe_schedule_mcp_retry(readiness, _profile, _ok)
+            deadline = time.monotonic() + 3.0
+            while readiness.status != "completed" and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert readiness.status == "completed"
+            assert runs, "the heal retry never ran"
+        finally:
+            streaming._MCP_DISCOVERY_RETRY_COOLDOWN_S = _old_cool
+
+
+class TestCanonicalKey:
+    def test_tilde_and_realpath_collide_to_one_key(self):
+        """`~/.hermes` and the expanded path are ONE readiness key.
+
+        Regression (maintainer round 15 #3): startup keyed `~/.hermes`
+        while turns keyed `/home/hermes/.hermes`, producing two owners
+        for one profile and registry shadowing.
+        """
+        import os
+
+        tilde = "~/.hermes"
+        expanded = os.path.join(str(Path.home()), ".hermes")
+        assert streaming._canonical_readiness_key(tilde) == streaming._canonical_readiness_key(expanded), (
+            "the tilde and expanded forms of the same home must collide to "
+            "one canonical readiness key"
+        )
+        assert streaming._canonical_readiness_key(tilde) == streaming._normalize_mcp_home(expanded)
+
+
+class TestConcurrentRetryNoCrash:
+    def test_wait_never_crashes_or_returns_pending_under_hammering(self):
+        """Concurrent retries during a wait must never raise or return bare pending.
+
+        Regression (maintainer round 15 #1): `_mcp_wait_readiness` used
+        to read the generation INSIDE the loop, so a terminal flip plus a
+        concurrent retry could leave `_gen` unbound (UnboundLocalError)
+        or return 'pending'.  Under repeated churn the waiter must always
+        return a terminal status without raising.
+        """
+        errors = []
+
+        def _discover():
+            time.sleep(0.005)
+            return True
+
+        readiness = streaming._ensure_mcp_discovery(
+            "profile-hammer", _discover, "t-hammer"
+        )
+
+        def _waiter():
+            try:
+                result = streaming._mcp_wait_readiness(readiness)
+                if result == "pending":
+                    errors.append(("pending",))
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append((type(exc).__name__, str(exc)))
+
+        def _retryer():
+            try:
+                streaming._mcp_retry_discovery(
+                    "profile-hammer", _discover, "t-hammer-retry"
+                )
+            except Exception:  # pragma: no cover - retryer noise
+                pass
+
+        waiters = []
+        for _ in range(4):
+            th = threading.Thread(target=_waiter, daemon=True)
+            waiters.append(th)
+            th.start()
+        retryers = []
+        for _ in range(6):
+            th = threading.Thread(target=_retryer, daemon=True)
+            retryers.append(th)
+            th.start()
+            time.sleep(0.01)
+        for th in waiters + retryers:
+            th.join(timeout=5)
+        assert not errors, f"wait crashed or returned pending under churn: {errors}"

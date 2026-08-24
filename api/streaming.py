@@ -318,6 +318,30 @@ _STREAMING_CRON_PROFILE_HOME: contextvars.ContextVar[str | None] = contextvars.C
 _MCP_READINESS: dict = {}
 _MCP_READINESS_LOCK = threading.Lock()
 _MCP_READINESS_WAIT_CAP_S = 120.0
+# Cooldown before an incomplete/failed discovery is re-attempted by a
+# later turn (maintainer round 15 #2): per-server connection failures are
+# recorded as non-terminal so a transient outage can never permanently
+# strip a profile's MCP tools.
+_MCP_DISCOVERY_RETRY_COOLDOWN_S = 60.0
+# Sentinel returned by the production discovery closures when the call
+# returned normally but ONE OR MORE enabled servers failed to connect —
+# the runner records this as 'failed' + refreshable, NOT completed.
+_MCP_INCOMPLETE = "incomplete"
+
+
+def _normalize_mcp_home(profile_home):
+    """One canonical profile-home normalization for keys AND override values.
+
+    expanduser -> resolve(strict=False) -> normcase, applied consistently so
+    startup, turns, and reload agree on the same authority (maintainer
+    round 15 #3): `~/.hermes` and `/home/hermes/.hermes` must be ONE key.
+    """
+    try:
+        return os.path.normcase(
+            str(os.path.realpath(os.path.expanduser(str(profile_home))))
+        )
+    except Exception:
+        return str(profile_home)
 
 # Fence held by /reload-mcp across its teardown window (owner snapshot
 # through `shutdown_mcp_servers`).  Owner CREATION (_ensure_mcp_discovery
@@ -337,20 +361,46 @@ def _canonical_readiness_key(profile_home):
     (even for the default profile).  Startup and /reload-mcp must use
     the SAME key instead of '' — otherwise the logical default profile
     holds two entries and a global reload refreshes only one
-    (maintainer review round 9).
+    (maintainer review round 9 + round 15 #3).
     """
     if profile_home:
-        return str(profile_home)
+        return _normalize_mcp_home(profile_home)
     try:
         from api.profiles import _resolve_hermes_home_override
         _hc_mod = _resolve_hermes_home_override()
         if _hc_mod is not None:
             _root = getattr(_hc_mod, 'get_default_hermes_root', lambda: '')()
             if _root:
-                return str(_root)
+                return _normalize_mcp_home(_root)
     except Exception:
         pass
     return ''
+
+
+def _mcp_profile_has_connect_errors(profile_home):
+    """True when any enabled server for this profile has a connect error.
+
+    Used for the INCOMPLETE outcome (maintainer round 15 #2): hermes-
+    agent's discovery call returns normally even when a server fails to
+    connect, so 'the call returned' is NOT success.  Also used by
+    `_ensure_mcp_discovery` to heal a stale 'completed' readiness
+    recorded before this fix (a profile whose servers are failing while
+    its readiness claims full success).
+    """
+    try:
+        from tools.mcp_tool import _load_mcp_config, _server_connect_errors
+    except Exception:
+        return False
+    try:
+        _cfg = _load_mcp_config() or {}
+        _enabled = [
+            n for n, _c in _cfg.items() if _c.get('enabled', True) is not False
+        ]
+        if not _enabled:
+            return False
+        return any(n in _server_connect_errors for n in _enabled)
+    except Exception:
+        return False
 
 
 class _McpReadiness:
@@ -366,9 +416,12 @@ class _McpReadiness:
                 start (or to keep waiting) discovery; used by retry and
                 timeout retirement to fence side effects, not just the
                 final label.
+        refresh_at: monotonic deadline (or None) after which a later
+                turn may spawn a cooldown retry owner for an incomplete
+                or failed run (maintainer round 15 #2).
     """
 
-    __slots__ = ("status", "event", "thread", "gen", "cancel")
+    __slots__ = ("status", "event", "thread", "gen", "cancel", "refresh_at")
 
     def __init__(self):
         self.status = "pending"
@@ -376,6 +429,7 @@ class _McpReadiness:
         self.thread = None
         self.gen = 0
         self.cancel = threading.Event()
+        self.refresh_at = None
 
 
 def _discovery_runner(discover_fn, readiness, event, gen, cancel):
@@ -388,19 +442,30 @@ def _discovery_runner(discover_fn, readiness, event, gen, cancel):
     a voided run never performs side effects (registration) — a body
     already mid-discovery cannot be preempted, but the label stays
     fenced and the thread is only ever replaced after a bounded join.
-    The closure returns an explicit bool outcome — a thrown run is
-    recorded as failed.
+    The closure returns an explicit outcome: True (all enabled servers
+    connected), False (the run raised), or `_MCP_INCOMPLETE` (the call
+    returned but some enabled servers failed to connect).  Only a
+    genuinely-complete run is 'completed'; incomplete/failed runs get a
+    cooldown `refresh_at` so a later turn can re-attempt discovery
+    (maintainer round 15 #2).
     """
     if cancel.is_set():
         event.set()
         return
     try:
-        outcome = discover_fn()  # production closures return bool
+        outcome = discover_fn()  # production closures return True/False/INCOMPLETE
     except Exception:
         outcome = False
     with _MCP_READINESS_LOCK:
         if gen == readiness.gen:
-            readiness.status = "completed" if outcome is True else "failed"
+            if outcome is True:
+                readiness.status = "completed"
+                readiness.refresh_at = None
+            else:
+                readiness.status = "failed"
+                readiness.refresh_at = (
+                    time.monotonic() + _MCP_DISCOVERY_RETRY_COOLDOWN_S
+                )
     event.set()
 
 
@@ -456,47 +521,52 @@ def _ensure_mcp_discovery(profile_home, discover_fn, thread_name):
 def _mcp_wait_readiness(readiness):
     """Block until the profile's discovery run finishes.
 
-    Bounded by `_MCP_READINESS_WAIT_CAP_S` (discovery's own internal
-    timeouts plus a hang-safety cap); a stuck run cannot hang the turn
-    forever.  If the cap is hit while the run is still pending, the
-    CURRENT generation is RETIRED (gen bumped, status 'failed', cancel
-    token set) so a late-finishing thread can never publish terminal
-    state over the caller's outcome — but the thread POINTER is NOT
-    cleared while execution continues, and a not-yet-started body sees
-    the cancel token and performs no discovery side effects.  The
-    retired generation's EVENT is signalled after publishing so peer
-    waiters subscribed to that generation observe the terminal 'failed'
-    promptly instead of sleeping out their own full cap.  If a retry
-    started a newer generation mid-wait, the wait rides the newer run.
+    Bounded by `_MCP_READINESS_WAIT_CAP_S` per observed generation
+    (discovery's own internal timeouts plus a hang-safety cap); a stuck
+    run cannot hang the turn forever.  Every iteration snapshots
+    status/gen/event UNDER `_MCP_READINESS_LOCK`, so a concurrent retry
+    can never leave `_gen` unbound or return a bare 'pending'
+    (maintainer round 15 #1).  If the cap is hit while the observed
+    generation is still current and pending, that generation is RETIRED
+    (gen bump, status 'failed', cancel token, cooldown `refresh_at`, and
+    the retired event is SIGNALLED so peer waiters wake promptly — round
+    14).  If a retry started a newer generation mid-wait, the wait rides
+    the replacement for one more bounded cap.
     """
     if readiness.status == "pending":
         _deadline = time.monotonic() + _MCP_READINESS_WAIT_CAP_S
-        while readiness.status == "pending":
-            _gen = readiness.gen
-            _event = readiness.event
+        while True:
+            with _MCP_READINESS_LOCK:
+                if readiness.status != "pending":
+                    return readiness.status
+                _gen = readiness.gen
+                _event = readiness.event
             _remaining = _deadline - time.monotonic()
             if _remaining <= 0:
                 break
             _event.wait(timeout=_remaining)
-            if readiness.gen == _gen and readiness.status == "pending":
-                # Event fired but nothing published for this generation:
-                # the owner died mid-run or discovery outlived its bounds.
-                break
+        # Cap expired for the observed generation.
         _retired_event = None
-        if readiness.status == "pending" and readiness.gen == _gen:
-            with _MCP_READINESS_LOCK:
-                if readiness.gen == _gen and readiness.status == "pending":
-                    readiness.gen += 1
-                    readiness.status = "failed"
-                    readiness.cancel.set()
-                    _retired_event = readiness.event
-            if _retired_event is not None:
-                # Wake peer waiters subscribed to the retired generation
-                # (maintainer round 14): without this, a second
-                # same-profile turn already blocked on the event sleeps
-                # out its own full cap even though the shared result is
-                # terminal.
-                _retired_event.set()
+        with _MCP_READINESS_LOCK:
+            if readiness.gen == _gen and readiness.status == "pending":
+                readiness.gen += 1
+                readiness.status = "failed"
+                readiness.cancel.set()
+                readiness.refresh_at = (
+                    time.monotonic() + _MCP_DISCOVERY_RETRY_COOLDOWN_S
+                )
+                _retired_event = readiness.event
+            elif readiness.status == "pending":
+                # A retry replaced the generation mid-wait: ride the
+                # replacement for one more bounded cap.
+                _deadline = time.monotonic() + _MCP_READINESS_WAIT_CAP_S
+                return _mcp_wait_readiness(readiness)
+        if _retired_event is not None:
+            # Wake peer waiters subscribed to the retired generation
+            # (maintainer round 14): without this, a second same-profile
+            # turn already blocked on the event sleeps out its own full
+            # cap even though the shared result is terminal.
+            _retired_event.set()
     return readiness.status
 
 
@@ -518,6 +588,42 @@ def _wait_and_surface_mcp_readiness(readiness, profile_home, session_id):
             session_id,
         )
     return _status
+
+
+def _maybe_schedule_mcp_retry(readiness, profile_home, discover_fn):
+    """Spawn ONE nonblocking cooldown retry owner when the run is refreshable.
+
+    Maintainer round 15 #2: per-server connection failures previously
+    made readiness terminal forever (the wrappers treated 'the call
+    returned' as success).  Now a failed run — or a stale 'completed'
+    whose servers currently have connect errors — is REFRESHABLE: after
+    `_MCP_DISCOVERY_RETRY_COOLDOWN_S`, a turn schedules one background
+    retry owner (single-flight: never while an owner is alive) so a
+    later turn finds freshly registered tools without /reload-mcp.
+
+    Runs off the turn's critical path: the caller has already resolved
+    readiness and the retry is purely additive.
+    """
+    try:
+        with _MCP_READINESS_LOCK:
+            _refreshable = readiness.status == "failed"
+            _stale_completed = (
+                readiness.status == "completed"
+                and _mcp_profile_has_connect_errors(profile_home)
+            )
+            if not (_refreshable or _stale_completed):
+                return
+            if readiness.refresh_at is not None and time.monotonic() < readiness.refresh_at:
+                return
+            if readiness.thread is not None and readiness.thread.is_alive():
+                return  # single-flight: an owner is already running
+        threading.Thread(
+            target=_mcp_retry_discovery,
+            args=(profile_home, discover_fn, "mcp-cooldown-retry"),
+            daemon=True,
+        ).start()
+    except Exception:
+        logger.debug("cooldown MCP retry scheduling failed", exc_info=True)
 
 
 def _mcp_retry_discovery(profile_home, discover_fn, thread_name, _fence_held=False):
@@ -570,6 +676,7 @@ def _mcp_retry_discovery(profile_home, discover_fn, thread_name, _fence_held=Fal
                 # discovery bodies for one profile.
                 return readiness
             readiness.status = "pending"
+            readiness.refresh_at = None
             readiness.gen += 1
             _gen = readiness.gen
             readiness.event = threading.Event()
@@ -627,14 +734,18 @@ def _prepare_global_reload():
 
 
 def _invalidate_mcp_readiness(except_key=None):
-    """Remove every readiness entry except the reload's own refreshed one.
+    """Remove readiness entries.
 
-    A global reload rebuilt the process-global MCP registry, so any
-    other profile's 'completed'/'failed' readiness is stale — its next
-    turn must re-run discovery instead of trusting old state whose
-    servers were just shut down.  The except_key entry was refreshed by
-    the reload run itself and stays.
+    With an explicit except_key, remove every entry except that one (the
+    reload's own refreshed entry stays).  With except_key=None, remove
+    ALL entries — used on the reload teardown FAILURE path when the
+    registry was partially mutated, so no profile trusts stale state
+    after a failed reload (maintainer round 15 #4).
     """
+    if except_key is None:
+        with _MCP_READINESS_LOCK:
+            _MCP_READINESS.clear()
+        return
     except_key = _canonical_readiness_key(except_key or '')
     with _MCP_READINESS_LOCK:
         for _key in [k for k in list(_MCP_READINESS) if k != except_key]:
@@ -680,15 +791,35 @@ def _startup_mcp_discovery():
                     )
             try:
                 _dmt()
-                return True
+            except Exception:
+                return False
             finally:
                 if _mcp_home_token is not None:
                     _hc_mod.reset_hermes_home_override(_mcp_home_token)
+            # Any enabled server with a connect error = incomplete, not
+            # success (maintainer round 15 #2).
+            if _mcp_profile_has_connect_errors(''):
+                return _MCP_INCOMPLETE
+            return True
         except Exception:
             return False
 
     try:
         _ensure_mcp_discovery('', _discover_default, 'mcp-discovery-startup')
+    except Exception:
+        pass
+
+
+def _startup_mcp_discovery_best_effort():
+    """Kick off default-profile MCP discovery at process start.
+
+    server.py calls this during startup (never blocks): the default
+    profile's readiness resolves during idle time so the first user turn
+    usually finds it completed/failed instead of waiting.  Best-effort —
+    any failure is swallowed (the first turn re-attempts anyway).
+    """
+    try:
+        _startup_mcp_discovery()
     except Exception:
         pass
 
@@ -9847,10 +9978,13 @@ def _run_agent_streaming(
             from tools.mcp_tool import discover_mcp_tools
 
             def _discover_mcp_background():
-                """Discover MCP tools for this stream's profile; returns bool.
+                """Discover MCP tools for this stream's profile.
 
-                True = ran to completion; False = the run raised.  The
-                runner needs an explicit outcome (maintainer review).
+                Returns True when every enabled server connected, False
+                when the run raised, or `_MCP_INCOMPLETE` when the call
+                returned but some enabled servers failed to connect
+                (maintainer round 15 #2).  The runner needs the explicit
+                outcome: 'the call returned' is NOT success.
                 """
                 _mcp_home_token = None
                 try:
@@ -9872,12 +10006,14 @@ def _run_agent_streaming(
                             )
                     try:
                         discover_mcp_tools()
-                        return True
                     except Exception:
                         return False
                     finally:
                         if _mcp_home_token is not None:
                             _hc_mod.reset_hermes_home_override(_mcp_home_token)
+                    if _mcp_profile_has_connect_errors(_profile_home):
+                        return _MCP_INCOMPLETE
+                    return True
                 except Exception:
                     return False
 
@@ -9893,9 +10029,18 @@ def _run_agent_streaming(
                     _discover_mcp_background,
                     'mcp-discovery-%s' % (session_id or 'unknown'),
                 )
-                _wait_and_surface_mcp_readiness(
+                _readiness_status = _wait_and_surface_mcp_readiness(
                     _readiness, _profile_home, session_id
                 )
+                # Incomplete/failed runs (and stale 'completed' runs whose
+                # servers now have connect errors) are REFRESHABLE: after
+                # the cooldown, schedule one background retry owner so a
+                # later turn finds freshly registered tools without
+                # /reload-mcp (maintainer round 15 #2).
+                if _readiness_status in ("failed", "completed"):
+                    _maybe_schedule_mcp_retry(
+                        _readiness, _profile_home, _discover_mcp_background
+                    )
             else:
                 # Older agent: no context-local override — a background
                 # owner would read the process env, which other streams

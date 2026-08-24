@@ -653,6 +653,62 @@ def test_reload_mcp_legacy_agent_runs_inline(monkeypatch):
     assert "Reloaded MCP servers from configuration." in output
 
 
+def test_reload_clears_readiness_when_shutdown_raises(monkeypatch):
+    """A reload that raises after mutating the registry must not leave stale state.
+
+    Regression (maintainer round 15 #4): `shutdown_mcp_servers()` used
+    to be able to mutate the registry and then raise, skipping the
+    invalidation — leaving 'completed' readiness that prevented the next
+    turn from rediscovering tools.  Once teardown begins, EVERY
+    readiness entry (including the default) is cleared before the failure
+    propagates.
+    """
+    import pytest
+
+    from api import profiles
+    from api import streaming
+    from api.commands import execute_agent_command
+
+    class _FakeOverride:
+        def set_hermes_home_override(self, home):
+            return "tok"
+
+        def reset_hermes_home_override(self, token):
+            pass
+
+        def get_default_hermes_root(self):
+            return "/default/hermes/home"
+
+    monkeypatch.setattr(
+        profiles, "_resolve_hermes_home_override", lambda: _FakeOverride()
+    )
+
+    # Seed stale entries that must NOT survive a failed teardown.
+    for _key in ("/profiles/beta", "/default/hermes/home"):
+        _entry = streaming._McpReadiness()
+        _entry.status = "completed"
+        streaming._MCP_READINESS[_key] = _entry
+
+    def shutdown():
+        raise RuntimeError("registry partially mutated")
+
+    def discover():
+        return []
+
+    _install_fake_mcp_tool(monkeypatch, shutdown=shutdown, discover=discover, servers={})
+
+    with pytest.raises(RuntimeError) as exc:
+        execute_agent_command("/reload-mcp")
+    assert str(exc.value) == "Failed to reload MCP servers"
+    assert "/profiles/beta" not in streaming._MCP_READINESS, (
+        "once teardown begins, a raising reload must invalidate every "
+        "entry it touched"
+    )
+    assert "/default/hermes/home" not in streaming._MCP_READINESS, (
+        "a raising reload must also invalidate the DEFAULT profile entry"
+    )
+
+
 def test_reload_mcp_does_not_stall_unrelated_first_turn(monkeypatch):
     """A new-profile first turn never blocks for the reload's discovery wait.
 

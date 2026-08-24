@@ -580,25 +580,15 @@ def main() -> None:
         if result.get("restored"):
             print(f"[recovery] Restored {result['restored']}/{result['scanned']} sessions from .bak (see #1558).", flush=True)
     except Exception as exc:
-        # Recovery is best-effort; never block server startup.
         print(f"[recovery] startup recovery failed: {exc}", flush=True)
 
-    # Kick off default-profile MCP discovery in the background so the first
-    # user turn usually finds readiness already resolved (completed or
-    # failed) instead of waiting on the shared readiness event.  See
-    # api/streaming.py `_startup_mcp_discovery`.  Never blocks startup.
-    try:
-        from api.streaming import _startup_mcp_discovery
-        _startup_mcp_discovery()
-    except Exception:
-        pass
+    # Kick off default-profile MCP discovery (never blocks startup).
+    from api.streaming import _startup_mcp_discovery_best_effort; _startup_mcp_discovery_best_effort()
 
-    within_container = False
     try:
-        with open('/.within_container', 'r') as f:
-            within_container = True
+        within_container = bool(open('/.within_container', 'r').read())
     except FileNotFoundError:
-        pass
+        within_container = False
 
     if within_container:
         print('[ok] Running within container.', flush=True)

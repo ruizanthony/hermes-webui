@@ -288,8 +288,10 @@ def _run_reload_mcp_command() -> str:
             from api.streaming import (
                 _MCP_READINESS_WAIT_CAP_S,
                 _MCP_RELOAD_FENCE,
+                _MCP_INCOMPLETE,
                 _canonical_readiness_key,
                 _invalidate_mcp_readiness,
+                _mcp_profile_has_connect_errors,
                 _mcp_retry_discovery,
                 _mcp_wait_readiness,
                 _prepare_global_reload,
@@ -317,6 +319,10 @@ def _run_reload_mcp_command() -> str:
                             )
                     try:
                         discover_mcp_tools()
+                        # Any enabled server with a connect error =
+                        # incomplete, not success (maintainer round 15 #2).
+                        if _mcp_profile_has_connect_errors(''):
+                            return _MCP_INCOMPLETE
                         return True
                     except Exception:
                         return False
@@ -350,13 +356,23 @@ def _run_reload_mcp_command() -> str:
             # reentrant; waiting turns are unaffected — they only wait
             # on readiness events, never the fence.
             with _MCP_RELOAD_FENCE:
-                if not _prepare_global_reload():
-                    return (
-                        "MCP reload aborted: a discovery run is still in "
-                        f"progress after waiting {int(_MCP_READINESS_WAIT_CAP_S)}s. "
-                        "Retry once it finishes."
-                    )
-                shutdown_mcp_servers()
+                try:
+                    if not _prepare_global_reload():
+                        return (
+                            "MCP reload aborted: a discovery run is still in "
+                            f"progress after waiting {int(_MCP_READINESS_WAIT_CAP_S)}s. "
+                            "Retry once it finishes."
+                        )
+                    shutdown_mcp_servers()
+                except Exception:
+                    # Teardown began but raised mid-way (e.g. shutdown left
+                    # the registry partially mutated): every readiness
+                    # entry, including the default, is now stale.  Clear
+                    # ALL of them before propagating, so no profile trusts
+                    # a 'completed'/'failed' state whose servers were
+                    # partially torn down (maintainer round 15 #4).
+                    _invalidate_mcp_readiness(except_key=None)
+                    raise
 
                 # The global reload just shut down the registry: every
                 # OTHER profile's readiness is stale.  Remove those
