@@ -155,6 +155,29 @@ the remaining way to kill a live turn.
 - A restart that is gated on idleness cannot complete while the requesting
   conversation is itself streaming. Hand the restart to a detached helper and
   end the turn, or restart explicitly and accept that the current turn dies.
+- Do not type `systemctl --user restart hermes-webui.service` into a tool call.
+  Use the detached helper `~/.hermes/scripts/restart-webui-when-idle.sh`, which
+  re-execs itself through `systemd-run --user` into its own cgroup, requires
+  `is_streaming == 0` AND `/health.active_runs == 0` confirmed on consecutive
+  reads, and fails closed on an unreachable endpoint. Loading a Python patch is
+  not an exception to this rule — it is the most common way the rule gets
+  broken.
+- Incident of record (2026-08-24): two direct restarts issued from a single
+  conversation that was itself patching WebUI killed 11 live conversations in
+  two minutes; 19 were lost over two days. `NRestarts=0` throughout — systemd
+  never saw a crash, because none of it was a crash. When someone reports "WebUI
+  keeps crashing", check `NRestarts` and the `Stopping...` journal lines before
+  investigating stability.
+- Sizing the stop timeout is part of this contract. A stop must be able to write
+  the sidecar of every live session; those reach 10-24 Mo and are written under
+  the GIL. `TimeoutStopSec` was raised 20s -> 90s in the drop-in
+  `50-stop-timeout.conf` after SIGKILL escalation was observed twice. A turn
+  killed before its sidecar is written leaves `active_stream_id` and
+  `pending_user_message` set with no worker behind them, and the conversation
+  displays as permanently running. Repair with
+  `~/.hermes/scripts/repair_zombie_sidecars.py` (materializes the pending prompt
+  and appends the cancel marker per `_persist_cancelled_turn`) rather than
+  clearing the runtime fields by hand.
 
 - Keep one logical change per PR; split unrelated refactors or cleanup.
 - Read `docs/CONTRACTS.md` and the linked contract/RFC for the touched
