@@ -1035,23 +1035,25 @@ def _redact_value(v, *, _enabled: bool | None = None):
     if isinstance(v, str):
         return _redact_text(v, _enabled=_enabled)
     if isinstance(v, dict):
-        changed = False
-        out = {}
+        out = None
         for key, value in v.items():
             redacted = _redact_value(value, _enabled=_enabled)
+            if redacted is value:
+                continue
+            if out is None:
+                out = dict(v)
             out[key] = redacted
-            if redacted is not value:
-                changed = True
-        return out if changed else v
+        return v if out is None else out
     if isinstance(v, list):
-        changed = False
-        out = []
-        for item in v:
+        out = None
+        for index, item in enumerate(v):
             redacted = _redact_value(item, _enabled=_enabled)
-            out.append(redacted)
-            if redacted is not item:
-                changed = True
-        return out if changed else v
+            if redacted is item:
+                continue
+            if out is None:
+                out = list(v)
+            out[index] = redacted
+        return v if out is None else out
     return v
 
 

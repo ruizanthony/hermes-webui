@@ -8,12 +8,14 @@ GIL (json/allocations ne le liberent pas), ce qui serialise les onglets.
 
 Contrat verifie ici:
   1. Quand rien n'est redige, la valeur RENVOYEE EST l'objet d'origine
-     (identite, pas seulement egalite) -> zero allocation.
+     (identite, pas seulement egalite) et aucun conteneur proportionnel au
+     payload n'est alloue en chemin.
   2. Quand quelque chose est redige, un NOUVEL objet est renvoye et
      l'original n'est PAS mute (fail-closed: pas de fuite par aliasing).
   3. Le resultat reste egal a celui de l'ancienne implementation.
 """
 import sys
+import tracemalloc
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -55,6 +57,32 @@ def test_clean_payload_is_returned_by_identity():
     assert out["meta"] is payload["meta"]
 
 
+def test_clean_payload_does_not_allocate_eager_container_copies():
+    """La voie propre doit rester O(1) en allocation de conteneurs temporaires."""
+    payload = {
+        "dict": {index: index for index in range(20_000)},
+        "list": list(range(20_000)),
+    }
+
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
+    before, _ = tracemalloc.get_traced_memory()
+    tracemalloc.reset_peak()
+    try:
+        out = _redact_value(payload, _enabled=True)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        if not was_tracing:
+            tracemalloc.stop()
+
+    assert out is payload
+    # Une liste temporaire de 20 000 pointeurs depasse a elle seule 160 Ko.
+    # Le seuil reste volontairement un ordre de grandeur en dessous, sans
+    # dependre des details exacts de l'allocateur d'une version de CPython.
+    assert peak - before < 16_384, f"copies temporaires detectees: {peak - before} octets"
+
+
 def test_sensitive_payload_is_copied_and_original_untouched():
     """Quelque chose est redige -> nouvel objet, original intact."""
     inner = {"role": "user", "content": SECRET}
@@ -76,6 +104,29 @@ def test_sensitive_payload_is_copied_and_original_untouched():
 
     # les branches NON modifiees restent partagees (c'est tout l'interet)
     assert out["meta"] is payload["meta"]
+
+
+def test_copy_on_first_change_preserves_order_types_and_clean_identity():
+    """Une redaction tardive copie seulement son chemin sans reordonner le JSON."""
+    before = {"clean": ["avant", 1]}
+    after = {"clean": ["apres", 2]}
+    payload = {
+        "before": before,
+        "items": [before, {"secret": SECRET}, after],
+        "after": after,
+    }
+
+    out = _redact_value(payload, _enabled=True)
+
+    assert type(out) is dict
+    assert type(out["items"]) is list
+    assert list(out) == list(payload)
+    assert out["before"] is before
+    assert out["after"] is after
+    assert out["items"][0] is before
+    assert out["items"][2] is after
+    assert out["items"][1] is not payload["items"][1]
+    assert out["items"][1]["secret"] != SECRET
 
 
 def test_matches_reference_implementation():
