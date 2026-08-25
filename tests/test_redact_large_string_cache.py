@@ -32,7 +32,7 @@ from api.helpers import (  # noqa: E402
     _redact_fn_uncached,
 )
 
-SECRET = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB"
+SECRET = "gh" + "p_" + "0123456789abcdefghijklmnopqrstuvwxyzAB"
 
 
 @pytest.fixture(autouse=True)

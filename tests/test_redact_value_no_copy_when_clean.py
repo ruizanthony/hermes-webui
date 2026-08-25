@@ -46,7 +46,7 @@ def test_clean_payload_is_returned_by_identity():
             {"role": "user", "content": "bonjour, ou en est la commande 4512 ?"},
             {"role": "assistant", "content": [{"type": "text", "text": "elle part demain"}]},
         ],
-        "meta": {"workspace": "/a0/usr/projects/MES", "count": 3, "ok": True},
+        "meta": {"workspace": "/workspace/project", "count": 3, "ok": True},
     }
 
     out = _redact_value(payload, _enabled=True)
