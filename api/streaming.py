@@ -189,17 +189,40 @@ def _compact_for_echo_compare(value: str) -> str:
 
 
 def _strip_compact_echo_suffix(value: str, suffix: str, *, search_window: int = 4096) -> tuple[str, bool]:
-    """Remove ``suffix`` from ``value`` when they match after whitespace folding."""
+    """Remove ``suffix`` from ``value`` when they match after whitespace folding.
+
+    The search window is folded once and the cut point is then located by
+    walking backwards across the echo itself. The previous implementation
+    probed every candidate cut index and re-folded the whole remaining tail for
+    each probe, which is quadratic in the window size: a 6000-character final
+    message cost seconds of CPU, held under the GIL, stalling every other
+    stream in the process.
+
+    ``str.isspace`` is used for the backwards walk instead of the ``\\s``
+    pattern used by :func:`_compact_for_echo_compare`. The two agree on every
+    Unicode code point, so the folded view and the walk stay consistent.
+    """
     raw = str(value or '')
     candidate = _compact_for_echo_compare(suffix)
     if not raw or not candidate:
         return raw, False
     tail = raw[-max(len(str(suffix or '')) * 3, search_window):]
     offset = len(raw) - len(tail)
-    for idx in range(len(tail) + 1):
-        if _compact_for_echo_compare(tail[idx:]) == candidate:
-            return raw[: offset + idx].rstrip(), True
-    return raw, False
+    compact_tail = _compact_for_echo_compare(tail)
+    if len(candidate) > len(compact_tail) or not compact_tail.endswith(candidate):
+        return raw, False
+    # Consume exactly as many non-whitespace characters as the folded suffix
+    # holds; ``idx`` then sits on the first character of the echo. Whitespace
+    # sitting between the kept text and the echo is removed by ``rstrip``,
+    # which is why this lands on the same result as the leftmost cut index the
+    # probing loop used to return.
+    remaining = len(candidate)
+    idx = len(tail)
+    while remaining and idx:
+        idx -= 1
+        if not tail[idx].isspace():
+            remaining -= 1
+    return raw[: offset + idx].rstrip(), True
 
 
 def _redacted_session_payload_with_full_messages(session, *, tool_calls=None) -> dict | None:
