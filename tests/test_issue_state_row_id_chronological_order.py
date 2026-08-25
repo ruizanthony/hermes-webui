@@ -1,23 +1,10 @@
-"""Regression: a state.db-only row must never render after a newer reply.
+"""Regression coverage for source-aware transcript merge ordering."""
 
-Real-world shape (session 20260822_084749_7d1e2c, reported 2026-08-23):
+import sqlite3
+from types import SimpleNamespace
 
-A user prompt exists in state.db with a UNIQUE typed row id that the sidecar
-does not carry (the two stores do not share an id space). That makes
-``row_id_preserves_source_multiplicity`` true, which bypasses the
-sidecar-timestamp-range block in ``merge_session_messages_append_only`` --
-including the ``_insert_state_message_chronologically`` call that block owns --
-and drops the row onto the terminal ``merged_messages.append``.
-
-The row therefore renders LAST, underneath the assistant turn that answered it.
-The full display path hides this because it re-sorts by timestamp afterwards;
-the paginated path (``msg_limit``, used for the initial render) does not, so the
-user sees their own message below its own answer.
-
-The merge itself must produce a chronologically coherent transcript.
-"""
-
-from api.models import merge_session_messages_append_only
+import api.models as models
+import api.routes as routes
 
 
 def _user(content, ts, **extra):
@@ -28,54 +15,160 @@ def _assistant(content, ts, **extra):
     return {"role": "assistant", "content": content, "timestamp": ts, **extra}
 
 
-def test_unique_state_row_id_user_row_keeps_chronological_slot():
-    """A state-only user row must land before the reply it triggered."""
-    # Sidecar: the settled transcript. Its rows carry ids from the sidecar's
-    # own numbering space.
+def _read_idless_state_rows(monkeypatch, tmp_path, rows):
+    """Project the production shape from a schema with no durable row id."""
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE messages "
+            "(session_id TEXT, role TEXT, content TEXT, timestamp REAL)"
+        )
+        conn.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?)",
+            [
+                ("ordering-session", row["role"], row["content"], row["timestamp"])
+                for row in rows
+            ],
+        )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db_path)
+    return models.get_state_db_session_messages("ordering-session")
+
+
+def test_idless_state_db_projection_keeps_older_row_in_chronological_slot(
+    monkeypatch, tmp_path
+):
+    """The SQLite reader must not turn its row identity into a WebUI stable id."""
     sidecar = [
-        _user("question un", 1000.0, id=1),
-        _assistant("reponse un", 1010.0, id=2),
-        _assistant("conclusion finale", 1200.0, id=3),
+        _user("question one", 1000.0, id="parent-user"),
+        _assistant("answer one", 1010.0, id="parent-answer"),
+        _assistant("final conclusion", 1200.0, id="parent-final"),
+    ]
+    state = _read_idless_state_rows(
+        monkeypatch,
+        tmp_path,
+        [_user("question two", 1100.0)],
+    )
+
+    assert state == [_user("question two", 1100.0)]
+
+    session = SimpleNamespace(
+        session_id="ordering-session",
+        messages=sidecar,
+        truncation_watermark=None,
+        truncation_boundary=None,
+    )
+    merged = models.reconciled_state_db_messages_for_session(
+        session,
+        state_messages=state,
+    )
+
+    assert [message["content"] for message in merged] == [
+        "question one",
+        "answer one",
+        "question two",
+        "final conclusion",
     ]
 
-    # state.db: the same conversation, but this prompt was persisted only here,
-    # under a typed row id that is unique to state.db and absent from the
-    # sidecar. Its timestamp sits BEFORE the settled conclusion above.
-    state = [
-        _user("question deux", 1100.0, id=848467),
-    ]
 
-    merged = merge_session_messages_append_only(sidecar, state)
-
-    contents = [m.get("content") for m in merged]
-    assert "question deux" in contents, (
-        "the state-only user row must be preserved (append-only contract)"
-    )
-
-    # The core invariant: the recovered prompt must not sit after the newer
-    # assistant turn.
-    assert contents.index("question deux") < contents.index("conclusion finale"), (
-        "state-only user row rendered AFTER a newer assistant reply: "
-        f"{contents}"
-    )
-
-    # And the transcript as a whole must be non-decreasing in time.
-    timestamps = [m.get("timestamp") for m in merged]
-    assert timestamps == sorted(timestamps), (
-        f"merged transcript is not chronologically ordered: {timestamps}"
-    )
-
-
-def test_unique_state_row_id_row_still_appends_when_newest():
-    """A genuinely newer state-only row still belongs at the tail."""
+def test_idless_state_db_projection_still_appends_genuinely_newest_row(
+    monkeypatch, tmp_path
+):
     sidecar = [
-        _user("question un", 1000.0, id=1),
-        _assistant("reponse un", 1010.0, id=2),
+        _user("question one", 1000.0, id="parent-user"),
+        _assistant("answer one", 1010.0, id="parent-answer"),
+    ]
+    state = _read_idless_state_rows(
+        monkeypatch,
+        tmp_path,
+        [_user("late question", 2000.0)],
+    )
+
+    session = SimpleNamespace(
+        session_id="ordering-session",
+        messages=sidecar,
+        truncation_watermark=None,
+        truncation_boundary=None,
+    )
+    merged = models.reconciled_state_db_messages_for_session(
+        session,
+        state_messages=state,
+    )
+
+    assert [message["content"] for message in merged][-1] == "late question"
+
+
+def test_private_state_db_provenance_can_reorder_terminal_conflict_row():
+    """Only a private state.db row identity can authorize terminal reordering."""
+    sidecar = [
+        _user("question one", 1000.0, id="sidecar-user"),
+        _user(
+            "recovered question",
+            1100.0,
+            _state_db_row_id=848467,
+            api_content="wire-sidecar",
+        ),
+        _assistant("final conclusion", 1200.0, id="sidecar-final"),
     ]
     state = [
-        _user("question tardive", 2000.0, id=848468),
+        _user(
+            "recovered question",
+            1100.0,
+            _state_db_row_id=848467,
+            api_content="wire-state-db-conflict",
+        )
     ]
 
-    merged = merge_session_messages_append_only(sidecar, state)
+    merged = models.merge_session_messages_append_only(
+        sidecar,
+        state,
+        incoming_provenance="state_db",
+    )
 
-    assert [m.get("content") for m in merged][-1] == "question tardive"
+    assert [message["content"] for message in merged] == [
+        "question one",
+        "recovered question",
+        "recovered question",
+        "final conclusion",
+    ]
+
+
+def test_compression_child_stable_ids_remain_after_restamped_parent(monkeypatch):
+    """Child-sidecar sequence is authoritative even when parent timestamps are later."""
+    parent = SimpleNamespace(
+        session_id="compression-parent",
+        parent_session_id=None,
+        session_source="webui",
+        pre_compression_snapshot=True,
+        truncation_watermark=None,
+        truncation_boundary=None,
+        messages=[
+            _user("parent question", 1000.0, id="parent-user"),
+            _assistant("parent answer", 1400.0, id="parent-answer"),
+        ],
+    )
+    child = SimpleNamespace(
+        session_id="compression-child",
+        parent_session_id="compression-parent",
+        session_source="webui",
+        pre_compression_snapshot=False,
+        truncation_watermark=None,
+        truncation_boundary=None,
+        messages=[
+            _user("child continuation", 1100.0, id="child-user"),
+            _assistant("child answer", 1200.0, id="child-answer"),
+        ],
+    )
+    monkeypatch.setattr(
+        routes.Session,
+        "load",
+        lambda session_id: parent if session_id == parent.session_id else None,
+    )
+
+    merged = routes._webui_sidecar_lineage_messages_for_display(child)
+
+    assert [message["id"] for message in merged] == [
+        "parent-user",
+        "parent-answer",
+        "child-user",
+        "child-answer",
+    ]

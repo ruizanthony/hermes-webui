@@ -10091,6 +10091,7 @@ def merge_session_messages_append_only(
     *,
     truncation_watermark=None,
     truncation_boundary=None,
+    incoming_provenance: Literal["unverified", "state_db"] = "unverified",
 ) -> list:
     """Merge sidecar/context and state.db messages without deleting local rows.
 
@@ -10667,19 +10668,14 @@ def merge_session_messages_append_only(
         seen_dedup_keys.add(dedup_key)
         seen_content_keys.add(content_key)
         seen_visible_keys.add(visible_key)
-        # Append-only must not mean append-at-the-end. A state.db-only row can
-        # legitimately reach this point while carrying a timestamp that predates
-        # the sidecar tail — most often when its typed row id is unique to
-        # state.db (row_id_preserves_source_multiplicity), which bypasses the
-        # sidecar-timestamp-range block above and its chronological insert.
-        # Blindly appending such a row renders it after turns that already
-        # answered it: the reported shape is a user prompt displayed below its
-        # own assistant reply on the paginated (msg_limit) load, which unlike
-        # the full display path does not re-sort by timestamp afterwards.
-        # Place the row in its chronological slot instead; rows that are
-        # genuinely newest still land at the tail, so no row is ever dropped.
+        # This terminal path is shared by state.db reconciliation and by ordered
+        # sidecar stitching (notably compression continuations). Only the caller
+        # that read state.db may authorize timestamp-based recovery placement;
+        # stable child-sidecar sequence remains authoritative even when an
+        # archived parent was restamped later.
         if (
-            max_sidecar_timestamp is not None
+            incoming_provenance == "state_db"
+            and max_sidecar_timestamp is not None
             and timestamp is not None
             and timestamp < max_sidecar_timestamp
         ):
@@ -10806,6 +10802,7 @@ def reconciled_state_db_messages_for_session(
         state_messages,
         truncation_watermark=getattr(session, "truncation_watermark", None),
         truncation_boundary=getattr(session, "truncation_boundary", None),
+        incoming_provenance="state_db",
     )
     return _state_db_session_messages_result(
         reconciled_messages,

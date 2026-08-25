@@ -240,12 +240,17 @@ Called after run_conversation() completes to set the session title retroactively
 
 `reconciled_state_db_messages_for_session()` uses
 `merge_session_messages_append_only()` to combine a WebUI sidecar or context
-projection with active Agent `state.db` rows. “Append-only” is a preservation
-contract, not an append-at-the-tail ordering rule: a `state.db`-only row whose
-timestamp predates the sidecar tail is inserted into a safe chronological slot.
-This includes typed database row IDs that are absent from the sidecar because
-the stores do not share an ID space. Paginated `msg_limit` consumers rely on
-this merged order directly rather than applying a later timestamp sort.
+projection with active Agent `state.db` rows. Its explicit
+`incoming_provenance="state_db"` fence permits a state-only row whose timestamp
+predates the sidecar tail to use a safe chronological slot. Paginated
+`msg_limit` consumers rely on this merged order directly rather than applying a
+later timestamp sort.
+
+The same merge helper also stitches ordered child sidecars onto archived
+compression parents. Those calls leave incoming provenance unverified, so their
+stable message sequence remains append-only even when parent rows carry later,
+restamped timestamps. Timestamp alone is never authority to move a continuation
+inside its parent transcript.
 
 If an older row could only be placed before the first surviving sidecar/context
 row, the insertion helper declines it to avoid resurrecting compacted history.
