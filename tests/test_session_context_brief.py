@@ -11,7 +11,6 @@ duplicate, status polling, fallback when the auxiliary model is absent).
 import json
 import threading
 import time
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -246,7 +245,7 @@ def test_requests_exclude_runtime_injected_user_messages(tmp_path):
     plumbing. Older wakeups predate the `_source` marker, so the text
     prefix must be enough on its own.
     """
-    ws = "[Workspace::v1: /home/example/project]\n"
+    ws = "[Workspace::v1: /srv/project]\n"
     messages = [
         {"role": "user", "content": ws + "déploie la nouvelle version", "timestamp": 1.0},
         {
@@ -289,7 +288,7 @@ def test_requests_strip_workspace_tag_and_dedupe(tmp_path):
     drifted timestamps, so dedupe is by TEXT alone (user report 2026-08-18):
     identical asks collapse to one entry keeping the first timestamp.
     """
-    ws = "[Workspace::v1: /home/example/project]\n"
+    ws = "[Workspace::v1: /srv/project]\n"
     messages = [
         {"role": "user", "content": ws + "corrige le brief", "timestamp": 10.0},
         {"role": "user", "content": "corrige le brief", "timestamp": 10.0},
@@ -507,7 +506,7 @@ def test_brief_job_refuses_duplicate_and_empty(tmp_path):
     sess = _make_session(tmp_path)
 
     # Force the job to stay running so the duplicate check triggers.
-    started = threading_event = __import__("threading").Event()
+    started = __import__("threading").Event()
 
     def _slow_generate(session, sid, deterministic, **_kwargs):
         started.wait(timeout=5)
