@@ -20,6 +20,7 @@ maintainer review demanded:
    into an in-flight turn), and a retry while the prior owner is still
    pending never leaves two live owners for one profile.
 """
+import os
 import sys
 import threading
 import time
@@ -148,6 +149,65 @@ class TestProfileIsolation:
         assert ra.thread is not rb.thread
         assert streaming._mcp_wait_readiness(ra) == "completed"
         assert streaming._mcp_wait_readiness(rb) == "completed"
+
+    def test_legacy_discovery_serializes_captured_profile_home(self, monkeypatch):
+        """Old-agent discovery must pin its captured home under ``_ENV_LOCK``.
+
+        Agents without the context-local home override resolve MCP config from
+        process-wide ``HERMES_HOME``.  Two profile discoveries must therefore
+        run in one shared legacy critical section: each body sees its captured
+        profile for its whole execution, and the ambient value is restored.
+        """
+        monkeypatch.setenv("HERMES_HOME", "/ambient/home")
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        seen = []
+
+        def discover_first():
+            seen.append(("first-enter", os.environ.get("HERMES_HOME")))
+            first_entered.set()
+            assert release_first.wait(2.0)
+            seen.append(("first-exit", os.environ.get("HERMES_HOME")))
+            return True
+
+        def discover_second():
+            seen.append(("second", os.environ.get("HERMES_HOME")))
+            return True
+
+        first = threading.Thread(
+            target=streaming._run_legacy_mcp_discovery,
+            args=("/profiles/alpha", discover_first),
+            daemon=True,
+        )
+
+        def run_second():
+            second_started.set()
+            streaming._run_legacy_mcp_discovery(
+                "/profiles/beta", discover_second
+            )
+
+        second = threading.Thread(target=run_second, daemon=True)
+        first.start()
+        assert first_entered.wait(2.0)
+        second.start()
+        assert second_started.wait(2.0)
+        time.sleep(0.05)
+        assert second.is_alive(), (
+            "the second legacy discovery must wait for the shared env owner"
+        )
+
+        release_first.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert seen == [
+            ("first-enter", streaming._normalize_mcp_home("/profiles/alpha")),
+            ("first-exit", streaming._normalize_mcp_home("/profiles/alpha")),
+            ("second", streaming._normalize_mcp_home("/profiles/beta")),
+        ]
+        assert os.environ.get("HERMES_HOME") == "/ambient/home"
 
 
 class TestFailureAndRetry:
@@ -325,7 +385,7 @@ class TestGenerations:
             return _discover
 
         slow = make_logging_discover(0.3, "old")
-        r = streaming._ensure_mcp_discovery("profile-p", slow, "tp1")
+        streaming._ensure_mcp_discovery("profile-p", slow, "tp1")
         time.sleep(0.1)  # old body is running
         fast = make_logging_discover(0.05, "new")
         r2 = streaming._mcp_retry_discovery("profile-p", fast, "tp2")
@@ -363,6 +423,11 @@ class TestGenerations:
 
         monkeypatch.setattr(
             profiles, "_resolve_hermes_home_override", lambda: _FakeOverride()
+        )
+        monkeypatch.setattr(
+            profiles,
+            "get_hermes_home_for_profile",
+            lambda _profile: "/default/hermes/home",
         )
 
         # Fake tools.mcp_tool so _startup_mcp_discovery can import it.

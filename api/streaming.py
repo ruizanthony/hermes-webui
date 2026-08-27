@@ -15,7 +15,6 @@ import random
 import re
 import sqlite3
 import shlex
-import sys
 import subprocess
 import threading
 import time
@@ -313,8 +312,9 @@ _STREAMING_CRON_PROFILE_HOME: contextvars.ContextVar[str | None] = contextvars.C
 # mutates that under `_ENV_LOCK` and restores it at teardown; a delayed
 # write would cross-contaminate other streams).  On agents WITHOUT the
 # override API discovery is never backgrounded: the worker runs it
-# INLINE inside its own env window (pre-PR synchronous semantics), so a
-# daemon can never read another stream's profile after env mutation.
+# INLINE while `_run_legacy_mcp_discovery()` owns `_ENV_LOCK` and pins the
+# captured home.  This preserves pre-PR synchronous semantics without letting
+# another stream replace process-wide profile state during the config read.
 _MCP_READINESS: dict = {}
 _MCP_READINESS_LOCK = threading.Lock()
 _MCP_READINESS_WAIT_CAP_S = 120.0
@@ -366,6 +366,13 @@ def _canonical_readiness_key(profile_home):
     if profile_home:
         return _normalize_mcp_home(profile_home)
     try:
+        from api.profiles import get_hermes_home_for_profile
+        _root = get_hermes_home_for_profile('')
+        if _root:
+            return _normalize_mcp_home(_root)
+    except Exception:
+        pass
+    try:
         from api.profiles import _resolve_hermes_home_override
         _hc_mod = _resolve_hermes_home_override()
         if _hc_mod is not None:
@@ -375,6 +382,33 @@ def _canonical_readiness_key(profile_home):
     except Exception:
         pass
     return ''
+
+
+def _run_legacy_mcp_discovery(profile_home, discover_fn):
+    """Run old-agent discovery with one exclusive process-profile owner.
+
+    Hermes Agent versions without the context-local home override resolve MCP
+    configuration from process-wide ``HERMES_HOME``.  Merely running inline is
+    insufficient: another profile worker may replace that value after the
+    stream's short setup critical section.  Pin the captured canonical home
+    while holding the same lock used by every WebUI env mutation, then restore
+    the exact ambient state on success or failure.
+    """
+    _profile_home = _canonical_readiness_key(profile_home)
+    with _ENV_LOCK:
+        _had_home = 'HERMES_HOME' in os.environ
+        _old_home = os.environ['HERMES_HOME'] if _had_home else ''
+        try:
+            if _profile_home:
+                os.environ['HERMES_HOME'] = _profile_home
+            else:
+                os.environ.pop('HERMES_HOME', None)
+            return discover_fn()
+        finally:
+            if _had_home:
+                os.environ['HERMES_HOME'] = _old_home
+            else:
+                os.environ.pop('HERMES_HOME', None)
 
 
 def _mcp_profile_has_connect_errors(profile_home):
@@ -10045,10 +10079,14 @@ def _run_agent_streaming(
                 # Older agent: no context-local override — a background
                 # owner would read the process env, which other streams
                 # mutate (cross-profile contamination).  Run discovery
-                # INLINE (pre-PR synchronous semantics) so the env read
-                # happens inside this worker's env window; a daemon can
-                # never read another stream's profile after env mutation.
-                _discover_mcp_background()
+                # INLINE (pre-PR synchronous semantics), but pin the captured
+                # home under the shared env lock: this worker's earlier env
+                # setup lock has already been released, so inline alone does
+                # not prevent another profile from replacing HERMES_HOME.
+                _run_legacy_mcp_discovery(
+                    _profile_home,
+                    _discover_mcp_background,
+                )
         except Exception:
             pass  # MCP import itself failed — non-fatal
 

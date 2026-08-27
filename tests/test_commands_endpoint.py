@@ -425,7 +425,6 @@ def test_reload_mcp_uses_default_profile_authority(monkeypatch):
     asserts the DEFAULT root override and the default readiness entry
     is updated.
     """
-    import os
     from api import profiles
     from api import streaming
     from api.commands import execute_agent_command
@@ -447,6 +446,11 @@ def test_reload_mcp_uses_default_profile_authority(monkeypatch):
 
     monkeypatch.setattr(
         profiles, "_resolve_hermes_home_override", lambda: _FakeOverride()
+    )
+    monkeypatch.setattr(
+        profiles,
+        "get_hermes_home_for_profile",
+        lambda _profile: "/default/hermes/home",
     )
 
     def shutdown():
@@ -509,6 +513,11 @@ def test_reload_mcp_invalidates_other_profile_entries(monkeypatch):
 
     monkeypatch.setattr(
         profiles, "_resolve_hermes_home_override", lambda: _FakeOverride()
+    )
+    monkeypatch.setattr(
+        profiles,
+        "get_hermes_home_for_profile",
+        lambda _profile: "/default/hermes/home",
     )
 
     # Seed a stale named-profile entry and a stale default entry.
@@ -619,19 +628,29 @@ def test_reload_mcp_legacy_agent_runs_inline(monkeypatch):
     mutating HERMES_HOME could make it register that stream's servers.
     The inline path mirrors the stream worker's old-agent fallback.
     """
+    import os
+
     from api import profiles
     from api import streaming
     from api.commands import execute_agent_command
 
     calls = []
+    observed_homes = []
 
     monkeypatch.setattr(profiles, "_resolve_hermes_home_override", lambda: None)
+    monkeypatch.setattr(
+        profiles,
+        "get_hermes_home_for_profile",
+        lambda _profile: "/default/hermes/home",
+    )
+    monkeypatch.setenv("HERMES_HOME", "/profiles/foreign-stream")
 
     def shutdown():
         calls.append("shutdown")
 
     def discover():
         calls.append("discover")
+        observed_homes.append(os.environ.get("HERMES_HOME"))
         return []
 
     _install_fake_mcp_tool(monkeypatch, shutdown=shutdown, discover=discover, servers={})
@@ -650,6 +669,13 @@ def test_reload_mcp_legacy_agent_runs_inline(monkeypatch):
     assert not retry_calls, "old-agent reload must not background discovery"
     assert not wait_calls
     assert "discover" in calls
+    assert observed_homes == ["/default/hermes/home"], (
+        "legacy reload must discover the default profile, not a concurrent "
+        "stream's process-wide HERMES_HOME"
+    )
+    assert os.environ.get("HERMES_HOME") == "/profiles/foreign-stream", (
+        "legacy reload must restore the ambient process profile"
+    )
     assert "Reloaded MCP servers from configuration." in output
 
 

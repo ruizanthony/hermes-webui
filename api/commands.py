@@ -7,7 +7,6 @@ so the frontend can still load with WEBUI_ONLY commands.
 from __future__ import annotations
 from contextlib import nullcontext
 import logging
-import os
 import threading
 from typing import Any
 
@@ -293,6 +292,7 @@ def _run_reload_mcp_command() -> str:
                 _invalidate_mcp_readiness,
                 _mcp_profile_has_connect_errors,
                 _mcp_retry_discovery,
+                _run_legacy_mcp_discovery,
                 _mcp_wait_readiness,
                 _prepare_global_reload,
             )
@@ -411,11 +411,16 @@ def _run_reload_mcp_command() -> str:
                 # Older agent: no context-local override — a background
                 # reload would read the process env while other streams
                 # mutate it.  Run inline (pre-PR semantics), mirroring the
-                # stream worker's old-agent path.  The env read stays
-                # pre-PR on these agents (no override API exists to scope
-                # it); this is the documented compatibility behavior.
+                # stream worker's old-agent path.  Inline alone is not an
+                # isolation boundary because the stream setup lock has already
+                # been released: pin the canonical default home under the
+                # shared env lock for the complete discovery/config read.
                 _reload_status = (
-                    "completed" if _reload_discover() else "failed"
+                    "completed"
+                    if _run_legacy_mcp_discovery(
+                        _canonical_readiness_key(''), _reload_discover
+                    ) is True
+                    else "failed"
                 )
 
             with _lock:

@@ -92,6 +92,15 @@ def test_discovery_thread_uses_context_local_home_not_env():
     )
 
 
+def test_legacy_stream_discovery_uses_locked_profile_scope():
+    """The no-override stream fallback must use the serialized legacy scope."""
+    assert "_run_legacy_mcp_discovery(" in STREAMING_PY
+    assert "_run_legacy_mcp_discovery(\n                    _profile_home," in STREAMING_PY, (
+        "old-agent stream discovery must pin the captured profile home under "
+        "the shared process-env lock"
+    )
+
+
 def _function_body(name: str, stop_prefixes: tuple[str, ...]) -> list[str]:
     """Lines of a top-level function from its def to the next top-level item."""
     start = next(i for i, line in enumerate(LINES) if line.startswith(f"def {name}("))
