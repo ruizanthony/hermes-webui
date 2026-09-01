@@ -17516,6 +17516,7 @@ const LOCALES = {
     n_messages: (n) => `${n} messages`,
     load_older_messages: '↑ Faites défiler vers le haut ou cliquez pour charger les anciens messages',
     tail_reduced_banner: function(n){ return String(n) + (n>1?' messages compactes':' message compacte') + ' -- historique archive'; },
+    session_jump_start: 'Début',
     continuation_followed_toast: 'Conversation poursuivie apres compression',
     midturn_compacted_banner: 'Messages precedents compactes -- historique archive',
     session_jump_start_label: 'Aller au début de la session',

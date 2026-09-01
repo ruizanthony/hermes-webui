@@ -6533,6 +6533,48 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // instead of a full renderMessages() so an in-flight streaming node is
     // never torn down mid-render (2026-08-15 renderMessages()-during-stream
     // incident referenced in the 'compressing' handler above).
+    // Prefix chrome is not part of the archived transcript. Keep virtual
+    // spacers (scroll geometry), the load-older control, and the context brief
+    // banner while removing only archived message rows. Compensate scrollTop
+    // by the actual scroll-height delta so the surviving anchor stays at the
+    // same viewport position until the next bounded virtual render.
+    function _tailReductionPrefixUiNode(node){
+      if(!node) return false;
+      const classes=node.classList;
+      return node.id==='loadOlderIndicator'
+        || !!(classes&&classes.contains('message-virtual-spacer'))
+        || !!(classes&&classes.contains('ctx-brief-banner'));
+    }
+    function _pruneTailReductionPrefix(container,anchorNode,scroller){
+      if(!container||!anchorNode||anchorNode.parentElement!==container) return 0;
+      const viewport=scroller||container;
+      const scrollTopBefore=Number(viewport.scrollTop)||0;
+      const scrollHeightBefore=Number(viewport.scrollHeight)||0;
+      let removed=0;
+      let node=anchorNode.previousElementSibling;
+      while(node){
+        const prev=node.previousElementSibling;
+        if(!_tailReductionPrefixUiNode(node)){
+          node.remove();
+          removed++;
+        }
+        node=prev;
+      }
+      const removedHeight=Math.max(0,scrollHeightBefore-(Number(viewport.scrollHeight)||0));
+      if(removedHeight>0){
+        if(typeof _programmaticScroll!=='undefined') _programmaticScroll=true;
+        if(typeof _programmaticScrollSetAt!=='undefined' && typeof performance!=='undefined'){
+          _programmaticScrollSetAt=performance.now();
+        }
+        const release=(typeof _suppressBrowserOverflowAnchor==='function')
+          ? _suppressBrowserOverflowAnchor(viewport) : null;
+        viewport.scrollTop=Math.max(0,scrollTopBefore-removedHeight);
+        if(release) release();
+        if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll();
+      }
+      return removed;
+    }
+
     source.addEventListener('tail_reduced',e=>{
       if(!S.session) return;
       const currentSid=S.session.session_id;
@@ -6609,12 +6651,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!idxInAnchorNode.length||Math.min(...idxInAnchorNode)<cutRawIdx) return;
       S.messages=S.messages.slice(cutRawIdx);
       {
-        let node=anchorNode.previousElementSibling;
-        while(node){
-          const prev=node.previousElementSibling;
-          node.remove();
-          node=prev;
-        }
+        _pruneTailReductionPrefix(
+          container,
+          anchorNode,
+          document.getElementById('messages')||container,
+        );
         // Renumber every surviving [data-msg-idx] node so it stays a valid
         // LOCAL index into the just-sliced S.messages array. data-msg-idx is
         // raw/local (edit/regenerate compute absoluteKeepCount = _oldestIdx +

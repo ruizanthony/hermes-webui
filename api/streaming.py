@@ -6333,6 +6333,47 @@ def _should_apply_active_session_tail_reduction(
     return True
 
 
+def _apply_active_session_tail_reduction_and_save(
+    session,
+    *,
+    continuation_tail,
+    continuation_tail_boundary,
+    put,
+):
+    """Persist an active tail reduction before publishing its browser event.
+
+    The browser removes archived rows as soon as it receives ``tail_reduced``.
+    Keep that irreversible UI edge behind the continuation-session writeback:
+    if ``save()`` fails, no event is emitted and the browser retains the full
+    transcript.  This focused helper is the production seam used by the
+    end-of-turn worker and by the runtime contract test.
+    """
+    tail = list(continuation_tail or [])
+    dropped_message_count = len(session.messages or []) - len(tail)
+    session.messages = tail
+    session.tool_calls = _tool_call_summaries_after_dropping_prefix(
+        session.tool_calls,
+        dropped_message_count,
+    )
+    session.compression_anchor_visible_idx = 0
+    session.compression_anchor_message_key = _compression_anchor_message_key(tail[0])
+    session.compression_anchor_mode = "automatic_tail"
+    session.compaction_generation = uuid.uuid4().hex
+    session.truncation_watermark = continuation_tail_boundary
+    session.truncation_boundary = continuation_tail_boundary
+    payload = {
+        'session_id': session.session_id,
+        'dropped_count': dropped_message_count,
+        'anchor_message_key': session.compression_anchor_message_key,
+    }
+
+    # Durability boundary: never tell the browser to discard rows until the
+    # reduced continuation transcript itself is safely persisted.
+    session.save()
+    put('tail_reduced', payload)
+    return payload
+
+
 def _cleanup_auto_tail_backup_after_writeback(
     session,
     *,
@@ -11230,6 +11271,7 @@ def _run_agent_streaming(
 
                 # ── Handle context compression side effects ──
                 _compacted_tail_this_turn = False
+                _tail_reduction_writeback = None
                 # Also detect compression via the result dict or compressor state
                 if not _compressed:
                     _compressor = getattr(agent, 'context_compressor', None)
@@ -11720,39 +11762,22 @@ def _run_agent_streaming(
                         ),
                         session_id=_compression_continuation_session_id,
                     ):
-                        _dropped_message_count = len(s.messages or []) - len(
-                            _continuation_tail
+                        _tail_reduction_writeback = (
+                            _continuation_tail,
+                            _continuation_tail_boundary,
                         )
-                        s.messages = _continuation_tail
-                        s.tool_calls = _tool_call_summaries_after_dropping_prefix(
-                            s.tool_calls,
-                            _dropped_message_count,
-                        )
-                        s.compression_anchor_visible_idx = 0
-                        s.compression_anchor_message_key = _compression_anchor_message_key(
-                            _continuation_tail[0]
-                        )
-                        s.compression_anchor_mode = "automatic_tail"
-                        s.compaction_generation = uuid.uuid4().hex
-                        s.truncation_watermark = _continuation_tail_boundary
-                        s.truncation_boundary = _continuation_tail_boundary
                         _compacted_tail_this_turn = True
-                        # Plan Option A, C1: tell the browser to prune the DOM
-                        # above the compression card THIS turn instead of
-                        # waiting for the terminal 'done' event to replace the
-                        # transcript wholesale. A dedicated event (rather than
-                        # reusing 'compressed', which already fired earlier in
-                        # this block for usage/session-rotation bookkeeping,
-                        # before this reduction was even decided) keeps the
-                        # existing 'compressed' contract and timing unchanged
-                        # for every other listener.
-                        put('tail_reduced', {
-                            'session_id': s.session_id,
-                            'dropped_count': _dropped_message_count,
-                            'anchor_message_key': s.compression_anchor_message_key,
-                        })
                 with _stream_writeback_stage(_writeback_timings, "session_save"):
-                    s.save()
+                    if _tail_reduction_writeback is None:
+                        s.save()
+                    else:
+                        _tail, _tail_boundary = _tail_reduction_writeback
+                        _apply_active_session_tail_reduction_and_save(
+                            s,
+                            continuation_tail=_tail,
+                            continuation_tail_boundary=_tail_boundary,
+                            put=put,
+                        )
                 _cleanup_auto_tail_backup_after_writeback(
                     s,
                     compacted_this_turn=_compacted_tail_this_turn,

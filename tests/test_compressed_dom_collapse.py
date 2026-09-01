@@ -22,6 +22,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 UI_JS = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
+MESSAGES_JS = (REPO / "static" / "messages.js").read_text(encoding="utf-8")
+I18N_JS = (REPO / "static" / "i18n.js").read_text(encoding="utf-8")
 
 
 def _extract_function(src: str, name: str) -> str:
@@ -42,6 +44,8 @@ def _extract_function(src: str, name: str) -> str:
 
 ANCHOR_KEY_FN = _extract_function(UI_JS, "_compressionMessageAnchorKey")
 CUT_IDX_FN = _extract_function(UI_JS, "_tailReductionCutRawIdx")
+PREFIX_UI_FN = _extract_function(MESSAGES_JS, "_tailReductionPrefixUiNode")
+PRUNE_PREFIX_FN = _extract_function(MESSAGES_JS, "_pruneTailReductionPrefix")
 
 
 def _run_node(messages, anchor_key_input, use_helper_for_key=False):
@@ -94,3 +98,74 @@ def test_returns_minus_one_for_null_or_empty_anchor_key():
     anchor_key = {"role": "user", "ts": 1, "text": "x", "attachments": 0}
     result_empty = _run_node([], anchor_key, use_helper_for_key=False)
     assert result_empty["cut"] == -1
+
+
+def test_runtime_dom_prune_preserves_virtual_geometry_controls_and_viewport():
+    """Execute the real DOM-prune helpers against a virtualized prefix."""
+    script = f"""
+{PREFIX_UI_FN}
+{PRUNE_PREFIX_FN}
+class Classes {{
+  constructor(...names) {{ this.names=new Set(names); }}
+  contains(name) {{ return this.names.has(name); }}
+}}
+class Node {{
+  constructor(id,height,...classes) {{
+    this.id=id; this.height=height; this.classList=new Classes(...classes);
+    this.parentElement=null; this.previousElementSibling=null;
+  }}
+  remove() {{
+    const siblings=this.parentElement.children;
+    siblings.splice(siblings.indexOf(this),1);
+    this.parentElement.relink();
+  }}
+}}
+class Container {{
+  constructor(children) {{ this.children=children; this.relink(); }}
+  relink() {{
+    this.children.forEach((node,index)=>{{
+      node.parentElement=this;
+      node.previousElementSibling=index?this.children[index-1]:null;
+    }});
+  }}
+}}
+const spacer=new Node('top-spacer',500,'message-virtual-spacer');
+const loadOlder=new Node('loadOlderIndicator',40,'load-older-indicator');
+const contextBanner=new Node('context-banner',50,'ctx-brief-banner');
+const archived=new Node('archived-row',120,'message-row');
+const anchor=new Node('active-user-row',160,'message-row');
+const container=new Container([spacer,loadOlder,contextBanner,archived,anchor]);
+const scroller={{scrollTop:700,get scrollHeight(){{
+  return container.children.reduce((total,node)=>total+node.height,0);
+}}}};
+const removed=_pruneTailReductionPrefix(container,anchor,scroller);
+console.log(JSON.stringify({{
+  removed,
+  ids:container.children.map(node=>node.id),
+  scrollTop:scroller.scrollTop,
+  scrollHeight:scroller.scrollHeight,
+}}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=REPO,
+    )
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    result = json.loads(proc.stdout.strip())
+
+    assert result == {
+        "removed": 1,
+        "ids": ["top-spacer", "loadOlderIndicator", "context-banner", "active-user-row"],
+        "scrollTop": 580,
+        "scrollHeight": 750,
+    }
+
+
+def test_french_tail_banner_keeps_the_session_start_label():
+    """Adding compaction copy must not replace the existing French jump key."""
+    french = I18N_JS.split("\n  fr: {", 1)[1].split("\n  },\n\n", 1)[0]
+    assert "tail_reduced_banner:" in french
+    assert "session_jump_start: 'Début'," in french

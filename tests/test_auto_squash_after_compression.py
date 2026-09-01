@@ -16,6 +16,7 @@ import api.session_ops
 import api.streaming as streaming
 from api import session_squash
 from api.streaming import (
+    _apply_active_session_tail_reduction_and_save,
     _auto_snapshot_summary_from_compression,
     _compression_tail_after_latest_compaction,
     _is_trusted_auto_compression_marker,
@@ -436,34 +437,97 @@ def test_pre_compression_snapshot_is_durable_false_when_lookup_fails(monkeypatch
     assert _pre_compression_snapshot_is_durable("missing-sid") is False
 
 
-def test_tail_reduced_sse_event_emitted_when_reduction_applied():
-    """Plan Option A, C1 contract pin: a dedicated 'tail_reduced' SSE event
-    must be emitted at the exact point the active-session reduction is
-    applied, carrying the fields the client needs to prune the DOM without
-    waiting for the terminal 'done' event (session_id, dropped_count,
-    anchor_message_key). Kept as a source-text pin (like the sibling
-    #3306-style tests) rather than a full streaming-harness test, since
-    api/streaming.py's put()/SSE plumbing has no existing unit-test seam.
-    """
-    import inspect
+def test_tail_reduced_sse_runtime_values_follow_successful_persistence():
+    """Execute the production reduction/writeback/SSE seam end to end."""
+    order = []
+    persisted = []
+    events = []
+    boundary = 1_777_777_777.0
+    tail = [
+        {"role": "user", "content": "current request", "timestamp": boundary},
+        {"role": "assistant", "content": "current answer", "timestamp": boundary + 1},
+    ]
+    session = SimpleNamespace(
+        session_id="continuation-runtime",
+        messages=[
+            {"role": "user", "content": "archived request", "timestamp": 1.0},
+            {"role": "assistant", "content": "archived answer", "timestamp": 2.0},
+            *tail,
+        ],
+        tool_calls=[{"tid": "kept", "assistant_msg_idx": 3}],
+        compression_anchor_visible_idx=None,
+        compression_anchor_message_key=None,
+        compression_anchor_mode=None,
+        compaction_generation=None,
+        truncation_watermark=None,
+        truncation_boundary=None,
+    )
 
-    src = inspect.getsource(streaming)
-    assert "put('tail_reduced', {" in src, (
-        "expected a dedicated 'tail_reduced' SSE event at the tail-reduction "
-        "call site — see plan Option A step C1"
+    def save():
+        order.append("save")
+        persisted.append({
+            "messages": list(session.messages),
+            "mode": session.compression_anchor_mode,
+            "boundary": session.truncation_boundary,
+        })
+
+    def put(event, payload):
+        order.append(event)
+        events.append((event, payload))
+
+    session.save = save
+    payload = _apply_active_session_tail_reduction_and_save(
+        session,
+        continuation_tail=tail,
+        continuation_tail_boundary=boundary,
+        put=put,
     )
-    marker = src.index("put('tail_reduced', {")
-    block = src[marker:marker + 400]
-    assert "'session_id':" in block
-    assert "'dropped_count':" in block
-    assert "'anchor_message_key':" in block
-    # Must live in the branch guarded by _should_apply_active_session_tail_reduction
-    # (i.e. after _compacted_tail_this_turn = True), not unconditionally.
-    guard_idx = src.index("_compacted_tail_this_turn = True")
-    assert guard_idx < marker < guard_idx + 800, (
-        "'tail_reduced' must be emitted only when the reduction was actually "
-        "applied — found it outside the guarded branch"
+
+    expected_anchor = {
+        "role": "user",
+        "ts": boundary,
+        "text": "current request",
+        "attachments": 0,
+    }
+    assert order == ["save", "tail_reduced"]
+    assert persisted == [{"messages": tail, "mode": "automatic_tail", "boundary": boundary}]
+    assert payload == {
+        "session_id": "continuation-runtime",
+        "dropped_count": 2,
+        "anchor_message_key": expected_anchor,
+    }
+    assert events == [("tail_reduced", payload)]
+    assert session.tool_calls == [{"tid": "kept", "assistant_msg_idx": 1}]
+    assert session.truncation_watermark == boundary
+    assert session.compaction_generation
+
+
+def test_tail_reduced_sse_is_not_emitted_when_persistence_fails():
+    """A failed continuation writeback must leave the browser DOM untouched."""
+    events = []
+    tail = [{"role": "user", "content": "current", "timestamp": 3.0}]
+    session = SimpleNamespace(
+        session_id="continuation-save-failure",
+        messages=[{"role": "assistant", "content": "archived"}, *tail],
+        tool_calls=[],
+        compression_anchor_visible_idx=None,
+        compression_anchor_message_key=None,
+        compression_anchor_mode=None,
+        compaction_generation=None,
+        truncation_watermark=None,
+        truncation_boundary=None,
+        save=lambda: (_ for _ in ()).throw(OSError("disk full")),
     )
+
+    with pytest.raises(OSError, match="disk full"):
+        _apply_active_session_tail_reduction_and_save(
+            session,
+            continuation_tail=tail,
+            continuation_tail_boundary=3.0,
+            put=lambda event, payload: events.append((event, payload)),
+        )
+
+    assert events == []
 
 
 def test_tool_call_summaries_drop_archived_prefix_and_rebase_indices():

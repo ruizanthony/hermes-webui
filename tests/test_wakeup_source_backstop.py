@@ -24,7 +24,7 @@ RAW_COMPLETION = (
     "]"
 )
 PREFIXED_COMPLETION = (
-    "[Workspace::v1: /a0/usr/projects/MES/.worktrees/hermes-70ce773a]\n"
+    "[Workspace::v1: /tmp/hermes-test-workspace]\n"
     + RAW_COMPLETION
 )
 WRAPPED_COMPLETION = (
