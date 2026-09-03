@@ -1,21 +1,21 @@
-"""Grosses chaines: memoiser au lieu de repayer ~15 regex a chaque requete.
+"""Large strings: memoize instead of re-paying ~15 regexes on every request.
 
-``_redact_fn_cached`` excluait du LRU toute chaine > 16 384 caracteres, pour
-eviter d'evincer les milliers de petites chaines recurrentes et de gonfler la
-RSS. Consequence mesuree sur une session reelle de 22 Mo: 59 grosses chaines
-(29 uniques, 0,76 Mo) repassaient l'integralite des regex a CHAQUE requete,
-pour un resultat toujours identique — 1,68 s par requete, soit 99,9% du cout
-recurrent de la redaction une fois le cache des petites chaines chaud.
+``_redact_fn_cached`` excluded every string > 16,384 characters from the LRU,
+to avoid evicting the thousands of small recurring strings and inflating RSS.
+Measured consequence on a real 22 MB session: 59 large strings (29 unique,
+0.76 MB) went through the full regex set on EVERY request, for an always
+identical result -- 1.68 s per request, i.e. 99.9% of the recurring redaction
+cost once the small-string cache is warm.
 
-Le correctif ajoute un SECOND cache, dedie aux grosses chaines, borne en
-nombre d'entrees ET par une taille maximale par entree, pour que la RSS reste
-plafonnee. Les chaines geantes (> plafond) restent volontairement non cachees.
+The fix adds a SECOND cache, dedicated to large strings, bounded both by entry
+count AND by a maximum size per entry, so that RSS stays capped. Giant strings
+(> cap) deliberately remain uncached.
 
-Contrat verifie ici:
-  1. une grosse chaine est redigee exactement comme avant;
-  2. la meme grosse chaine n'est pas recalculee au second appel;
-  3. les deux caches restent separes (pas d'eviction croisee);
-  4. une chaine au-dela du plafond n'est jamais retenue.
+Contract verified here:
+  1. a large string is redacted exactly as before;
+  2. the same large string is not recomputed on the second call;
+  3. the two caches stay separate (no cross-eviction);
+  4. a string above the cap is never retained.
 """
 import sys
 from pathlib import Path
@@ -37,13 +37,13 @@ SECRET = "gh" + "p_" + "0123456789abcdefghijklmnopqrstuvwxyzAB"
 
 @pytest.fixture(autouse=True)
 def _isolate_large_cache():
-    """Ne pas laisser ce fichier polluer l'etat global du process.
+    """Do not let this file pollute the process-wide global state.
 
-    Le cache est un singleton de module partage par toute la suite. Le vider
-    sans le restaurer laisse les tests suivants demarrer a froid, ce qui
-    perturbe ceux qui dependent de fenetres de fraicheur ou de temps de
-    reponse. On repart d'un cache vide ET on le revide en sortie, pour que ce
-    fichier n'ait aucun effet observable en dehors de lui-meme.
+    The cache is a module singleton shared by the whole suite. Clearing it
+    without restoring it makes the following tests start cold, which disturbs
+    those that depend on freshness windows or response times. We start from an
+    empty cache AND clear it again on exit, so that this file has no observable
+    effect outside of itself.
     """
     helpers._redact_fn_large_lru.cache_clear()
     yield
@@ -51,11 +51,11 @@ def _isolate_large_cache():
 
 
 def _big(secret: str, size: int) -> str:
-    """Chaine > seuil du petit cache, porteuse d'un secret.
+    """String > small-cache threshold, carrying a secret.
 
-    Le remplissage doit etre assez long pour atteindre ``size`` meme au-dela
-    du plafond du grand cache, sinon la troncature produit une chaine trop
-    courte et le test ne verifie plus ce qu'il annonce.
+    The filler must be long enough to reach ``size`` even beyond the large
+    cache cap, otherwise truncation yields a string that is too short and the
+    test no longer verifies what it claims.
     """
     unit = "lorem ipsum dolor sit amet "
     filler = unit * (size // len(unit) + 1)
@@ -82,21 +82,21 @@ def test_large_string_is_memoized():
     info = helpers._redact_fn_large_lru.cache_info()
 
     assert second == first
-    assert info.hits >= 1, "grosse chaine recalculee au second appel"
-    assert info.misses == misses_after_first, "miss supplementaire inattendu"
+    assert info.hits >= 1, "large string recomputed on second call"
+    assert info.misses == misses_after_first, "unexpected additional miss"
 
 
 def test_small_strings_do_not_use_the_large_cache():
     helpers._redact_fn_large_lru.cache_clear()
-    small = f"petit texte {SECRET}"
+    small = f"small text {SECRET}"
     assert len(small) <= _REDACT_CACHE_MAX_TEXT_LEN
     _redact_fn_cached(small)
     info = helpers._redact_fn_large_lru.cache_info()
-    assert info.hits == 0 and info.misses == 0, "petite chaine routee vers le grand cache"
+    assert info.hits == 0 and info.misses == 0, "small string routed to the large cache"
 
 
 def test_giant_string_is_not_retained():
-    """Au-dela du plafond: correct, mais jamais mis en cache (RSS bornee)."""
+    """Above the cap: correct, but never cached (bounded RSS)."""
     helpers._redact_fn_large_lru.cache_clear()
     giant = _big(SECRET, _REDACT_LARGE_CACHE_MAX_TEXT_LEN + 10000)
     assert len(giant) > _REDACT_LARGE_CACHE_MAX_TEXT_LEN
@@ -106,7 +106,7 @@ def test_giant_string_is_not_retained():
     assert out == _redact_fn_uncached(giant)
     assert SECRET not in out
     info = helpers._redact_fn_large_lru.cache_info()
-    assert info.currsize == 0, "chaine geante retenue en cache"
+    assert info.currsize == 0, "giant string retained in cache"
 
 
 def test_large_cache_is_bounded():

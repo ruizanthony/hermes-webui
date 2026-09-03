@@ -1,18 +1,18 @@
-"""Redaction: ne pas reconstruire ce qui n'a pas change.
+"""Redaction: do not rebuild what has not changed.
 
-``_redact_value`` reconstruisait integralement chaque dict/liste, soit une
-copie profonde de tout le payload a chaque reponse, meme quand rien n'est
-redige. Sur une session de 22 Mo, 97,4% des chaines ne contiennent aucun
-marqueur sensible: la copie est donc du travail pur perte, et elle tient le
-GIL (json/allocations ne le liberent pas), ce qui serialise les onglets.
+``_redact_value`` used to rebuild every dict/list in full, i.e. a deep copy of
+the whole payload on every response, even when nothing is redacted. On a 22 MB
+session, 97.4% of the strings contain no sensitive marker: the copy is
+therefore pure wasted work, and it holds the GIL (json/allocations do not
+release it), which serializes the tabs.
 
-Contrat verifie ici:
-  1. Quand rien n'est redige, la valeur RENVOYEE EST l'objet d'origine
-     (identite, pas seulement egalite) et aucun conteneur proportionnel au
-     payload n'est alloue en chemin.
-  2. Quand quelque chose est redige, un NOUVEL objet est renvoye et
-     l'original n'est PAS mute (fail-closed: pas de fuite par aliasing).
-  3. Le resultat reste egal a celui de l'ancienne implementation.
+Contract verified here:
+  1. When nothing is redacted, the RETURNED value IS the original object
+     (identity, not just equality) and no container proportional to the
+     payload is allocated along the way.
+  2. When something is redacted, a NEW object is returned and the original
+     is NOT mutated (fail-closed: no leak through aliasing).
+  3. The result stays equal to the one of the previous implementation.
 """
 import sys
 import tracemalloc
@@ -27,7 +27,7 @@ SECRET = "authorization=Bearer sk-live-abcdef0123456789"
 
 
 def _reference_redact(v, *, _enabled):
-    """Implementation d'origine (copie systematique), pour comparaison."""
+    """Original implementation (systematic copy), kept for comparison."""
     from api.helpers import _redact_text
 
     if isinstance(v, str):
@@ -40,25 +40,25 @@ def _reference_redact(v, *, _enabled):
 
 
 def test_clean_payload_is_returned_by_identity():
-    """Rien de sensible -> aucun dict/liste ne doit etre reconstruit."""
+    """Nothing sensitive -> no dict/list must be rebuilt."""
     payload = {
         "messages": [
-            {"role": "user", "content": "bonjour, ou en est la commande 4512 ?"},
-            {"role": "assistant", "content": [{"type": "text", "text": "elle part demain"}]},
+            {"role": "user", "content": "hello, where is order 4512 at?"},
+            {"role": "assistant", "content": [{"type": "text", "text": "it ships tomorrow"}]},
         ],
         "meta": {"workspace": "/workspace/project", "count": 3, "ok": True},
     }
 
     out = _redact_value(payload, _enabled=True)
 
-    assert out is payload, "payload propre reconstruit inutilement"
+    assert out is payload, "clean payload rebuilt needlessly"
     assert out["messages"] is payload["messages"]
     assert out["messages"][0] is payload["messages"][0]
     assert out["meta"] is payload["meta"]
 
 
 def test_clean_payload_does_not_allocate_eager_container_copies():
-    """La voie propre doit rester O(1) en allocation de conteneurs temporaires."""
+    """The clean path must stay O(1) in temporary container allocation."""
     payload = {
         "dict": {index: index for index in range(20_000)},
         "list": list(range(20_000)),
@@ -77,39 +77,39 @@ def test_clean_payload_does_not_allocate_eager_container_copies():
             tracemalloc.stop()
 
     assert out is payload
-    # Une liste temporaire de 20 000 pointeurs depasse a elle seule 160 Ko.
-    # Le seuil reste volontairement un ordre de grandeur en dessous, sans
-    # dependre des details exacts de l'allocateur d'une version de CPython.
-    assert peak - before < 16_384, f"copies temporaires detectees: {peak - before} octets"
+    # A temporary list of 20,000 pointers alone exceeds 160 KB. The threshold
+    # deliberately stays an order of magnitude below that, without depending
+    # on the exact allocator details of a given CPython version.
+    assert peak - before < 16_384, f"temporary copies detected: {peak - before} bytes"
 
 
 def test_sensitive_payload_is_copied_and_original_untouched():
-    """Quelque chose est redige -> nouvel objet, original intact."""
+    """Something is redacted -> new object, original intact."""
     inner = {"role": "user", "content": SECRET}
     payload = {"messages": [inner], "meta": {"workspace": "/tmp"}}
 
     out = _redact_value(payload, _enabled=True)
 
-    # un nouvel objet est renvoye sur le chemin modifie
+    # a new object is returned along the modified path
     assert out is not payload
     assert out["messages"] is not payload["messages"]
     assert out["messages"][0] is not inner
 
-    # l'original n'est pas mute (pas de fuite par aliasing)
+    # the original is not mutated (no leak through aliasing)
     assert inner["content"] == SECRET
     assert payload["messages"][0]["content"] == SECRET
 
-    # le secret est bien masque dans la sortie
+    # the secret is indeed masked in the output
     assert out["messages"][0]["content"] != SECRET
 
-    # les branches NON modifiees restent partagees (c'est tout l'interet)
+    # the UNmodified branches stay shared (that is the whole point)
     assert out["meta"] is payload["meta"]
 
 
 def test_copy_on_first_change_preserves_order_types_and_clean_identity():
-    """Une redaction tardive copie seulement son chemin sans reordonner le JSON."""
-    before = {"clean": ["avant", 1]}
-    after = {"clean": ["apres", 2]}
+    """A late redaction copies only its own path without reordering the JSON."""
+    before = {"clean": ["before", 1]}
+    after = {"clean": ["after", 2]}
     payload = {
         "before": before,
         "items": [before, {"secret": SECRET}, after],
@@ -130,14 +130,14 @@ def test_copy_on_first_change_preserves_order_types_and_clean_identity():
 
 
 def test_matches_reference_implementation():
-    """Le resultat doit rester identique a l'implementation d'origine."""
+    """The result must stay identical to the original implementation."""
     payload = {
         "messages": [
-            {"role": "user", "content": "texte normal"},
+            {"role": "user", "content": "plain text"},
             {"role": "assistant", "content": SECRET},
-            {"role": "user", "content": ["propre", SECRET, 42, None]},
+            {"role": "user", "content": ["clean", SECRET, 42, None]},
         ],
-        "nested": {"a": {"b": {"c": SECRET}}, "d": {"e": "rien"}},
+        "nested": {"a": {"b": {"c": SECRET}}, "d": {"e": "nothing"}},
         "scalars": [1, 2.5, True, None],
     }
 
@@ -145,7 +145,7 @@ def test_matches_reference_implementation():
 
 
 def test_disabled_redaction_still_shares():
-    """Redaction desactivee -> rien ne doit etre copie."""
+    """Redaction disabled -> nothing must be copied."""
     payload = {"messages": [{"role": "user", "content": SECRET}]}
     out = _redact_value(payload, _enabled=False)
     assert out is payload
