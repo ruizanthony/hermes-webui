@@ -74,8 +74,9 @@ def _cases():
         ("aaaa", "aa"),
         # Long buffer with the echo at the very end.
         ("remplissage " * 500 + "la vraie conclusion", "la vraie conclusion"),
-        # Echo further back than the search window allows.
-        ("z" * 9000 + " tail", "tail"),
+        # Echo whose whitespace-padded span is wider than the search window:
+        # the window only exposes ``conclusion``, so nothing may be stripped.
+        ("bla une" + " " * 5000 + "conclusion", "une conclusion"),
         # Exotic whitespace that ``\s`` and ``str.isspace`` must treat alike.
         ("bla\u00a0bla une conclusion", "une\u00a0conclusion"),
         ("bla\u2028une conclusion", "une conclusion"),
@@ -121,6 +122,25 @@ def test_strip_compact_echo_suffix_honours_a_custom_search_window():
         ) == _reference_strip_compact_echo_suffix(
             buffer_text, "la conclusion", search_window=window
         ), f"window={window}"
+
+
+def test_strip_compact_echo_suffix_rejects_an_echo_wider_than_the_window():
+    """An echo that only fits inside a wider window must not be found.
+
+    The buffer ends with the echo, but interior whitespace stretches its raw
+    span past the default window, so the folded window only exposes the last
+    word. Widening the window to cover the whole span makes the same echo
+    visible again, which proves the non-match is caused by the window and
+    not by the text.
+    """
+    import api.streaming as streaming
+
+    buffer_text = "bla une" + " " * 5000 + "conclusion"
+    suffix = "une conclusion"
+
+    for impl in (streaming._strip_compact_echo_suffix, _reference_strip_compact_echo_suffix):
+        assert impl(buffer_text, suffix) == (buffer_text, False), impl.__name__
+        assert impl(buffer_text, suffix, search_window=len(buffer_text)) == ("bla", True), impl.__name__
 
 
 def test_strip_compact_echo_suffix_does_not_refold_the_window_per_cut(monkeypatch):
