@@ -29,7 +29,11 @@ def test_frontend_todo_state_listener_is_registered_and_journaled():
     messages = _read_static("static/messages.js")
 
     assert "source.addEventListener('todo_state'" in messages
-    assert "if(d.session_id&&d.session_id!==activeSid) return;" in messages
+    # Event ownership is no longer a bare equality against the attach-time id:
+    # after a mid-turn compression rotation the server keeps emitting under the
+    # ORIGIN session id, so the listener must accept every id this stream has
+    # owned. (See tests/test_midturn_rotation_live_stream_identity.py.)
+    assert "_streamOwnsEventSid(d.session_id)" in messages
     assert "if(!S.session||S.session.session_id!==activeSid) return;" in messages
     assert "if(incomingTs&&currentTs&&incomingTs<currentTs) return;" in messages
     assert "inflight.todos=S.todos" in messages
@@ -179,8 +183,18 @@ let persistCalls = 0;
 function persistInflightState(){ persistCalls++; }
 let refreshCalls = 0;
 function scheduleTodosRefresh(){ refreshCalls++; }
-const handler = new Function('e','S','INFLIGHT','activeSid','persistInflightState','scheduleTodosRefresh', body);
-function fire(payload){ handler({data: JSON.stringify(payload)}, S, INFLIGHT, activeSid, persistInflightState, scheduleTodosRefresh); }
+// Event ownership is resolved through the live stream's owned-id set: after a
+// mid-turn compression rotation the server keeps emitting under the ORIGIN
+// session id, so a bare `!==activeSid` comparison would drop real events. The
+// handler is extracted here without its enclosing attachLiveStream scope, so
+// the predicate is injected the same way the other dependencies are.
+const _streamOwnedSids = new Set(['s1']);
+function _streamOwnsEventSid(eventSid){
+  const id = String(eventSid || '').trim();
+  return !id || _streamOwnedSids.has(id);
+}
+const handler = new Function('e','S','INFLIGHT','activeSid','persistInflightState','scheduleTodosRefresh','_streamOwnsEventSid', body);
+function fire(payload){ handler({data: JSON.stringify(payload)}, S, INFLIGHT, activeSid, persistInflightState, scheduleTodosRefresh, _streamOwnsEventSid); }
 function assert(cond, msg){ if(!cond) throw new Error(msg); }
 
 fire({session_id:'other', todos:[{id:'x', content:'wrong', status:'pending'}], ts:20});
@@ -198,8 +212,17 @@ fire({session_id:'s1', todos:[{id:'old', content:'old', status:'pending'}], ts:5
 assert(S.todos[0].id === 'a', 'older event must not roll back S.todos');
 assert(persistCalls === 1 && refreshCalls === 1, 'older event must not persist or refresh');
 
-handler({data:'not json'}, S, INFLIGHT, activeSid, persistInflightState, scheduleTodosRefresh);
+handler({data:'not json'}, S, INFLIGHT, activeSid, persistInflightState, scheduleTodosRefresh, _streamOwnsEventSid);
 assert(S.todos[0].id === 'a', 'malformed event must be swallowed');
+
+// A post-rotation event still arrives under the ORIGIN id while the tab has
+// moved to the continuation. It must be accepted, not dropped.
+_streamOwnedSids.add('s2');
+S.session.session_id = 's2';
+INFLIGHT.s2 = INFLIGHT.s1;
+activeSid = 's2';
+handler({data: JSON.stringify({session_id:'s1', todos:[{id:'post', content:'after rotation', status:'in_progress'}], ts:30, version:1})}, S, INFLIGHT, activeSid, persistInflightState, scheduleTodosRefresh, _streamOwnsEventSid);
+assert(S.todos[0].id === 'post', 'post-rotation event emitted under the origin id must be accepted');
 '''
     script_path = tmp_path / "todo_listener_test.js"
     script_path.write_text(script, encoding="utf-8")

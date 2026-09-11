@@ -431,7 +431,11 @@ def test_auto_compression_running_sse_uses_active_session_running_card():
     block = _compressing_listener_block()
 
     assert "if(!S.session||S.session.session_id!==activeSid) return;" in block
-    assert "if(d.session_id&&d.session_id!==activeSid) return;" in block
+    # Event ownership is no longer a bare equality against the attach-time id:
+    # after a mid-turn rotation the server keeps emitting under the ORIGIN
+    # session id, so the listener must accept every id this stream has owned.
+    # (See tests/test_midturn_rotation_live_stream_identity.py.)
+    assert "_streamOwnsEventSid(d.session_id)" in block
     assert "try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }" in block
     assert "setCompressionUi" in block
     assert "phase:'running'" in block

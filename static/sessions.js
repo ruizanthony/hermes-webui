@@ -811,6 +811,51 @@ function _isSessionLocallyStreaming(s) {
   return isActive && Boolean(S.busy);
 }
 
+// A mid-turn compression rotates the session id while the turn keeps running.
+// The sidebar row for the CONTINUATION must inherit the running indicator, or
+// the conversation looks stopped while it is still working (observed
+// 4169a7cacdd3 -> 20260817_142640_dada12: ~9 more minutes of tool activity
+// after the rotation, with no badge at all).
+function _adoptSessionStreamingRotation(previousSid, continuationSid) {
+  const from = String(previousSid || '').trim();
+  const to = String(continuationSid || '').trim();
+  if (!to || from === to) return false;
+  // Carry the observed streaming flag onto the continuation id.
+  if (typeof _sessionStreamingById !== 'undefined' && _sessionStreamingById) {
+    const wasStreaming = from ? _sessionStreamingById.get(from) : undefined;
+    _sessionStreamingById.set(to, wasStreaming === undefined ? true : Boolean(wasStreaming));
+    if (from) _sessionStreamingById.delete(from);
+  }
+  if (from && typeof _forgetObservedStreamingSession === 'function') {
+    _forgetObservedStreamingSession(from);
+  }
+  // Keep a cache repaint honest: the continuation row must render as
+  // streaming (creating it from the pre-rotation row when the server list has
+  // not caught up yet), and the archived pre-rotation row must drop its badge.
+  if (Array.isArray(_allSessions)) {
+    const fromIdx = from ? _allSessions.findIndex(s => s && s.session_id === from) : -1;
+    const toIdx = _allSessions.findIndex(s => s && s.session_id === to);
+    const base = fromIdx >= 0 ? _allSessions[fromIdx] : null;
+    if (toIdx >= 0) {
+      _allSessions[toIdx] = {..._allSessions[toIdx], is_streaming: true};
+    } else if (base) {
+      _allSessions.unshift({...base, session_id: to, is_streaming: true});
+    }
+    const archivedIdx = from ? _allSessions.findIndex(s => s && s.session_id === from) : -1;
+    if (archivedIdx >= 0) {
+      _allSessions[archivedIdx] = {
+        ..._allSessions[archivedIdx],
+        active_stream_id: null,
+        pending_user_message: null,
+        pending_started_at: null,
+        is_streaming: false,
+      };
+    }
+  }
+  if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
+  return true;
+}
+
 function _isSessionEffectivelyStreaming(s) {
   return Boolean(s && (
     s.is_streaming ||
